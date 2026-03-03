@@ -1351,21 +1351,23 @@ ET_NODISCARD Error Method::get_inputs(EValue* input_evalues, size_t length) {
   return Error::Ok;
 }
 
-Error Method::execute_instruction() {
-  auto& chain = chains_[step_state_.chain_idx];
+Error Method::execute_instruction(
+    size_t chain_idx,
+    size_t& instr_idx) {
+  auto& chain = chains_[chain_idx];
   auto instructions = chain.s_chain_->instructions();
 
   ET_CHECK_OR_RETURN_ERROR(
-      step_state_.instr_idx < instructions->size(),
+      instr_idx < instructions->size(),
       Internal,
       "Instr index %" ET_PRIsize_t " >= chain[%" ET_PRIsize_t
       "] instr count %" ET_PRIsize_t,
-      step_state_.instr_idx,
-      step_state_.chain_idx,
+      instr_idx,
+      chain_idx,
       (size_t)instructions->size());
 
-  auto instruction = instructions->Get(step_state_.instr_idx);
-  size_t next_instr_idx = step_state_.instr_idx + 1;
+  auto instruction = instructions->Get(instr_idx);
+  size_t next_instr_idx = instr_idx + 1;
   Error err = Error::Ok;
 
   switch (instruction->instr_args_type()) {
@@ -1375,8 +1377,8 @@ Error Method::execute_instruction() {
           internal::EventTracerProfileOpScope(event_tracer_, "OPERATOR_CALL");
       // TODO(T147221312): Also expose tensor resizer via the context.
       KernelRuntimeContext context(event_tracer_, temp_allocator_);
-      auto args = chain.argument_lists_[step_state_.instr_idx];
-      chain.kernels_[step_state_.instr_idx](context, args);
+      auto args = chain.argument_lists_[instr_idx];
+      chain.kernels_[instr_idx](context, args);
       // We reset the temp_allocator after the switch statement
       err = context.failure_state();
       if (err != Error::Ok) {
@@ -1388,8 +1390,8 @@ Error Method::execute_instruction() {
             Error,
             "KernelCall failed at instruction %" ET_PRIsize_t ":%" ET_PRIsize_t
             " in operator %s.%s: 0x%x",
-            step_state_.chain_idx,
-            step_state_.instr_idx,
+            chain_idx,
+            instr_idx,
             op->name()->c_str(),
             op->overload()->c_str(),
             (unsigned int)err);
@@ -1420,20 +1422,20 @@ Error Method::execute_instruction() {
           " at instruction %" ET_PRIsize_t,
           delegate_idx,
           n_delegate_,
-          step_state_.instr_idx);
+          instr_idx);
       BackendExecutionContext backend_execution_context(
           /*event_tracer=*/event_tracer_,
           /*temp_allocator=*/temp_allocator_,
           /*method_name=*/serialization_plan_->name()->c_str());
       err = delegates_[delegate_idx].Execute(
           backend_execution_context,
-          chain.argument_lists_[step_state_.instr_idx]);
+          chain.argument_lists_[instr_idx]);
       if (err != Error::Ok) {
         ET_LOG(
             Error,
             "CALL_DELEGATE execute failed at instruction %" ET_PRIsize_t
             ": 0x%" PRIx32,
-            step_state_.instr_idx,
+            instr_idx,
             static_cast<uint32_t>(err));
       }
 
@@ -1444,9 +1446,9 @@ Error Method::execute_instruction() {
       // ouputs are separate lists.
 #ifdef ET_EVENT_TRACER_ENABLED
       for (size_t i = 0;
-           i < chain.argument_lists_[step_state_.instr_idx].size();
+           i < chain.argument_lists_[instr_idx].size();
            i++) {
-        EValue* arg = chain.argument_lists_[step_state_.instr_idx].data()[i];
+        EValue* arg = chain.argument_lists_[instr_idx].data()[i];
         internal::event_tracer_log_evalue(event_tracer_, *arg);
       }
 #endif
@@ -1501,7 +1503,7 @@ Error Method::execute_instruction() {
     temp_allocator_->reset();
   }
   if (err == Error::Ok) {
-    step_state_.instr_idx = next_instr_idx;
+    instr_idx = next_instr_idx;
   }
   return err;
 }
@@ -1566,7 +1568,8 @@ Error Method::step() {
     return Error::Ok;
   }
 
-  auto status = execute_instruction();
+  auto status =
+      execute_instruction(step_state_.chain_idx, step_state_.instr_idx);
   if (status != Error::Ok) {
     return status;
   }
@@ -1617,34 +1620,34 @@ Error Method::execute() {
 
   // Chains are executed sequentially today, but future async designs may
   // branch and run many in parallel or out of order.
-  for (step_state_.chain_idx = 0; step_state_.chain_idx < n_chains_;
-       ++step_state_.chain_idx) {
-    Chain& chain = chains_[step_state_.chain_idx];
+  for (size_t chain_idx = 0; chain_idx < n_chains_; ++chain_idx) {
+    Chain& chain = chains_[chain_idx];
     auto instructions = chain.s_chain_->instructions();
     ET_CHECK_OR_RETURN_ERROR(
         instructions != nullptr,
         Internal,
         "chain %" ET_PRIsize_t " has no instructions field",
-        step_state_.chain_idx);
+        chain_idx);
 
-    // Loop over instructions
-    step_state_.instr_idx = 0;
-    while (step_state_.instr_idx < chain.s_chain_->instructions()->size()) {
+    const size_t n_instructions = instructions->size();
+    size_t instr_idx = 0;
+    while (instr_idx < n_instructions) {
       EXECUTORCH_PROFILE_INSTRUCTION_SCOPE(
-          static_cast<int32_t>(step_state_.chain_idx),
-          static_cast<uint32_t>(step_state_.instr_idx));
+          static_cast<int32_t>(chain_idx),
+          static_cast<uint32_t>(instr_idx));
       internal::EventTracerProfileInstructionScope event_tracer_instr_scope =
           internal::EventTracerProfileInstructionScope(
               event_tracer_,
-              static_cast<ChainID>(step_state_.chain_idx),
-              static_cast<DebugHandle>(step_state_.instr_idx));
-      auto status = execute_instruction();
+              static_cast<ChainID>(chain_idx),
+              static_cast<DebugHandle>(instr_idx));
+      auto status = execute_instruction(chain_idx, instr_idx);
       if (status != Error::Ok) {
         step_state_ = StepState{0, 0};
         return status;
       }
     }
   }
+  step_state_.chain_idx = n_chains_;
   internal::event_tracer_end_profiling_event(event_tracer_, event_tracer_entry);
   log_outputs();
 

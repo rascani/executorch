@@ -379,8 +379,10 @@ class Method final {
   size_t get_input_index(size_t i) const;
   size_t get_output_index(size_t i) const;
 
-  // Executes a single instruction using the state in step_state_
-  ET_NODISCARD Error execute_instruction();
+  // Executes a single instruction at the given position in the given chain.
+  // On success, advances instr_idx to the next instruction.
+  ET_NODISCARD Error
+  execute_instruction(size_t chain_idx, size_t& instr_idx);
 
   StepState step_state_;
   const Program* program_;
