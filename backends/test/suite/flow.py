@@ -147,4 +147,11 @@ def all_flows() -> dict[str, TestFlow]:
     except Exception as e:
         logger.info(f"Skipping ARM flow registration: {e}")
 
+    try:
+        from executorch.backends.test.suite.flows.cortex_m import CORTEX_M_TEST_FLOW
+
+        flows += [CORTEX_M_TEST_FLOW]
+    except Exception as e:
+        logger.info(f"Skipping Cortex-M flow registration: {e}")
+
     return {f.name: f for f in flows if f is not None}
