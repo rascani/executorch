@@ -165,11 +165,13 @@ def run_test(  # noqa: C901
         extra_stats["lower_time"] = timedelta(seconds=elapsed)
         return build_result(TestResult.LOWER_FAIL, e)
 
-    # Compute delegation statistics. Use the ETRecord to access the edge dialect graph between
-    # to_edge and delegation. Note that ETRecord only stores the edge dialect graph for a single
-    # method currently and assumes it is called "forward".
+    # Compute delegation statistics. Use the ETRecord to access the edge dialect graph
+    # between to_edge and delegation. Note that ETRecord only stores the edge dialect
+    # graph for a single method currently and assumes it is called "forward".
     edge_manager: EdgeProgramManager = tester.get_artifact()
-    edge_op_counts = count_ops({"forward": edge_manager._etrecord.edge_dialect_program})
+    edge_op_counts = count_ops(
+        {"forward": edge_manager._etrecord.edge_dialect_program}
+    )
     undelegated_op_counts = count_ops(edge_manager._edge_programs)
     delegated_op_counts = edge_op_counts - undelegated_op_counts
 
@@ -182,21 +184,20 @@ def run_test(  # noqa: C901
         if n.op == "call_function"
     )
 
-    # Check if any undelegated ops are in the unsupported ops set.
     has_unsupported_ops = any(
         op in UNSUPPORTED_PORTABLE_OPS for op in undelegated_op_counts.keys()
-    ) or _graph_has_unsupported_patterns(edge_manager._etrecord.edge_dialect_program)
+    ) or _graph_has_unsupported_patterns(
+        edge_manager._etrecord.edge_dialect_program
+    )
 
-    # Skip the test if there are unsupported portable ops remaining.
     if has_unsupported_ops:
         return build_result(TestResult.SKIPPED)
 
     # Only run the runtime portion if something was delegated (or the flow doesn't delegate)
     if is_delegated or not flow.is_delegated:
         try:
-            tester.to_executorch()
-
             if flow.supports_serialize:
+                tester.to_executorch()
                 tester.serialize()
                 extra_stats["pte_size_bytes"] = len(tester.get_artifact())
         except Exception as e:

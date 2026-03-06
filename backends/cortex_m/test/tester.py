@@ -19,6 +19,7 @@ from executorch.backends.test.harness.stages import (
     RunPasses,
     StageType,
     ToEdge,
+    ToEdgeTransformAndLower,
     ToExecutorch,
 )
 from executorch.exir import EdgeCompileConfig
@@ -30,20 +31,23 @@ class CortexMQuantize(Quantize):
         super().__init__(quantizer, calibration_samples=calibration_samples)
 
 
+def _cortex_m_edge_compile_config() -> EdgeCompileConfig:
+    return EdgeCompileConfig(
+        preserve_ops=[
+            torch.ops.aten.linear.default,
+            torch.ops.aten.hardsigmoid.default,
+            torch.ops.aten.hardsigmoid_.default,
+            torch.ops.aten.hardswish.default,
+            torch.ops.aten.hardswish_.default,
+        ],
+        _check_ir_validity=False,
+        _core_aten_ops_exception_list=[torch.ops.aten.max_pool2d.default],
+    )
+
+
 class CortexMToEdge(ToEdge):
     def __init__(self):
-        config = EdgeCompileConfig(
-            preserve_ops=[
-                torch.ops.aten.linear.default,
-                torch.ops.aten.hardsigmoid.default,
-                torch.ops.aten.hardsigmoid_.default,
-                torch.ops.aten.hardswish.default,
-                torch.ops.aten.hardswish_.default,
-            ],
-            _check_ir_validity=False,
-            _core_aten_ops_exception_list=[torch.ops.aten.max_pool2d.default],
-        )
-        super().__init__(config)
+        super().__init__(_cortex_m_edge_compile_config())
 
 
 class CortexMRunPasses(RunPasses):
@@ -52,6 +56,19 @@ class CortexMRunPasses(RunPasses):
             CortexMPassManager,
             CortexMPassManager.pass_list,
         )
+
+
+class CortexMToEdgeTransformAndLower(ToEdgeTransformAndLower):
+    def __init__(self):
+        super().__init__(edge_compile_config=_cortex_m_edge_compile_config())
+
+    def run(self, artifact, inputs=None, generate_etrecord=False):
+        super().run(artifact, inputs, generate_etrecord)
+        pass_manager = CortexMPassManager(
+            self.edge_dialect_program.exported_program(),
+            CortexMPassManager.pass_list,
+        )
+        self.edge_dialect_program._edge_programs["forward"] = pass_manager.transform()
 
 
 class CortexMSerialize(Serialize):
@@ -64,8 +81,8 @@ cortex_m_stage_classes = {
     StageType.EXPORT: Export,
     StageType.QUANTIZE: CortexMQuantize,
     StageType.RUN_PASSES: CortexMRunPasses,
-    StageType.SERIALIZE: Serialize,
     StageType.TO_EDGE: CortexMToEdge,
+    StageType.TO_EDGE_TRANSFORM_AND_LOWER: CortexMToEdgeTransformAndLower,
     StageType.TO_EXECUTORCH: ToExecutorch,
     StageType.SERIALIZE: CortexMSerialize,
 }
