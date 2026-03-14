@@ -9,6 +9,9 @@
 #pragma once
 
 #include <cinttypes>
+#include <new>
+#include <type_traits>
+#include <utility>
 
 #include <c10/util/safe_numerics.h>
 
@@ -166,6 +169,24 @@ class MemoryAllocator {
       return nullptr;
     }
     return static_cast<T*>(this->allocate(bytes_size, alignment));
+  }
+
+  /**
+   * Allocates and constructs a single object of type T. The caller is
+   * responsible for calling the destructor if T is non-trivially destructible.
+   */
+  template <
+      typename T,
+      typename... Args,
+      std::enable_if_t<
+          !std::is_array_v<T> && std::is_constructible_v<T, Args...>,
+          int> = 0>
+  ET_NODISCARD T* construct(Args&&... args) {
+    T* p = allocateInstance<T>();
+    if ET_UNLIKELY (p == nullptr) {
+      return nullptr;
+    }
+    return ::new (p) T(std::forward<Args>(args)...);
   }
 
   // Returns the allocator memory's base address.

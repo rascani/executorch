@@ -74,12 +74,11 @@ class ExecutorBackend final : public ::executorch::runtime::BackendInterface {
     // `processed` contains an executorch program. Wrap it in a DataLoader that
     // will return the data directly without copying it.
     MemoryAllocator* runtime_allocator = context.get_runtime_allocator();
-    auto loader = runtime_allocator->allocateInstance<BufferDataLoader>();
+    auto loader = runtime_allocator->construct<BufferDataLoader>(
+        processed->data(), processed->size());
     if (loader == nullptr) {
       return Error::MemoryAllocationFailed;
     }
-
-    new (loader) BufferDataLoader(processed->data(), processed->size());
     // Can't free `processed` because the program will point into that memory.
 
     // Try loading the program.
@@ -89,12 +88,11 @@ class ExecutorBackend final : public ::executorch::runtime::BackendInterface {
     }
 
     // Move the Program off the stack.
-    auto client_program = runtime_allocator->allocateInstance<Program>();
+    auto client_program =
+        runtime_allocator->construct<Program>(std::move(program_result.get()));
     if (client_program == nullptr) {
       return Error::MemoryAllocationFailed;
     }
-
-    new (client_program) Program(std::move(program_result.get()));
 
     Result<MethodMeta> method_meta = client_program->method_meta("forward");
     if (!method_meta.ok()) {
@@ -124,39 +122,32 @@ class ExecutorBackend final : public ::executorch::runtime::BackendInterface {
     }
 
     auto client_planned_memory =
-        runtime_allocator->allocateInstance<HierarchicalAllocator>();
+        runtime_allocator->construct<HierarchicalAllocator>(Span<Span<uint8_t>>{
+            memory_planned_buffers, num_memory_planned_buffers});
     if (client_planned_memory == nullptr) {
       return Error::MemoryAllocationFailed;
     }
 
-    new (client_planned_memory) HierarchicalAllocator(
-        {memory_planned_buffers, num_memory_planned_buffers});
-
     // Allocate some memory from runtime allocator for the client executor, in
     // real case, like if it's an executor in dsp, it should allocate memory
     // dedicated to this specific hardware
-    auto client_method_allocator =
-        runtime_allocator->allocateInstance<MemoryAllocator>();
-    if (client_method_allocator == nullptr) {
-      return Error::MemoryAllocationFailed;
-    }
-
     const size_t kClientRuntimeMemorySize = 4 * 1024U;
     auto runtime_pool = runtime_allocator->allocate(kClientRuntimeMemorySize);
     if (runtime_pool == nullptr) {
       return Error::MemoryAllocationFailed;
     }
-    new (client_method_allocator) MemoryAllocator(
-        kClientRuntimeMemorySize, static_cast<uint8_t*>(runtime_pool));
-
-    auto client_memory_manager =
-        runtime_allocator->allocateInstance<MemoryManager>();
-    if (client_memory_manager == nullptr) {
+    auto client_method_allocator =
+        runtime_allocator->construct<MemoryAllocator>(
+            kClientRuntimeMemorySize, static_cast<uint8_t*>(runtime_pool));
+    if (client_method_allocator == nullptr) {
       return Error::MemoryAllocationFailed;
     }
 
-    new (client_memory_manager)
-        MemoryManager(client_method_allocator, client_planned_memory);
+    auto client_memory_manager = runtime_allocator->construct<MemoryManager>(
+        client_method_allocator, client_planned_memory);
+    if (client_memory_manager == nullptr) {
+      return Error::MemoryAllocationFailed;
+    }
 
     const NamedDataMap* named_data_map = context.get_named_data_map();
     // Construct the client Method
@@ -173,12 +164,11 @@ class ExecutorBackend final : public ::executorch::runtime::BackendInterface {
       return method_res.error();
     }
 
-    auto client_method = runtime_allocator->allocateInstance<Method>();
+    auto client_method =
+        runtime_allocator->construct<Method>(std::move(method_res.get()));
     if (client_method == nullptr) {
       return Error::MemoryAllocationFailed;
     }
-
-    new (client_method) Method(std::move(method_res.get()));
 
     // Return the client method so it will be passed to `execute()` as
     // `handle`.

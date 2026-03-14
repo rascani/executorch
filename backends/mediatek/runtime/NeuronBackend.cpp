@@ -48,12 +48,10 @@ Result<DelegateHandle*> NeuronBackend::init(
   NeuronDelegateSetting setting;
   MemoryAllocator* runtime_allocator = context.get_runtime_allocator();
   NeuronExecuTorchDelegate* delegate =
-      runtime_allocator->allocateInstance<NeuronExecuTorchDelegate>();
+      runtime_allocator->construct<NeuronExecuTorchDelegate>();
   if (delegate == nullptr) {
     return Error::MemoryAllocationFailed;
   }
-
-  new (delegate) NeuronExecuTorchDelegate();
 
   for (auto& compile_spec : compile_specs) {
     if (std::strcmp(compile_spec.key, kHighAddrKey) == 0) {

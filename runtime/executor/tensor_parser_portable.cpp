@@ -147,14 +147,7 @@ Result<Tensor> parseTensor(
       Internal,
       "dim_order_to_stride returned invalid status");
 
-  auto* tensor_impl = method_allocator->allocateInstance<TensorImpl>();
-  if (tensor_impl == nullptr) {
-    return Error::MemoryAllocationFailed;
-  }
-
-  // Placement new on the allocated memory space. Note that we create this first
-  // with null data so we can find its expected size before getting its memory.
-  new (tensor_impl) TensorImpl(
+  auto* tensor_impl = method_allocator->construct<TensorImpl>(
       scalar_type,
       dim,
       sizes,
@@ -162,6 +155,9 @@ Result<Tensor> parseTensor(
       dim_order,
       strides,
       dynamism);
+  if (tensor_impl == nullptr) {
+    return Error::MemoryAllocationFailed;
+  }
 
   // Now that we know how big the tensor is, find and assign its memory.
   Result<void*> data_ptr = getTensorDataPtr(

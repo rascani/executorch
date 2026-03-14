@@ -638,15 +638,14 @@ class VulkanBackend final : public ::executorch::runtime::BackendInterface {
       BackendInitContext& context,
       FreeableBuffer* processed,
       ArrayRef<CompileSpec> compile_specs) const override {
+    GraphConfig graph_config = get_graph_config(compile_specs);
+    graph_config.external_adapter = vkapi::set_and_get_external_adapter();
+
     ComputeGraph* compute_graph =
-        context.get_runtime_allocator()->allocateInstance<ComputeGraph>();
+        context.get_runtime_allocator()->construct<ComputeGraph>(graph_config);
     if (compute_graph == nullptr) {
       return Error::MemoryAllocationFailed;
     }
-
-    GraphConfig graph_config = get_graph_config(compile_specs);
-    graph_config.external_adapter = vkapi::set_and_get_external_adapter();
-    new (compute_graph) ComputeGraph(graph_config);
 
     const NamedDataMap* named_data_map = context.get_named_data_map();
     Error err = compileModel(processed->data(), compute_graph, named_data_map);

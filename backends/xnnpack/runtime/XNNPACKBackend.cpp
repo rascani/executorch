@@ -70,12 +70,6 @@ class XnnpackBackend final
       BackendInitContext& context,
       FreeableBuffer* processed,
       ArrayRef<CompileSpec> compile_specs) const override {
-    auto executor = context.get_runtime_allocator()
-                        ->allocateInstance<xnnpack::delegate::XNNExecutor>();
-    if (executor == nullptr) {
-      return Error::MemoryAllocationFailed;
-    }
-
     const NamedDataMap* named_data_map = context.get_named_data_map();
     // thread safe. This can happen when multiple threads call init() on
     // the same backend instance.
@@ -96,11 +90,13 @@ class XnnpackBackend final
 
     auto [workspace_lock, workspace_ptr] = workspace->acquire();
 
-    // Executor has been allocated but not constructed, ensure that runtime_ is
-    // nullptr by constructing it in place here. NOTE: Since we use placement
-    // new and since this type is not trivially destructible, we must call the
-    // destructor manually in destroy().
-    new (executor) xnnpack::delegate::XNNExecutor(workspace);
+    // NOTE: Since we use construct and since this type is not trivially
+    // destructible, we must call the destructor manually in destroy().
+    auto executor = context.get_runtime_allocator()
+                        ->construct<xnnpack::delegate::XNNExecutor>(workspace);
+    if (executor == nullptr) {
+      return Error::MemoryAllocationFailed;
+    }
     Error err = xnnpack::delegate::XNNCompiler::compileModel(
         processed->data(),
         processed->size(),

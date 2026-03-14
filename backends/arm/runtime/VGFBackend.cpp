@@ -137,9 +137,11 @@ class VGFBackend final : public ::executorch::runtime::BackendInterface {
     const char* vgf_data = reinterpret_cast<const char*>(processed->data());
 
     MemoryAllocator* allocator = context.get_runtime_allocator();
-    VgfRepr* repr = allocator->allocateInstance<VgfRepr>();
-    new (repr) VgfRepr(
+    VgfRepr* repr = allocator->construct<VgfRepr>(
         vk_instance, vk_physical_device, vk_device, vk_queue, vk_command_pool);
+    if (repr == nullptr) {
+      return Error::MemoryAllocationFailed;
+    }
 
     auto valid_vgf = repr->process_vgf(vgf_data, compile_specs);
     if (!valid_vgf) {

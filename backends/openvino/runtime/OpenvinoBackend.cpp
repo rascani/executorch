@@ -82,8 +82,10 @@ exr::Result<exr::DelegateHandle*> OpenvinoBackend::init(
 
   // Allocate execution handle
   exr::MemoryAllocator* allocator = context.get_runtime_allocator();
-  ExecutionHandle* handle = allocator->allocateInstance<ExecutionHandle>();
-  new (handle) ExecutionHandle;
+  ExecutionHandle* handle = allocator->construct<ExecutionHandle>();
+  if (handle == nullptr) {
+    return Error::MemoryAllocationFailed;
+  }
   handle->compiled_model = std::make_shared<ov::CompiledModel>(compiled_model);
   handle->infer_request = infer_request;
 

@@ -193,10 +193,11 @@ class BackendDelegate final {
       }
       case executorch_flatbuffer::DataLocation::SEGMENT: {
         const char* backend_id = delegate.id()->c_str();
-        return program->LoadSegment(DataLoader::SegmentInfo(
-            DataLoader::SegmentInfo::Type::Backend,
-            processed->index(),
-            backend_id));
+        return program->LoadSegment(
+            DataLoader::SegmentInfo(
+                DataLoader::SegmentInfo::Type::Backend,
+                processed->index(),
+                backend_id));
       }
       default:
         ET_LOG(
@@ -475,9 +476,9 @@ Error Method::parse_values(const NamedDataMap* external_data_map) {
             static_cast<const executorch_flatbuffer::Int*>(val)->int_val());
       } break;
       case executorch_flatbuffer::KernelTypes::Double: {
-        new (&values_[i])
-            EValue(static_cast<const executorch_flatbuffer::Double*>(val)
-                       ->double_val());
+        new (&values_[i]) EValue(
+            static_cast<const executorch_flatbuffer::Double*>(val)
+                ->double_val());
       } break;
       case executorch_flatbuffer::KernelTypes::Bool: {
         new (&values_[i]) EValue(
@@ -513,11 +514,14 @@ Error Method::parse_values(const NamedDataMap* external_data_map) {
               j);
           evalp_list[j] = &values_[static_cast<size_t>(value_index)];
         }
-        auto* boxed_list_mem =
-            memory_manager_->method_allocator()
-                ->allocateInstance<BoxedEvalueList<int64_t>>();
-        auto boxed_list = new (boxed_list_mem)
-            BoxedEvalueList<int64_t>(evalp_list, int_list, items->size());
+        auto* boxed_list = memory_manager_->method_allocator()
+                               ->construct<BoxedEvalueList<int64_t>>(
+                                   evalp_list, int_list, items->size());
+        ET_CHECK_OR_RETURN_ERROR(
+            boxed_list != nullptr,
+            MemoryAllocationFailed,
+            "Failed to allocate BoxedEvalueList<int64_t> at index %" ET_PRIsize_t,
+            i);
         new (&values_[i]) EValue(boxed_list);
       } break;
       case executorch_flatbuffer::KernelTypes::BoolList: {
@@ -535,11 +539,14 @@ Error Method::parse_values(const NamedDataMap* external_data_map) {
         // portable here we need to allocate a new array of bool and copy cast
         // the flatbuffer data into it, but because of how exceptionally rare
         // this case is its low prio TODO: jakeszwe
-        auto* bool_list_mem =
-            memory_manager_->method_allocator()
-                ->allocateInstance<executorch::aten::ArrayRef<bool>>();
-        auto bool_list = new (bool_list_mem) executorch::aten::ArrayRef<bool>(
-            (const bool*)items->data(), items->size());
+        auto* bool_list = memory_manager_->method_allocator()
+                              ->construct<executorch::aten::ArrayRef<bool>>(
+                                  (const bool*)items->data(), items->size());
+        ET_CHECK_OR_RETURN_ERROR(
+            bool_list != nullptr,
+            MemoryAllocationFailed,
+            "Failed to allocate ArrayRef<bool> at index %" ET_PRIsize_t,
+            i);
         new (&values_[i]) EValue(bool_list);
       } break;
       case executorch_flatbuffer::KernelTypes::DoubleList: {
@@ -550,11 +557,14 @@ Error Method::parse_values(const NamedDataMap* external_data_map) {
             InvalidProgram,
             "Missing list at index %" ET_PRIsize_t,
             i);
-        auto* double_list_mem =
-            memory_manager_->method_allocator()
-                ->allocateInstance<executorch::aten::ArrayRef<double>>();
-        auto double_list = new (double_list_mem)
-            executorch::aten::ArrayRef<double>(items->data(), items->size());
+        auto* double_list = memory_manager_->method_allocator()
+                                ->construct<executorch::aten::ArrayRef<double>>(
+                                    items->data(), items->size());
+        ET_CHECK_OR_RETURN_ERROR(
+            double_list != nullptr,
+            MemoryAllocationFailed,
+            "Failed to allocate ArrayRef<double> at index %" ET_PRIsize_t,
+            i);
         new (&values_[i]) EValue(double_list);
       } break;
       case executorch_flatbuffer::KernelTypes::String: {
@@ -566,11 +576,14 @@ Error Method::parse_values(const NamedDataMap* external_data_map) {
             InvalidProgram,
             "Missing string at index %" ET_PRIsize_t,
             i);
-        auto* char_list_mem =
-            memory_manager_->method_allocator()
-                ->allocateInstance<executorch::aten::ArrayRef<char>>();
-        auto char_list = new (char_list_mem)
-            executorch::aten::ArrayRef<char>(fb_str->c_str(), fb_str->size());
+        auto* char_list = memory_manager_->method_allocator()
+                              ->construct<executorch::aten::ArrayRef<char>>(
+                                  fb_str->c_str(), fb_str->size());
+        ET_CHECK_OR_RETURN_ERROR(
+            char_list != nullptr,
+            MemoryAllocationFailed,
+            "Failed to allocate ArrayRef<char> at index %" ET_PRIsize_t,
+            i);
         new (&values_[i]) EValue(char_list);
       } break;
       case executorch_flatbuffer::KernelTypes::Tensor: {
@@ -611,11 +624,15 @@ Error Method::parse_values(const NamedDataMap* external_data_map) {
               static_cast<uint32_t>(tensors.error()));
           return tensors.error();
         }
-        auto* boxed_tensor_list_mem =
+        auto* boxed_tensor_list =
             memory_manager_->method_allocator()
-                ->allocateInstance<BoxedEvalueList<executorch::aten::Tensor>>();
-        auto boxed_tensor_list = new (boxed_tensor_list_mem)
-            BoxedEvalueList<executorch::aten::Tensor>(std::move(tensors.get()));
+                ->construct<BoxedEvalueList<executorch::aten::Tensor>>(
+                    std::move(tensors.get()));
+        ET_CHECK_OR_RETURN_ERROR(
+            boxed_tensor_list != nullptr,
+            MemoryAllocationFailed,
+            "Failed to allocate BoxedEvalueList<Tensor> at index %" ET_PRIsize_t,
+            i);
         new (&values_[i]) EValue(boxed_tensor_list);
       } break;
       case executorch_flatbuffer::KernelTypes::OptionalTensorList: {
@@ -640,13 +657,16 @@ Error Method::parse_values(const NamedDataMap* external_data_map) {
               static_cast<uint32_t>(tensors.error()));
           return tensors.error();
         }
-        auto* boxed_optional_tensor_list_mem =
+        auto* boxed_optional_tensor_list =
             memory_manager_->method_allocator()
-                ->allocateInstance<
-                    BoxedEvalueList<std::optional<executorch::aten::Tensor>>>();
-        auto boxed_optional_tensor_list = new (boxed_optional_tensor_list_mem)
-            BoxedEvalueList<std::optional<executorch::aten::Tensor>>(
-                std::move(tensors.get()));
+                ->construct<
+                    BoxedEvalueList<std::optional<executorch::aten::Tensor>>>(
+                    std::move(tensors.get()));
+        ET_CHECK_OR_RETURN_ERROR(
+            boxed_optional_tensor_list != nullptr,
+            MemoryAllocationFailed,
+            "Failed to allocate BoxedEvalueList<optional<Tensor>> at index %" ET_PRIsize_t,
+            i);
         new (&values_[i]) EValue(boxed_optional_tensor_list);
       } break;
       default:
@@ -818,12 +838,11 @@ Result<Method> Method::load(
   if (temp_allocator == nullptr) {
     PlatformMemoryAllocator* platform_allocator =
         memory_manager->method_allocator()
-            ->allocateInstance<PlatformMemoryAllocator>();
+            ->construct<PlatformMemoryAllocator>();
     if (platform_allocator == nullptr) {
       ET_LOG(Error, "Failed to allocate PlatformMemoryAllocator");
       return Error::MemoryAllocationFailed;
     }
-    new (platform_allocator) PlatformMemoryAllocator();
     temp_allocator = platform_allocator;
   }
   Method method(program, memory_manager, event_tracer, temp_allocator);
@@ -892,13 +911,12 @@ Error Method::init(
         return merged.error();
       }
       // Allocate memory for the merged data map.
-      merged_data_map_ =
-          method_allocator->allocateInstance<internal::MergedDataMap>();
+      merged_data_map_ = method_allocator->construct<internal::MergedDataMap>(
+          std::move(merged.get()));
       if (merged_data_map_ == nullptr) {
         ET_LOG(Error, "Failed to allocate MergedDataMap");
         return Error::MemoryAllocationFailed;
       }
-      new (merged_data_map_) internal::MergedDataMap(std::move(merged.get()));
       named_data_map = merged_data_map_;
     } else if (external_data_map) {
       named_data_map = external_data_map;

@@ -67,14 +67,13 @@ Result<DelegateHandle*> QnnExecuTorchBackend::init(
 
   // Create QnnManager
   MemoryAllocator* runtime_allocator = context.get_runtime_allocator();
-  QnnManager* qnn_manager = runtime_allocator->allocateInstance<QnnManager>();
+  // NOTE: Since we use construct and since this type is not trivially
+  // destructible, we must call the destructor manually in destroy().
+  QnnManager* qnn_manager = runtime_allocator->construct<QnnManager>(
+      qnn_executorch_options, qnn_context_blob);
   if (qnn_manager == nullptr) {
     return Error::MemoryAllocationFailed;
   }
-
-  // NOTE: Since we use placement new and since this type is not trivially
-  // destructible, we must call the destructor manually in destroy().
-  new (qnn_manager) QnnManager(qnn_executorch_options, qnn_context_blob);
   // TODO: this is a temporal solution for multi-graph support, will be
   //       removed once framework starts to accept runtime configuration
   // ---

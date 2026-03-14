@@ -196,6 +196,93 @@ TEST_F(MemoryAllocatorTest, AllocateListFailure) {
   EXPECT_EQ(p, nullptr);
 }
 
+struct ConstructTestType {
+  int x;
+  double y;
+
+  ConstructTestType() : x(42), y(3.14) {}
+  ConstructTestType(int x, double y) : x(x), y(y) {}
+};
+
+TEST_F(MemoryAllocatorTest, ConstructDefault) {
+  std::array<uint8_t, 256> buffer;
+  MemoryAllocator allocator(buffer.size(), buffer.data());
+
+  auto* p = allocator.construct<ConstructTestType>();
+  ASSERT_NE(p, nullptr);
+  EXPECT_EQ(p->x, 42);
+  EXPECT_EQ(p->y, 3.14);
+}
+
+TEST_F(MemoryAllocatorTest, ConstructWithArgs) {
+  std::array<uint8_t, 256> buffer;
+  MemoryAllocator allocator(buffer.size(), buffer.data());
+
+  auto* p = allocator.construct<ConstructTestType>(7, 2.72);
+  ASSERT_NE(p, nullptr);
+  EXPECT_EQ(p->x, 7);
+  EXPECT_EQ(p->y, 2.72);
+}
+
+TEST_F(MemoryAllocatorTest, ConstructTrivialType) {
+  std::array<uint8_t, 256> buffer;
+  MemoryAllocator allocator(buffer.size(), buffer.data());
+
+  auto* p = allocator.construct<int>(99);
+  ASSERT_NE(p, nullptr);
+  EXPECT_EQ(*p, 99);
+}
+
+TEST_F(MemoryAllocatorTest, ConstructAlignment) {
+  std::array<uint8_t, 256> buffer;
+  MemoryAllocator allocator(buffer.size(), buffer.data());
+
+  auto* p = allocator.construct<ConstructTestType>();
+  ASSERT_NE(p, nullptr);
+  EXPECT_ALIGNED(p, alignof(ConstructTestType));
+}
+
+TEST_F(MemoryAllocatorTest, ConstructAllocationFailure) {
+  std::array<uint8_t, 4> buffer;
+  MemoryAllocator allocator(buffer.size(), buffer.data());
+
+  auto* p = allocator.construct<TestType1024>();
+  EXPECT_EQ(p, nullptr);
+}
+
+struct MoveOnlyType {
+  int value;
+  explicit MoveOnlyType(int v) : value(v) {}
+  MoveOnlyType(MoveOnlyType&& other) noexcept : value(other.value) {
+    other.value = -1;
+  }
+  MoveOnlyType(const MoveOnlyType&) = delete;
+  MoveOnlyType& operator=(const MoveOnlyType&) = delete;
+};
+
+TEST_F(MemoryAllocatorTest, ConstructMoveOnly) {
+  std::array<uint8_t, 256> buffer;
+  MemoryAllocator allocator(buffer.size(), buffer.data());
+
+  MoveOnlyType src(123);
+  auto* p = allocator.construct<MoveOnlyType>(std::move(src));
+  ASSERT_NE(p, nullptr);
+  EXPECT_EQ(p->value, 123);
+  EXPECT_EQ(src.value, -1);
+}
+
+// Verify SFINAE rejects array types at compile time.
+template <typename T, typename Alloc, typename = void>
+struct can_construct : std::false_type {};
+template <typename T, typename Alloc>
+struct can_construct<
+    T,
+    Alloc,
+    std::void_t<decltype(std::declval<Alloc>().template construct<T>())>>
+    : std::true_type {};
+static_assert(can_construct<int, MemoryAllocator>::value);
+static_assert(!can_construct<int[5], MemoryAllocator>::value);
+
 class HelperMacrosTest : public ::testing::Test {
  protected:
   void SetUp() override {
