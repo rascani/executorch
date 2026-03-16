@@ -1,0 +1,15 @@
+[package]
+name = "et-backend-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+std = []
+
+[dependencies]
+et-core = { workspace = true }
+
+[build-dependencies]
+cc = "1"

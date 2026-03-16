@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/et-core",
+    "crates/et-flatbuffer",
+    "crates/et-runtime",
+    "crates/et-kernel-ffi",
+    "crates/et-backend-ffi",
+    "crates/et-pal",
+    "examples/run_pte",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+
+[workspace.dependencies]
+et-core = { path = "crates/et-core" }
+et-flatbuffer = { path = "crates/et-flatbuffer" }
+et-runtime = { path = "crates/et-runtime" }
+et-kernel-ffi = { path = "crates/et-kernel-ffi" }
+et-backend-ffi = { path = "crates/et-backend-ffi" }
+et-pal = { path = "crates/et-pal" }
+flatbuffers = { version = "24.12.23", default-features = false }

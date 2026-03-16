@@ -1,0 +1,13 @@
+[package]
+name = "run-pte"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+et-core = { workspace = true, features = ["std"] }
+et-flatbuffer = { workspace = true, features = ["std"] }
+et-runtime = { workspace = true, features = ["std"] }
+et-kernel-ffi = { workspace = true }
+et-backend-ffi = { workspace = true }
+flatbuffers = { workspace = true }

@@ -1,0 +1,9 @@
+[package]
+name = "et-pal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+std = []

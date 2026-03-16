@@ -1,0 +1,16 @@
+[package]
+name = "et-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+std = []
+
+[dependencies]
+et-core = { workspace = true }
+et-flatbuffer = { workspace = true }
+et-kernel-ffi = { workspace = true }
+et-pal = { workspace = true }
+flatbuffers = { workspace = true }
