@@ -24,30 +24,22 @@ fn main() {
 
     let lib_dir = build_dir.join("lib");
 
-    let include_root = repo_root.parent().expect("repo root has no parent");
-    let c10_shim = repo_root.join("runtime/core/portable_type/c10");
-
-    cc::Build::new()
-        .cpp(true)
-        .std("c++17")
-        .define("C10_USING_CUSTOM_GENERATED_MACROS", None)
-        .file(crate_dir.join("csrc/backend_shim.cpp"))
-        .include(include_root)
-        .include(&c10_shim)
-        .compile("backend_shim");
-
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    println!("cargo:rustc-link-search=native={}", build_dir.display());
-    println!("cargo:rustc-link-lib=static=executorch");
-    println!("cargo:rustc-link-lib=static=executorch_core");
-
+    // portable_ops_lib uses static constructors to register kernels.
+    // Force-load ensures the linker doesn't strip the unreferenced
+    // registration object files.
     if cfg!(target_os = "macos") {
-        println!("cargo:rustc-link-lib=c++");
+        println!(
+            "cargo:rustc-link-arg=-Wl,-force_load,{}/libportable_ops_lib.a",
+            lib_dir.display()
+        );
     } else if cfg!(target_os = "linux") {
-        println!("cargo:rustc-link-lib=stdc++");
+        println!("cargo:rustc-link-arg=-Wl,--whole-archive");
+        println!(
+            "cargo:rustc-link-arg={}/libportable_ops_lib.a",
+            lib_dir.display()
+        );
+        println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
     }
 
-    println!("cargo:rerun-if-changed=csrc/backend_shim.h");
-    println!("cargo:rerun-if-changed=csrc/backend_shim.cpp");
     println!("cargo:rerun-if-env-changed=EXECUTORCH_BUILD_DIR");
 }

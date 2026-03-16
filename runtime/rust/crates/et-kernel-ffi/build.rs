@@ -1,3 +1,9 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
+
 use std::env;
 use std::path::PathBuf;
 
@@ -38,6 +44,7 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", build_dir.display());
     println!("cargo:rustc-link-lib=static=executorch");
     println!("cargo:rustc-link-lib=static=executorch_core");
+
     println!("cargo:rustc-link-lib=static=portable_ops_lib");
     println!("cargo:rustc-link-lib=static=portable_kernels");
 
