@@ -57,6 +57,12 @@ impl<L: DataLoader> Program<L> {
 
         let program_data = loader.load(0, program_size)?;
 
+        // TODO: The Rust flatbuffers verifier rejects PTE files with unaligned
+        // i64 fields (e.g. IntList items vectors at 4-byte-aligned offsets).
+        // This is a spec violation in ExecuTorch's PTE serializer — the actual
+        // read path handles unaligned access safely via copy_nonoverlapping.
+        // Options: fix the serializer upstream, or patch/fork the flatbuffers
+        // crate verifier to skip alignment checks.
         if verification == Verification::InternalConsistency {
             flatbuffers::root::<FBProgram>(program_data.as_slice())
                 .map_err(|_| Error::InvalidProgram)?;
