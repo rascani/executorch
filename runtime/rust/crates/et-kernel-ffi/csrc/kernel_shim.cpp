@@ -19,10 +19,22 @@
 
 using namespace executorch::runtime;
 
+namespace {
+
+struct KernelContextData {
+  MemoryAllocator alloc;
+  KernelRuntimeContext context;
+
+  KernelContextData(uint8_t* buf, uint32_t size)
+      : alloc(size, buf),
+        context(/*event_tracer=*/nullptr, buf ? &alloc : nullptr) {}
+};
+
+} // namespace
+
 extern "C" {
 
 EtOpFunction et_kernel_lookup(const char* name, size_t name_len) {
-  // Copy into a stack buffer and null-terminate.
   char buf[256];
   size_t copy_len = name_len < sizeof(buf) - 1 ? name_len : sizeof(buf) - 1;
   memcpy(buf, name, copy_len);
@@ -32,11 +44,6 @@ EtOpFunction et_kernel_lookup(const char* name, size_t name_len) {
   if (!result.ok()) {
     return nullptr;
   }
-  // OpFunction and EtOpFunction have compatible calling conventions
-  // because KernelRuntimeContext& is passed as a pointer, and
-  // Span<EValue*> is a {pointer, size} pair passed as two args.
-  // However, the Rust side calls through a (void* ctx, void** args, size_t
-  // n_args) signature, which is what et_kernel_call adapts.
   return reinterpret_cast<EtOpFunction>(*result);
 }
 
@@ -45,36 +52,29 @@ void et_kernel_call(
     void* ctx,
     void** args,
     size_t n_args) {
-  // Cast back to the real C++ types.
-  auto* context = static_cast<KernelRuntimeContext*>(ctx);
+  auto* data = static_cast<KernelContextData*>(ctx);
   auto* evalue_ptrs = reinterpret_cast<EValue**>(args);
 
   auto op = reinterpret_cast<OpFunction>(func);
-  op(*context, {evalue_ptrs, n_args});
+  op(data->context, {evalue_ptrs, n_args});
 }
 
-void* et_kernel_context_new(void* temp_allocator) {
-  auto* alloc = static_cast<MemoryAllocator*>(temp_allocator);
-  // Allocate on the heap. In a no_std embedded target, the caller would
-  // provide storage; this shim is for hosted builds that link against
-  // libexecutorch.a.
-  return new KernelRuntimeContext(/*event_tracer=*/nullptr, alloc);
+void* et_kernel_context_new(uint8_t* temp_buf, uint32_t temp_size) {
+  return new KernelContextData(temp_buf, temp_size);
 }
 
 void et_kernel_context_destroy(void* ctx) {
-  delete static_cast<KernelRuntimeContext*>(ctx);
+  delete static_cast<KernelContextData*>(ctx);
 }
 
 uint32_t et_kernel_context_failure_state(const void* ctx) {
-  auto* context = static_cast<const KernelRuntimeContext*>(ctx);
-  return static_cast<uint32_t>(context->failure_state());
+  auto* data = static_cast<const KernelContextData*>(ctx);
+  return static_cast<uint32_t>(data->context.failure_state());
 }
 
-void et_kernel_context_reset_failure(void* ctx) {
-  // KernelRuntimeContext doesn't expose a reset, but we can reconstruct.
-  // For now, the Rust runtime creates a fresh context per method init,
-  // so this is a no-op placeholder.
-  (void)ctx;
+void et_kernel_context_reset_temp(void* ctx) {
+  auto* data = static_cast<KernelContextData*>(ctx);
+  data->alloc.reset();
 }
 
 size_t et_sizeof_evalue(void) {

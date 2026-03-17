@@ -12,10 +12,12 @@ extern "C" {
 
     pub fn et_backend_init(
         backend: *mut u8,
-        allocator: *mut u8,
+        alloc_buf: *mut u8,
+        alloc_size: u32,
         data: *const u8,
         size: usize,
         out_handle: *mut *mut u8,
+        out_alloc_used: *mut u32,
     ) -> u32;
 
     pub fn et_backend_execute(
@@ -23,7 +25,8 @@ extern "C" {
         handle: *mut u8,
         args: *mut *mut u8,
         n_args: usize,
-        temp_alloc: *mut u8,
+        temp_buf: *mut u8,
+        temp_size: u32,
     ) -> u32;
 
     pub fn et_backend_destroy(backend: *mut u8, handle: *mut u8);

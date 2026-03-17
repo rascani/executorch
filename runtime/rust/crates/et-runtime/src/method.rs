@@ -10,7 +10,7 @@ use et_core::evalue::{BoxedEvalueListI64, CArrayRef, EValue};
 use et_core::scalar_type::ScalarType;
 use et_core::tensor::{TensorImpl, TensorShapeDynamism};
 
-use et_flatbuffer::executorch_flatbuffer::{self as fb, ExecutionPlan, InstructionArguments};
+use et_flatbuffer::executorch_flatbuffer::{self as fb, DataLocation, ExecutionPlan, InstructionArguments};
 
 use crate::data_loader::DataLoader;
 use crate::program::Program;
@@ -33,17 +33,25 @@ struct InstructionData {
     operand_b: usize,
 }
 
+struct DelegateData {
+    backend: *mut u8,
+    handle: *mut u8,
+}
+
 pub struct Method {
     n_value: usize,
     values: *mut EValue,
     n_chains: usize,
     chain_instructions: *const ChainData,
     kernel_context: *mut u8,
-    temp_allocator_ptr: *mut BumpAllocator,
+    temp_buf: *mut u8,
+    temp_size: u32,
     input_indices: *const usize,
     n_inputs: usize,
     output_indices: *const usize,
     n_outputs: usize,
+    delegates: *mut DelegateData,
+    n_delegates: usize,
 }
 
 struct ChainData {
@@ -84,6 +92,89 @@ impl Method {
                 n_value,
             )?;
             core::ptr::write(values.add(i), ev);
+        }
+
+        // Initialize delegates
+        let fb_delegates = plan.delegates().ok_or(Error::InvalidProgram)?;
+        let n_delegates = fb_delegates.len();
+        let delegates: *mut DelegateData = allocator.allocate_slice(n_delegates);
+        if delegates.is_null() && n_delegates > 0 {
+            return Err(Error::MemoryAllocationFailed);
+        }
+
+        let mut initialized_delegates: usize = 0;
+        for i in 0..n_delegates {
+            let fb_delegate = fb_delegates.get(i);
+            let backend_id = fb_delegate.id().ok_or(Error::InvalidProgram)?;
+
+            let backend = et_backend_ffi::et_backend_lookup(
+                backend_id.as_bytes().as_ptr(),
+                backend_id.len(),
+            );
+            if backend.is_null() {
+                // Clean up already-initialized delegates before returning
+                for j in 0..initialized_delegates {
+                    let d = &*delegates.add(j);
+                    if !d.backend.is_null() && !d.handle.is_null() {
+                        et_backend_ffi::et_backend_destroy(d.backend, d.handle);
+                    }
+                }
+                return Err(Error::NotFound);
+            }
+
+            let processed = fb_delegate.processed().ok_or(Error::InvalidProgram)?;
+            let (data_ptr, data_size) = match processed.location() {
+                DataLocation::INLINE => {
+                    program.get_backend_delegate_data(processed.index() as usize)?
+                }
+                DataLocation::SEGMENT => {
+                    let seg_buf = program.load_segment(processed.index() as usize)?;
+                    (seg_buf.as_slice().as_ptr(), seg_buf.as_slice().len())
+                    // Note: seg_buf is dropped here. For SEGMENT-based delegates,
+                    // the backend's init() must copy the data it needs.
+                    // XNNPACK uses INLINE so this path is rarely hit for MVP.
+                }
+                _ => {
+                    for j in 0..initialized_delegates {
+                        let d = &*delegates.add(j);
+                        if !d.backend.is_null() && !d.handle.is_null() {
+                            et_backend_ffi::et_backend_destroy(d.backend, d.handle);
+                        }
+                    }
+                    return Err(Error::Internal);
+                }
+            };
+
+            let (alloc_buf, alloc_size) = allocator.remaining();
+            let mut handle: *mut u8 = core::ptr::null_mut();
+            let mut alloc_used: u32 = 0;
+            let err = et_backend_ffi::et_backend_init(
+                backend,
+                alloc_buf,
+                alloc_size,
+                data_ptr,
+                data_size,
+                &mut handle,
+                &mut alloc_used,
+            );
+            if err == 0 {
+                allocator.advance(alloc_used as usize);
+            }
+            if err != 0 {
+                for j in 0..initialized_delegates {
+                    let d = &*delegates.add(j);
+                    if !d.backend.is_null() && !d.handle.is_null() {
+                        et_backend_ffi::et_backend_destroy(d.backend, d.handle);
+                    }
+                }
+                return Err(Error::try_from(err).unwrap_or(Error::Internal));
+            }
+
+            core::ptr::write(
+                delegates.add(i),
+                DelegateData { backend, handle },
+            );
+            initialized_delegates += 1;
         }
 
         let fb_chains = plan.chains().ok_or(Error::InvalidProgram)?;
@@ -159,7 +250,30 @@ impl Method {
                         (InstructionType::KernelCall, 0, 0, kernel_fn, arg_ptrs as *const *mut EValue, na)
                     }
                     InstructionArguments::DelegateCall => {
-                        (InstructionType::DelegateCall, 0, 0, None, core::ptr::null(), 0)
+                        let dc = instr
+                            .instr_args_as_delegate_call()
+                            .ok_or(Error::InvalidProgram)?;
+
+                        let delegate_idx = dc.delegate_index() as usize;
+                        if delegate_idx >= n_delegates {
+                            return Err(Error::InvalidProgram);
+                        }
+
+                        let fb_args = dc.args().ok_or(Error::InvalidProgram)?;
+                        let na = fb_args.len();
+                        let arg_ptrs: *mut *mut EValue = allocator.allocate_slice(na);
+                        if arg_ptrs.is_null() && na > 0 {
+                            return Err(Error::MemoryAllocationFailed);
+                        }
+                        for ai in 0..na {
+                            let val_idx = fb_args.get(ai) as usize;
+                            if val_idx >= n_value {
+                                return Err(Error::InvalidProgram);
+                            }
+                            core::ptr::write(arg_ptrs.add(ai), values.add(val_idx));
+                        }
+
+                        (InstructionType::DelegateCall, delegate_idx, 0, None, arg_ptrs as *const *mut EValue, na)
                     }
                     InstructionArguments::MoveCall => {
                         let mc = instr
@@ -226,12 +340,12 @@ impl Method {
             core::ptr::write(output_indices.add(i), fb_outputs.get(i) as usize);
         }
 
-        let temp_alloc_ptr = match &mut memory.temp_allocator {
-            Some(ta) => *ta as *mut BumpAllocator,
-            None => core::ptr::null_mut(),
+        let (temp_buf, temp_size) = match &memory.temp_allocator {
+            Some(ta) => ta.as_raw_parts(),
+            None => (core::ptr::null_mut(), 0),
         };
 
-        let kernel_context = et_kernel_ffi::et_kernel_context_new(temp_alloc_ptr as *mut u8);
+        let kernel_context = et_kernel_ffi::et_kernel_context_new(temp_buf, temp_size);
 
         Ok(Method {
             n_value,
@@ -239,11 +353,14 @@ impl Method {
             n_chains,
             chain_instructions: chain_data,
             kernel_context,
-            temp_allocator_ptr: temp_alloc_ptr as *mut u8 as *mut BumpAllocator,
+            temp_buf,
+            temp_size,
             input_indices,
             n_inputs,
             output_indices,
             n_outputs,
+            delegates,
+            n_delegates,
         })
     }
 
@@ -275,7 +392,25 @@ impl Method {
                         }
                     }
                     InstructionType::DelegateCall => {
-                        return Err(Error::NotSupported);
+                        let delegate_idx = instr.operand_a;
+                        if delegate_idx >= self.n_delegates {
+                            return Err(Error::InvalidProgram);
+                        }
+                        let delegate = unsafe { &*self.delegates.add(delegate_idx) };
+                        let arg_list = unsafe { &*chain.arg_lists.add(pc) };
+                        let err = unsafe {
+                            et_backend_ffi::et_backend_execute(
+                                delegate.backend,
+                                delegate.handle,
+                                arg_list.args as *mut *mut u8,
+                                arg_list.n_args,
+                                self.temp_buf,
+                                self.temp_size,
+                            )
+                        };
+                        if err != 0 {
+                            return Err(Error::try_from(err).unwrap_or(Error::Internal));
+                        }
                     }
                     InstructionType::MoveCall => {
                         let from_idx = instr.operand_a;
@@ -316,9 +451,9 @@ impl Method {
                     }
                 }
 
-                if !self.temp_allocator_ptr.is_null() {
+                if !self.temp_buf.is_null() {
                     unsafe {
-                        (*self.temp_allocator_ptr).reset();
+                        et_kernel_ffi::et_kernel_context_reset_temp(self.kernel_context);
                     }
                 }
                 pc += 1;
@@ -637,6 +772,14 @@ impl Method {
 
 impl Drop for Method {
     fn drop(&mut self) {
+        for i in 0..self.n_delegates {
+            unsafe {
+                let d = &*self.delegates.add(i);
+                if !d.backend.is_null() && !d.handle.is_null() {
+                    et_backend_ffi::et_backend_destroy(d.backend, d.handle);
+                }
+            }
+        }
         if !self.kernel_context.is_null() {
             unsafe {
                 et_kernel_ffi::et_kernel_context_destroy(self.kernel_context);

@@ -72,6 +72,21 @@ impl BumpAllocator {
     pub fn used(&self) -> usize {
         self.cur as usize - self.begin as usize
     }
+
+    pub fn as_raw_parts(&self) -> (*mut u8, u32) {
+        (self.begin, self.size)
+    }
+
+    pub fn remaining(&self) -> (*mut u8, u32) {
+        let rem = (self.end as usize).saturating_sub(self.cur as usize);
+        (self.cur, rem as u32)
+    }
+
+    pub fn advance(&mut self, bytes: usize) {
+        let new_cur = (self.cur as usize).saturating_add(bytes);
+        let end = self.end as usize;
+        self.cur = core::cmp::min(new_cur, end) as *mut u8;
+    }
 }
 
 pub struct HierarchicalAllocator<'a> {

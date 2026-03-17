@@ -41,6 +41,41 @@ fn main() {
     println!("cargo:rustc-link-lib=static=executorch");
     println!("cargo:rustc-link-lib=static=executorch_core");
 
+    if std::env::var("CARGO_FEATURE_XNNPACK").is_ok() {
+        let xnnpack_dir = build_dir.join("backends/xnnpack");
+        println!(
+            "cargo:rustc-link-search=native={}",
+            xnnpack_dir.display()
+        );
+        println!(
+            "cargo:rustc-link-search=native={}",
+            xnnpack_dir.join("third-party/XNNPACK").display()
+        );
+        println!(
+            "cargo:rustc-link-search=native={}",
+            xnnpack_dir.join("third-party/cpuinfo").display()
+        );
+        println!(
+            "cargo:rustc-link-search=native={}",
+            xnnpack_dir.join("third-party/pthreadpool").display()
+        );
+        println!("cargo:rustc-link-lib=static=xnnpack_backend");
+        println!("cargo:rustc-link-lib=static=XNNPACK");
+        println!("cargo:rustc-link-lib=static=xnnpack-microkernels-prod");
+        println!("cargo:rustc-link-lib=static=cpuinfo");
+        println!("cargo:rustc-link-lib=static=pthreadpool");
+        println!("cargo:rustc-link-lib=static=extension_threadpool");
+
+        let kleidiai_dir = build_dir.join("kleidiai");
+        if kleidiai_dir.join("libkleidiai.a").exists() {
+            println!(
+                "cargo:rustc-link-search=native={}",
+                kleidiai_dir.display()
+            );
+            println!("cargo:rustc-link-lib=static=kleidiai");
+        }
+    }
+
     if cfg!(target_os = "macos") {
         println!("cargo:rustc-link-lib=c++");
     } else if cfg!(target_os = "linux") {

@@ -12,5 +12,6 @@ std = []
 et-core = { workspace = true }
 et-flatbuffer = { workspace = true }
 et-kernel-ffi = { workspace = true }
+et-backend-ffi = { workspace = true }
 et-pal = { workspace = true }
 flatbuffers = { workspace = true }

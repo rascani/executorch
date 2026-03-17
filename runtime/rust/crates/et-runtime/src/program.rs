@@ -181,6 +181,39 @@ impl<L: DataLoader> Program<L> {
         }
     }
 
+    pub fn get_backend_delegate_data(
+        &self,
+        index: usize,
+    ) -> Result<(*const u8, usize)> {
+        let prog = self.internal_program()?;
+        let data_list = prog
+            .backend_delegate_data()
+            .ok_or(Error::InvalidProgram)?;
+        if index >= data_list.len() {
+            return Err(Error::NotFound);
+        }
+        let data = data_list
+            .get(index)
+            .data()
+            .ok_or(Error::InvalidProgram)?;
+        Ok((data.bytes().as_ptr(), data.len()))
+    }
+
+    pub fn load_segment(&self, segment_index: usize) -> Result<FreeableBuffer> {
+        if self.segment_base_offset == 0 {
+            return Err(Error::NotFound);
+        }
+        let prog = self.internal_program()?;
+        let segments = prog.segments().ok_or(Error::NotFound)?;
+        if segment_index >= segments.len() {
+            return Err(Error::NotFound);
+        }
+        let seg = segments.get(segment_index);
+        let offset = self.segment_base_offset + seg.offset();
+        let size = seg.size_() as usize;
+        self.loader.load(offset as usize, size)
+    }
+
     pub fn loader(&self) -> &L {
         &self.loader
     }

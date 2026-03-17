@@ -41,5 +41,20 @@ fn main() {
         println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
     }
 
+    // xnnpack_backend also uses static constructors to register the backend.
+    if env::var("CARGO_FEATURE_XNNPACK").is_ok() {
+        let xnnpack_lib = build_dir.join("backends/xnnpack/libxnnpack_backend.a");
+        if cfg!(target_os = "macos") {
+            println!(
+                "cargo:rustc-link-arg=-Wl,-force_load,{}",
+                xnnpack_lib.display()
+            );
+        } else if cfg!(target_os = "linux") {
+            println!("cargo:rustc-link-arg=-Wl,--whole-archive");
+            println!("cargo:rustc-link-arg={}", xnnpack_lib.display());
+            println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
+        }
+    }
+
     println!("cargo:rerun-if-env-changed=EXECUTORCH_BUILD_DIR");
 }

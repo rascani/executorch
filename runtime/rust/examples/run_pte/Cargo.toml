@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+xnnpack = ["et-backend-ffi/xnnpack"]
+
 [dependencies]
 et-core = { workspace = true, features = ["std"] }
 et-flatbuffer = { workspace = true, features = ["std"] }

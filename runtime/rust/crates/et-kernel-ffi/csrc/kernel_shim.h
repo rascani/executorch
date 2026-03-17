@@ -29,9 +29,11 @@ void et_kernel_call(
     void** args,
     size_t n_args);
 
-// Create a KernelRuntimeContext. temp_allocator may be NULL.
+// Create a KernelRuntimeContext.
+// temp_buf/temp_size describe the temp memory buffer (may be NULL/0).
+// A proper C++ MemoryAllocator is constructed internally.
 // The returned pointer must be freed with et_kernel_context_destroy.
-void* et_kernel_context_new(void* temp_allocator);
+void* et_kernel_context_new(uint8_t* temp_buf, uint32_t temp_size);
 
 // Destroy a KernelRuntimeContext created by et_kernel_context_new.
 void et_kernel_context_destroy(void* ctx);
@@ -40,8 +42,8 @@ void et_kernel_context_destroy(void* ctx);
 // 0 means success (Error::Ok).
 uint32_t et_kernel_context_failure_state(const void* ctx);
 
-// Reset the failure state of a KernelRuntimeContext back to Ok.
-void et_kernel_context_reset_failure(void* ctx);
+// Reset the temp allocator inside the context back to the start of the buffer.
+void et_kernel_context_reset_temp(void* ctx);
 
 // Layout validation helpers — checked at build time in Rust build.rs.
 size_t et_sizeof_evalue(void);

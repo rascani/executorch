@@ -18,9 +18,10 @@ extern "C" {
         n_args: usize,
     );
 
-    pub fn et_kernel_context_new(temp_allocator: *mut u8) -> *mut u8;
+    pub fn et_kernel_context_new(temp_buf: *mut u8, temp_size: u32) -> *mut u8;
     pub fn et_kernel_context_destroy(ctx: *mut u8);
     pub fn et_kernel_context_failure_state(ctx: *const u8) -> u32;
+    pub fn et_kernel_context_reset_temp(ctx: *mut u8);
 
     pub fn et_sizeof_evalue() -> usize;
     pub fn et_alignof_evalue() -> usize;

@@ -54,6 +54,7 @@ version = "0.1.0"
 name = "et-runtime"
 version = "0.1.0"
 dependencies = [
+ "et-backend-ffi",
  "et-core",
  "et-flatbuffer",
  "et-kernel-ffi",
