@@ -49,8 +49,9 @@ impl<L: DataLoader> Program<L> {
 
         // Load the constant segment if present.
         let constant_segment_data = {
-            let prog = flatbuffers::root::<FBProgram>(program_data.as_slice())
-                .map_err(|_| Error::InvalidProgram)?;
+            let prog = unsafe {
+                flatbuffers::root_unchecked::<FBProgram>(program_data.as_slice())
+            };
             let cs = prog.constant_segment();
             let has_constants = cs
                 .and_then(|s| s.offsets())
@@ -84,7 +85,7 @@ impl<L: DataLoader> Program<L> {
         if data.is_empty() {
             return Err(Error::InvalidProgram);
         }
-        flatbuffers::root::<FBProgram>(data).map_err(|_| Error::InvalidProgram)
+        Ok(unsafe { flatbuffers::root_unchecked::<FBProgram>(data) })
     }
 
     pub fn num_methods(&self) -> Result<usize> {

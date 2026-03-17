@@ -104,17 +104,13 @@ fn main() {
     // This is safe because Program keeps the data alive.
     let plan = {
         let prog_data = program.program_data();
-        let fb_prog =
-            flatbuffers::root::<et_flatbuffer::executorch_flatbuffer::Program>(prog_data)
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to parse flatbuffer: {:?}", e);
-                    process::exit(1);
-                });
+        let fb_prog = unsafe {
+            flatbuffers::root_unchecked::<et_flatbuffer::executorch_flatbuffer::Program>(prog_data)
+        };
         let plans = fb_prog.execution_plan().unwrap_or_else(|| {
             eprintln!("No execution plans in program");
             process::exit(1);
         });
-        // Find the plan matching method_name
         let mut found = None;
         for i in 0..plans.len() {
             if plans.get(i).name() == Some(method_name) {
@@ -130,8 +126,9 @@ fn main() {
 
     // Re-parse to get the plan (the previous borrow was dropped)
     let prog_data = program.program_data();
-    let fb_prog =
-        flatbuffers::root::<et_flatbuffer::executorch_flatbuffer::Program>(prog_data).unwrap();
+    let fb_prog = unsafe {
+        flatbuffers::root_unchecked::<et_flatbuffer::executorch_flatbuffer::Program>(prog_data)
+    };
     let fb_plan = fb_prog.execution_plan().unwrap().get(plan);
 
     let mut method = unsafe {
