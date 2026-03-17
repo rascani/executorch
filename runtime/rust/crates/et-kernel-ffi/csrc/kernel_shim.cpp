@@ -49,9 +49,6 @@ void et_kernel_call(
   auto* context = static_cast<KernelRuntimeContext*>(ctx);
   auto* evalue_ptrs = reinterpret_cast<EValue**>(args);
 
-  // The C++ OpFunction signature is:
-  //   void(KernelRuntimeContext&, Span<EValue*>)
-  // Span<EValue*> is a {data, size} pair.
   auto op = reinterpret_cast<OpFunction>(func);
   op(*context, {evalue_ptrs, n_args});
 }

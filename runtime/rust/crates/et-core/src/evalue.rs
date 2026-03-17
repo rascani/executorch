@@ -8,6 +8,23 @@ use crate::tag::Tag;
 use crate::tensor::{Tensor, TensorImpl};
 use crate::error::{Error, Result};
 
+/// Matches C++ `executorch::aten::ArrayRef<T>` layout: {data, length}.
+#[repr(C)]
+pub struct CArrayRef<T> {
+    pub data: *const T,
+    pub len: usize,
+}
+
+/// Matches C++ `torch::executor::BoxedEvalueList<int64_t>` layout.
+/// Contains an `ArrayRef<EValue*>` of wrapped value pointers plus a scratch
+/// buffer where `get()` materializes the unwrapped int64 values.
+#[repr(C)]
+pub struct BoxedEvalueListI64 {
+    pub wrapped_data: *const *mut EValue,
+    pub wrapped_len: usize,
+    pub unwrapped: *mut i64,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub union EValuePayload {
@@ -15,6 +32,7 @@ pub union EValuePayload {
     pub as_double: f64,
     pub as_bool: bool,
     pub as_tensor: Tensor,
+    pub as_ptr: *mut u8,
 }
 
 #[repr(C)]
@@ -58,6 +76,27 @@ impl EValue {
                 as_tensor: Tensor { impl_ptr: tensor_impl },
             },
             tag: Tag::Tensor,
+        }
+    }
+
+    pub fn from_int_list(boxed: *mut BoxedEvalueListI64) -> Self {
+        EValue {
+            payload: EValuePayload { as_ptr: boxed as *mut u8 },
+            tag: Tag::ListInt,
+        }
+    }
+
+    pub fn from_bool_list(array_ref: *mut CArrayRef<bool>) -> Self {
+        EValue {
+            payload: EValuePayload { as_ptr: array_ref as *mut u8 },
+            tag: Tag::ListBool,
+        }
+    }
+
+    pub fn from_double_list(array_ref: *mut CArrayRef<f64>) -> Self {
+        EValue {
+            payload: EValuePayload { as_ptr: array_ref as *mut u8 },
+            tag: Tag::ListDouble,
         }
     }
 

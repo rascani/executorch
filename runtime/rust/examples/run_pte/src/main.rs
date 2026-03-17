@@ -141,51 +141,76 @@ fn main() {
         })
     };
 
-    eprintln!(
-        "Method loaded: {} inputs, {} outputs",
-        method.num_inputs(),
-        method.num_outputs()
-    );
+    let n_inputs = method.num_inputs();
+    let n_outputs = method.num_outputs();
+    eprintln!("Method loaded: {} inputs, {} outputs", n_inputs, n_outputs);
 
-    // For a simple add model (forward(x, y) = x + y), set up float tensor inputs.
-    // This assumes the model expects two 2x2 float tensors.
-    let mut sizes = [2i32, 2];
-    let mut dim_order = [0u8, 1];
-    let mut strides = [2i32, 1];
+    // Build inputs from metadata: fill each tensor with sequential floats.
+    struct InputStorage {
+        data: Vec<f32>,
+        sizes: Vec<i32>,
+        dim_order: Vec<u8>,
+        strides: Vec<i32>,
+    }
 
-    let mut input_data_a = [1.0f32, 2.0, 3.0, 4.0];
-    let mut input_data_b = [10.0f32, 20.0, 30.0, 40.0];
+    let mut storages: Vec<InputStorage> = Vec::with_capacity(n_inputs);
+    for i in 0..n_inputs {
+        let ti = meta.input_tensor_meta(i).unwrap_or_else(|e| {
+            eprintln!("Failed to get input tensor meta {}: {}", i, e);
+            process::exit(1);
+        });
+        let sizes: Vec<i32> = ti.sizes().to_vec();
+        let numel: usize = sizes.iter().map(|&s| s as usize).product();
+        let ndim = sizes.len();
 
-    let mut impl_a = TensorImpl::new(
-        ScalarType::Float,
-        2,
-        sizes.as_mut_ptr(),
-        input_data_a.as_mut_ptr() as *mut u8,
-        dim_order.as_mut_ptr(),
-        strides.as_mut_ptr(),
-        TensorShapeDynamism::Static,
-    );
-    let mut impl_b = TensorImpl::new(
-        ScalarType::Float,
-        2,
-        sizes.as_mut_ptr(),
-        input_data_b.as_mut_ptr() as *mut u8,
-        dim_order.as_mut_ptr(),
-        strides.as_mut_ptr(),
-        TensorShapeDynamism::Static,
-    );
+        let data: Vec<f32> = (0..numel).map(|j| (j + 1) as f32).collect();
 
-    let ev_a = EValue::from_tensor(&mut impl_a as *mut TensorImpl);
-    let ev_b = EValue::from_tensor(&mut impl_b as *mut TensorImpl);
+        // Row-major dim order and strides
+        let dim_order: Vec<u8> = (0..ndim as u8).collect();
+        let mut strides = vec![1i32; ndim];
+        for d in (0..ndim.saturating_sub(1)).rev() {
+            strides[d] = strides[d + 1] * sizes[d + 1];
+        }
 
-    method.set_input(0, &ev_a).unwrap_or_else(|e| {
-        eprintln!("Failed to set input 0: {}", e);
-        process::exit(1);
-    });
-    method.set_input(1, &ev_b).unwrap_or_else(|e| {
-        eprintln!("Failed to set input 1: {}", e);
-        process::exit(1);
-    });
+        eprintln!(
+            "  input[{}]: {:?} {:?} ({} elements)",
+            i, ti.scalar_type, sizes, numel
+        );
+        storages.push(InputStorage {
+            data,
+            sizes,
+            dim_order,
+            strides,
+        });
+    }
+
+    // Create TensorImpl and EValue for each input (borrows from storages).
+    let mut tensor_impls: Vec<TensorImpl> = storages
+        .iter_mut()
+        .map(|s| {
+            TensorImpl::new(
+                ScalarType::Float,
+                s.sizes.len() as isize,
+                s.sizes.as_mut_ptr(),
+                s.data.as_mut_ptr() as *mut u8,
+                s.dim_order.as_mut_ptr(),
+                s.strides.as_mut_ptr(),
+                TensorShapeDynamism::Static,
+            )
+        })
+        .collect();
+
+    let evalues: Vec<EValue> = tensor_impls
+        .iter_mut()
+        .map(|ti| EValue::from_tensor(ti as *mut TensorImpl))
+        .collect();
+
+    for (i, ev) in evalues.iter().enumerate() {
+        method.set_input(i, ev).unwrap_or_else(|e| {
+            eprintln!("Failed to set input {}: {}", i, e);
+            process::exit(1);
+        });
+    }
 
     eprintln!("Executing...");
     method.execute().unwrap_or_else(|e| {

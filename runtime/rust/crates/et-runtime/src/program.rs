@@ -37,20 +37,39 @@ impl<L: DataLoader> Program<L> {
         let extended = header::parse_extended_header(head_data.as_slice())?;
         drop(head_data);
 
-        let (program_offset, program_size, segment_base_offset) = match extended {
-            Some(eh) => {
-                // The program data starts after the extended header.
-                // Extended header: eh_magic(4) + eh_size(4) + program_size(8) + segment_base_offset(8) = 24
-                // Starts at offset 8 (after flatbuffer offset + file identifier)
-                let fb_offset = 8 + 24;
-                (fb_offset, eh.program_size as usize, eh.segment_base_offset)
-            }
-            None => (0, file_size, 0),
+        // The extended header is spliced into the flatbuffer at offset 8,
+        // and the root offset at bytes [0..4] is adjusted to compensate.
+        // So the entire range [0, program_size) IS the flatbuffer data.
+        let (program_size, segment_base_offset) = match extended {
+            Some(eh) => (eh.program_size as usize, eh.segment_base_offset),
+            None => (file_size, 0),
         };
 
-        let program_data = loader.load(program_offset, program_size)?;
+        let program_data = loader.load(0, program_size)?;
 
-        let constant_segment_data = FreeableBuffer::empty();
+        // Load the constant segment if present.
+        let constant_segment_data = {
+            let prog = flatbuffers::root::<FBProgram>(program_data.as_slice())
+                .map_err(|_| Error::InvalidProgram)?;
+            let cs = prog.constant_segment();
+            let has_constants = cs
+                .and_then(|s| s.offsets())
+                .map_or(false, |o| o.len() > 1);
+            if has_constants {
+                let cs = cs.unwrap();
+                let segments = prog.segments().ok_or(Error::InvalidProgram)?;
+                let seg_idx = cs.segment_index() as usize;
+                if seg_idx >= segments.len() {
+                    return Err(Error::InvalidProgram);
+                }
+                let seg = segments.get(seg_idx);
+                let offset = segment_base_offset + seg.offset();
+                let size = seg.size_() as usize;
+                loader.load(offset as usize, size)?
+            } else {
+                FreeableBuffer::empty()
+            }
+        };
 
         Ok(Program {
             loader,
@@ -104,6 +123,40 @@ impl<L: DataLoader> Program<L> {
 
     pub fn segment_base_offset(&self) -> u64 {
         self.segment_base_offset
+    }
+
+    pub fn get_constant_buffer_data(
+        &self,
+        buffer_index: usize,
+        nbytes: usize,
+    ) -> Result<*const u8> {
+        let prog = self.internal_program()?;
+        let cs_data = self.constant_segment_data.as_slice();
+        if !cs_data.is_empty() {
+            let cs = prog
+                .constant_segment()
+                .ok_or(Error::InvalidProgram)?;
+            let offsets = cs.offsets().ok_or(Error::InvalidProgram)?;
+            if buffer_index >= offsets.len() {
+                return Err(Error::InvalidArgument);
+            }
+            let offset = offsets.get(buffer_index) as usize;
+            if offset + nbytes > cs_data.len() {
+                return Err(Error::InvalidArgument);
+            }
+            Ok(cs_data.as_ptr().wrapping_add(offset))
+        } else {
+            // Legacy: constant data in flatbuffer's constant_buffer field
+            let cb = prog.constant_buffer().ok_or(Error::InvalidProgram)?;
+            if buffer_index >= cb.len() {
+                return Err(Error::InvalidArgument);
+            }
+            let storage = cb.get(buffer_index).storage().ok_or(Error::InvalidProgram)?;
+            if nbytes > storage.len() {
+                return Err(Error::InvalidArgument);
+            }
+            Ok(storage.bytes().as_ptr())
+        }
     }
 
     pub fn loader(&self) -> &L {

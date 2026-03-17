@@ -6,7 +6,7 @@
 
 use et_core::allocator::{BumpAllocator, HierarchicalAllocator, MemoryManager};
 use et_core::error::{Error, Result};
-use et_core::evalue::EValue;
+use et_core::evalue::{BoxedEvalueListI64, CArrayRef, EValue};
 use et_core::scalar_type::ScalarType;
 use et_core::tensor::{TensorImpl, TensorShapeDynamism};
 
@@ -80,6 +80,8 @@ impl Method {
                 allocator,
                 program,
                 memory.planned_memory.as_deref_mut(),
+                values,
+                n_value,
             )?;
             core::ptr::write(values.add(i), ev);
         }
@@ -390,6 +392,8 @@ impl Method {
         allocator: &mut BumpAllocator,
         program: &Program<L>,
         planned_memory: Option<&mut HierarchicalAllocator<'_>>,
+        values: *mut EValue,
+        n_value: usize,
     ) -> Result<EValue> {
         let val_type = fb_val.val_type();
 
@@ -416,16 +420,103 @@ impl Method {
                 Self::deserialize_tensor(fb_tensor, allocator, program, planned_memory)
             }
 
-            _ => {
-                Ok(EValue::none())
+            fb::KernelTypes::IntList => {
+                let int_list = fb_val.val_as_int_list().ok_or(Error::InvalidProgram)?;
+                let items = int_list.items().ok_or(Error::InvalidProgram)?;
+                let n = items.len();
+
+                let evalp_list: *mut *mut EValue = allocator.allocate_slice(n);
+                if evalp_list.is_null() && n > 0 {
+                    return Err(Error::MemoryAllocationFailed);
+                }
+
+                let int_scratch: *mut i64 = allocator.allocate_slice(n);
+                if int_scratch.is_null() && n > 0 {
+                    return Err(Error::MemoryAllocationFailed);
+                }
+
+                for j in 0..n {
+                    let value_index = items.get(j) as usize;
+                    if value_index >= n_value {
+                        return Err(Error::InvalidProgram);
+                    }
+                    core::ptr::write(evalp_list.add(j), values.add(value_index));
+                }
+
+                let boxed: *mut BoxedEvalueListI64 = allocator.allocate_instance();
+                if boxed.is_null() {
+                    return Err(Error::MemoryAllocationFailed);
+                }
+                core::ptr::write(
+                    boxed,
+                    BoxedEvalueListI64 {
+                        wrapped_data: evalp_list as *const *mut EValue,
+                        wrapped_len: n,
+                        unwrapped: int_scratch,
+                    },
+                );
+
+                Ok(EValue::from_int_list(boxed))
             }
+
+            fb::KernelTypes::BoolList => {
+                let bool_list = fb_val.val_as_bool_list().ok_or(Error::InvalidProgram)?;
+                let items = bool_list.items().ok_or(Error::InvalidProgram)?;
+                let n = items.len();
+
+                let data: *mut bool = allocator.allocate_slice(n);
+                if data.is_null() && n > 0 {
+                    return Err(Error::MemoryAllocationFailed);
+                }
+                for j in 0..n {
+                    core::ptr::write(data.add(j), items.get(j));
+                }
+
+                let array_ref: *mut CArrayRef<bool> = allocator.allocate_instance();
+                if array_ref.is_null() {
+                    return Err(Error::MemoryAllocationFailed);
+                }
+                core::ptr::write(
+                    array_ref,
+                    CArrayRef { data: data as *const bool, len: n },
+                );
+
+                Ok(EValue::from_bool_list(array_ref))
+            }
+
+            fb::KernelTypes::DoubleList => {
+                let double_list = fb_val.val_as_double_list().ok_or(Error::InvalidProgram)?;
+                let items = double_list.items().ok_or(Error::InvalidProgram)?;
+                let n = items.len();
+
+                let data: *mut f64 = allocator.allocate_slice(n);
+                if data.is_null() && n > 0 {
+                    return Err(Error::MemoryAllocationFailed);
+                }
+                for j in 0..n {
+                    core::ptr::write(data.add(j), items.get(j));
+                }
+
+                let array_ref: *mut CArrayRef<f64> = allocator.allocate_instance();
+                if array_ref.is_null() {
+                    return Err(Error::MemoryAllocationFailed);
+                }
+                core::ptr::write(
+                    array_ref,
+                    CArrayRef { data: data as *const f64, len: n },
+                );
+
+                Ok(EValue::from_double_list(array_ref))
+            }
+
+            _ => Ok(EValue::none()),
         }
     }
 
     unsafe fn deserialize_tensor<L: DataLoader>(
         fb_tensor: fb::Tensor<'_>,
         allocator: &mut BumpAllocator,
-        _program: &Program<L>,
+        program: &Program<L>,
         planned_memory: Option<&mut HierarchicalAllocator<'_>>,
     ) -> Result<EValue> {
         let fb_sizes = fb_tensor.sizes().ok_or(Error::InvalidProgram)?;
@@ -480,8 +571,14 @@ impl Method {
         let allocation_info = fb_tensor.allocation_info();
 
         let data_ptr: *mut u8 = if data_buffer_idx > 0 && allocation_info.is_none() {
-            // Constant tensor — TODO: resolve from constant segment
-            core::ptr::null_mut()
+            let mut numel: usize = 1;
+            for i in 0..dim {
+                numel *= *sizes.add(i) as usize;
+            }
+            let nbytes = numel * scalar_type.element_size();
+            program
+                .get_constant_buffer_data(data_buffer_idx, nbytes)
+                .unwrap_or(core::ptr::null()) as *mut u8
         } else if let Some(alloc_info) = allocation_info {
             let memory_id = alloc_info.memory_id();
             let offset_low = alloc_info.memory_offset_low() as u64;
