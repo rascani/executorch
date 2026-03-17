@@ -13,6 +13,12 @@ use crate::method_meta::MethodMeta;
 
 extern crate flatbuffers;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verification {
+    Minimal,
+    InternalConsistency,
+}
+
 pub struct Program<L: DataLoader> {
     loader: L,
     program_data: FreeableBuffer,
@@ -22,6 +28,10 @@ pub struct Program<L: DataLoader> {
 
 impl<L: DataLoader> Program<L> {
     pub fn load(loader: L) -> Result<Self> {
+        Self::load_with_verification(loader, Verification::Minimal)
+    }
+
+    pub fn load_with_verification(loader: L, verification: Verification) -> Result<Self> {
         let file_size = loader.size()?;
         if file_size < header::MIN_HEAD_BYTES {
             return Err(Error::InvalidProgram);
@@ -46,6 +56,11 @@ impl<L: DataLoader> Program<L> {
         };
 
         let program_data = loader.load(0, program_size)?;
+
+        if verification == Verification::InternalConsistency {
+            flatbuffers::root::<FBProgram>(program_data.as_slice())
+                .map_err(|_| Error::InvalidProgram)?;
+        }
 
         // Load the constant segment if present.
         let constant_segment_data = {
