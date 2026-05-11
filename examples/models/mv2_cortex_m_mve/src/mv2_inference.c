@@ -140,8 +140,20 @@ static void dwconv2d_s8(const int8_t* input, int8_t* output,
                         const DepthwiseConv2dParams* p) {
   /* NHWC int8 input, IHWO int8 weights [1, kH, kW, C], depth_multiplier=1
    * (out_c == in_c).  Per-channel requant, fused ReLU bounds.
-   * Mirrors quantized_depthwise_conv2d_impl in operators.py:858 bit-exactly
-   * when using scalar_requantize. */
+   * Mirrors quantized_depthwise_conv2d_impl in operators.py:858 bit-exactly.
+   *
+   * Fast path (MV2_USE_MVE && out_c % 4 == 0): processes 4 output channels per
+   * inner iteration via vldrbq_s32 / vmulq_s32 / vaddq_s32 and the vector
+   * mve_requantize_per_channel.  This is ~4x faster than the scalar path
+   * since depthwise has no input-channel reduction — each output channel
+   * needs only its matching input channel, so the natural vectorization axis
+   * is the channel dimension.  All MV2 depthwise layers (channels in
+   * {32, 96, 144, 192, 384, 576, 960}) hit this path.
+   *
+   * Scalar fallback runs when MVE is unavailable or out_c is not a multiple
+   * of 4 (first conv's in_c=3 input never reaches a depthwise stage so this
+   * branch is unused in MV2 today; it's here for correctness on synthetic
+   * tests with arbitrary channel counts). */
   const uint32_t in_h = p->in_h, in_w = p->in_w, in_c = p->in_c;
   const uint32_t out_h = p->out_h, out_w = p->out_w, out_c = p->out_c;
   const uint32_t k_h = p->kernel_h, k_w = p->kernel_w;
@@ -158,6 +170,45 @@ static void dwconv2d_s8(const int8_t* input, int8_t* output,
   const size_t in_row_stride = (size_t)in_w * in_c;
   const size_t out_row_stride = (size_t)out_w * out_c;
   const size_t w_row_stride = (size_t)k_w * out_c;
+
+#if MV2_USE_MVE
+  if ((out_c & 3u) == 0u) {
+    const int32x4_t v_in_off  = vdupq_n_s32(input_offset);
+    const int32x4_t v_act_min = vdupq_n_s32(act_min);
+    const int32x4_t v_act_max = vdupq_n_s32(act_max);
+    for (uint32_t oh = 0; oh < out_h; ++oh) {
+      for (uint32_t ow = 0; ow < out_w; ++ow) {
+        for (uint32_t cb = 0; cb < out_c; cb += 4) {
+          int32x4_t acc = (bias != (const int32_t*)0)
+              ? vld1q_s32(bias + cb) : vdupq_n_s32(0);
+          for (uint32_t kh = 0; kh < k_h; ++kh) {
+            const int32_t ih = (int32_t)(oh * stride_h) - pad_h + (int32_t)kh;
+            if (ih < 0 || (uint32_t)ih >= in_h) continue;
+            const int8_t* w_row = weight + (size_t)kh * w_row_stride;
+            const int8_t* x_row = input + (size_t)ih * in_row_stride;
+            for (uint32_t kw = 0; kw < k_w; ++kw) {
+              const int32_t iw = (int32_t)(ow * stride_w) - pad_w + (int32_t)kw;
+              if (iw < 0 || (uint32_t)iw >= in_w) continue;
+              int32x4_t x = vldrbq_s32(x_row + (size_t)iw * in_c + cb);
+              int32x4_t w = vldrbq_s32(w_row + (size_t)kw * out_c + cb);
+              x = vaddq_s32(x, v_in_off);
+              acc = vaddq_s32(acc, vmulq_s32(x, w));
+            }
+          }
+          int32x4_t mult = vld1q_s32(mults + cb);
+          int32x4_t shft = vld1q_s32(shifts + cb);
+          acc = mve_requantize_per_channel(acc, mult, shft);
+          acc = vaddq_n_s32(acc, output_offset);
+          acc = vmaxq_s32(acc, v_act_min);
+          acc = vminq_s32(acc, v_act_max);
+          vstrbq_s32(output + (size_t)oh * out_row_stride
+                       + (size_t)ow * out_c + cb, acc);
+        }
+      }
+    }
+    return;
+  }
+#endif
 
   for (uint32_t oh = 0; oh < out_h; ++oh) {
     for (uint32_t ow = 0; ow < out_w; ++ow) {
