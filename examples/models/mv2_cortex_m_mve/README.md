@@ -7,8 +7,10 @@ backend's Python reference (i.e., the kernels defined in
 `backends/cortex_m/ops/operators.py`) — the same path that
 `test_implementation_mv2` exercises through the ExecuTorch runtime.
 
-See [`docs/DESIGN.md`](docs/DESIGN.md) for the architecture
-walkthrough with diagrams.
+See [`docs/DESIGN.md`](docs/DESIGN.md) for the architecture walkthrough
+with diagrams and [`docs/BENCHMARK.md`](docs/BENCHMARK.md) for a
+side-by-side footprint and latency comparison against the cortex_m
+backend.
 
 The whole compiled inference function (eight kernels plus the entry
 point) lives in a single translation unit (`src/mv2_inference.c`) so

@@ -22,12 +22,33 @@
 #include "mv2_arena.h"
 #include "input_fixture.h"
 
+/* DWT cycle counter registers — Cortex-M55 implements both DWT and the
+ * cycle counter (CYCCNT).  FVP simulates these accurately enough for
+ * sequential comparisons even though the CPU is not cycle-accurate as
+ * a whole. */
+#define DWT_CTRL    (*(volatile uint32_t*)0xE0001000u)
+#define DWT_CYCCNT  (*(volatile uint32_t*)0xE0001004u)
+#define DEMCR       (*(volatile uint32_t*)0xE000EDFCu)
+#define DEMCR_TRCENA   (1u << 24)
+#define DWT_CTRL_CYCCNTENA (1u << 0)
+
+static void enable_cycle_counter(void) {
+  DEMCR    |= DEMCR_TRCENA;
+  DWT_CYCCNT = 0;
+  DWT_CTRL |= DWT_CTRL_CYCCNTENA;
+}
+
 int main(void) {
-  /* Disable stdout buffering so the host sees each line as it's produced. */
   setvbuf(stdout, NULL, _IONBF, 0);
 
-  int8_t output[MV2_OUTPUT_NUM_ELEMENTS];
+  static int8_t output[MV2_OUTPUT_NUM_ELEMENTS];
+
+  enable_cycle_counter();
+  uint32_t start_cycles = DWT_CYCCNT;
   mobilenet_v2_inference(mv2_fixture_input, output);
+  uint32_t elapsed_cycles = DWT_CYCCNT - start_cycles;
+
+  printf("CYCLES %u\n", (unsigned)elapsed_cycles);
 
   printf("RESULT_BEGIN\n");
   for (unsigned i = 0; i < MV2_OUTPUT_NUM_ELEMENTS; ++i) {
