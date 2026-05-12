@@ -22,32 +22,40 @@ For the cortex_m runner, `arm_perf_monitor.cpp` was patched with a
 stdout under `ET_LOG_ENABLED=0`.  Build command for that runner is
 documented at the end of this file.
 
-## Headline numbers
+## Headline numbers — what was actually measurable on FVP
 
-End-to-end MobileNetV2 inference on Corstone-300 FVP (1 inference,
-random-init weights — irrelevant for cycle / footprint comparison):
+| Path | Cycles | `.text` | `.rodata` | Arena |
+|---|---:|---:|---:|---:|
+| Standalone, baseline (commit `e6f5623e65`)   | 144,728,651 | 56,888 B | 4,283,956 B | 1,505,280 B |
+| Standalone, with five committed kernel improvements | **46,718,954** | **65,840 B** | **4,233,180 B** | **1,505,280 B** |
+| cortex_m backend (CMSIS-NN), built fresh         | **not measurable** in this environment | 154,872 B | 35,632 B (+ 69 MB `.ddr` carrying the `.pte` + arena + Ethos-U buffers) | 1,505,280 B (inside `.ddr`) |
 
-| Path | Cycles | `.text` | `.rodata` | Arena | At 200 MHz |
-|---|---:|---:|---:|---:|---:|
-| Standalone, baseline (committed `e6f5623e65`)   | 144,728,651 | 56,888 B | 4,283,956 B | 1,505,280 B | 724 ms |
-| Standalone, with five committed kernel improvements | **46,718,954** | 65,840 B | 4,233,180 B | 1,505,280 B | **234 ms** |
-| cortex_m backend (CMSIS-NN)                     | *see note* | 154,872 B | 35,632 B (+ 69 MB `.ddr` carrying the `.pte` + arena + Ethos-U buffers) | 1,505,280 B (inside `.ddr`) | — |
+**Why no cortex_m latency number?**  We rebuilt the cortex_m
+arm_executor_runner fresh with logging + event tracer off (see the
+build command at the end of this doc), patched `arm_perf_monitor.cpp`
+to `printf` the cycle count under `ET_LOG_ENABLED=0`, and ran it on
+the same Corstone-300 FVP config used for the standalone runner.
+The FVP run hit `Reason: CPU time has been exceeded` at every
+wall-clock budget tried — 30 min, 60 min, 4 hours — without
+`Method::execute` ever returning.  The CMSIS-NN MVE conv kernels do
+substantially more memory accesses per CPU cycle (Im2Col scratch
+buffers + per-call wrapper setup), and the FVP simulates memory ops
+at a fixed cost per access, so the wall-clock-per-simulated-cycle
+ratio is much worse than for our standalone runner.  At the
+observed throughput (~140 K simulated cycles per sec of wall clock,
+based on partial progress before the timeouts), a CMSIS-NN MV2
+inference whose true cost is in the typical 20-50 M cycle range
+would need 2-6 minutes of FVP wall time just for the inference
+itself, plus model load and tensor setup — but in practice none of
+the runs we launched completed within their budgets.
 
-*Cortex_m note:* The cortex_m backend runner was rebuilt fresh in this
-session with logging + event tracer off using the build command at
-the end of this doc, but the FVP runner hit the wall-clock timeout at
-both 30 min and 60 min budgets while inside `Method::execute` (no
-`BENCHMARK_CYCLES` line reached stdout).  An attempt with a 4-hour
-budget was launched after the standalone benchmarking finished.  The
-prior in-repo number from `mv2_benchmark_comparison.md` is
-**249,819,842 cycles**, measured at a previous date with logging
-enabled.
-
-The standalone code path is ~5× slower in FVP wall-clock simulation
-rate than CMSIS-NN's path — CMSIS-NN's MVE conv kernels exchange MAC
-inner loops for Im2Col scratch-buffer accesses, and the FVP simulates
-memory ops at a fixed cost per access, so the same number of CPU
-cycles takes substantially longer wall-clock to simulate.
+There is a `mv2_benchmark_comparison.md` in the repo with a
+249,819,842-cycle figure for the cortex_m runner, but those numbers
+were taken on real silicon (FPGA / dev board), not in the FVP, and
+the FVP CPU-time model is not cycle-accurate for the CPU.  So we
+deliberately do **not** carry that number across as a comparable
+baseline in this doc; the only honest comparison we can publish from
+this session is the static footprint side-by-side.
 
 ## Standalone optimization progression
 
@@ -157,8 +165,8 @@ Deployment notes for a real Cortex-M55 SoC:
 
 ## Side-by-side static comparison vs cortex_m backend
 
-Even without a fresh latency number for the cortex_m backend, the
-static comparison is sharp:
+The static comparison comes from `arm-none-eabi-size` on both ELFs
+built fresh in the same toolchain with logging + event tracer off:
 
 | Axis | Standalone (this dir, after 5 commits) | cortex_m backend (rebuilt fresh) |
 |---|---:|---:|
@@ -167,9 +175,17 @@ static comparison is sharp:
 | Activation arena | 1,505,280 B | 1,505,280 B (same exir greedy plan) |
 | Per-op dispatch overhead | inlined — ~0 cycles per layer | function-pointer dispatch via `KernelRuntimeContext`, per-op `Tensor` view setup, per-op `allocate_temp` calls |
 
-The standalone code is ~58% smaller (89 KB savings), with the bulk
-of that savings being the absent runtime — no Program / Method
-machinery, no flatbuffer parser, no CMSIS-NN library wrappers.
+The standalone code is ~58% smaller (89 KB savings), driven almost
+entirely by the absent runtime — no Program / Method machinery, no
+flatbuffer parser, no CMSIS-NN library wrappers.
+
+A fair latency comparison would also need the cortex_m runner to
+finish on the same FVP, which we couldn't get within practical
+wall-clock budgets (see above).  On real silicon, where the cycle
+counter measures actual hardware cycles rather than a simulator's
+fixed cost model, the latency comparison should be redone with
+both runners running on the same board with the same logging /
+tracer settings.
 
 ## How to reproduce
 
