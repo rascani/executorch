@@ -96,6 +96,112 @@ static void conv2d_s8(const int8_t* input, int8_t* output, const Conv2dParams* p
   const size_t out_row_stride = (size_t)out_w * out_c;
   const size_t w_oc_stride = (size_t)k_h * k_w * in_c;
 
+#if MV2_USE_MVE
+  /* Fast path: process 4 output channels per inner iteration, sharing the
+   * input load across the 4 weight rows.  Cuts input bandwidth 4x and
+   * collapses the per-channel requantize into one vector op.  Triggers when
+   * out_c % 4 == 0 — true for every conv2d layer in torchvision MV2. */
+  if ((out_c & 3u) == 0u) {
+    const int32x4_t v_act_min = vdupq_n_s32(act_min);
+    const int32x4_t v_act_max = vdupq_n_s32(act_max);
+    /* The extractor folds input_offset * sum(weight[oc]) into the bias for
+     * safe layers (1x1 with no padding), and sets input_offset == 0 to
+     * signal "no runtime offset needed".  Skip the sum_w accumulation in
+     * that case — it saves a `vaddvq_s8` per 16-channel chunk per OC. */
+    const int offset_baked = (input_offset == 0);
+    for (uint32_t oh = 0; oh < out_h; ++oh) {
+      for (uint32_t ow = 0; ow < out_w; ++ow) {
+        for (uint32_t ocb = 0; ocb < out_c; ocb += 4) {
+          int32_t a0 = (bias != (const int32_t*)0) ? bias[ocb + 0] : 0;
+          int32_t a1 = (bias != (const int32_t*)0) ? bias[ocb + 1] : 0;
+          int32_t a2 = (bias != (const int32_t*)0) ? bias[ocb + 2] : 0;
+          int32_t a3 = (bias != (const int32_t*)0) ? bias[ocb + 3] : 0;
+          int32_t sum_w0 = 0, sum_w1 = 0, sum_w2 = 0, sum_w3 = 0;
+          const int8_t* w0_oc = weight + (size_t)(ocb + 0) * w_oc_stride;
+          const int8_t* w1_oc = weight + (size_t)(ocb + 1) * w_oc_stride;
+          const int8_t* w2_oc = weight + (size_t)(ocb + 2) * w_oc_stride;
+          const int8_t* w3_oc = weight + (size_t)(ocb + 3) * w_oc_stride;
+          for (uint32_t kh = 0; kh < k_h; ++kh) {
+            const int32_t ih = (int32_t)(oh * stride_h) - pad_h + (int32_t)kh;
+            if (ih < 0 || (uint32_t)ih >= in_h) continue;
+            for (uint32_t kw = 0; kw < k_w; ++kw) {
+              const int32_t iw = (int32_t)(ow * stride_w) - pad_w + (int32_t)kw;
+              if (iw < 0 || (uint32_t)iw >= in_w) continue;
+              const int8_t* x = input + (size_t)ih * in_row_stride
+                                + (size_t)iw * in_c;
+              const size_t w_off = ((size_t)kh * k_w + kw) * in_c;
+              uint32_t ic = 0;
+              if (offset_baked) {
+                while (ic + 16 <= in_c) {
+                  int8x16_t v_x  = vld1q_s8(x + ic);
+                  int8x16_t v_w0 = vld1q_s8(w0_oc + w_off + ic);
+                  int8x16_t v_w1 = vld1q_s8(w1_oc + w_off + ic);
+                  int8x16_t v_w2 = vld1q_s8(w2_oc + w_off + ic);
+                  int8x16_t v_w3 = vld1q_s8(w3_oc + w_off + ic);
+                  a0 = vmladavaq_s8(a0, v_x, v_w0);
+                  a1 = vmladavaq_s8(a1, v_x, v_w1);
+                  a2 = vmladavaq_s8(a2, v_x, v_w2);
+                  a3 = vmladavaq_s8(a3, v_x, v_w3);
+                  ic += 16;
+                }
+              } else {
+                while (ic + 16 <= in_c) {
+                  int8x16_t v_x  = vld1q_s8(x + ic);
+                  int8x16_t v_w0 = vld1q_s8(w0_oc + w_off + ic);
+                  int8x16_t v_w1 = vld1q_s8(w1_oc + w_off + ic);
+                  int8x16_t v_w2 = vld1q_s8(w2_oc + w_off + ic);
+                  int8x16_t v_w3 = vld1q_s8(w3_oc + w_off + ic);
+                  a0 = vmladavaq_s8(a0, v_x, v_w0);
+                  a1 = vmladavaq_s8(a1, v_x, v_w1);
+                  a2 = vmladavaq_s8(a2, v_x, v_w2);
+                  a3 = vmladavaq_s8(a3, v_x, v_w3);
+                  sum_w0 += vaddvq_s8(v_w0);
+                  sum_w1 += vaddvq_s8(v_w1);
+                  sum_w2 += vaddvq_s8(v_w2);
+                  sum_w3 += vaddvq_s8(v_w3);
+                  ic += 16;
+                }
+              }
+              for (; ic < in_c; ++ic) {
+                int32_t x_v = (int32_t)x[ic];
+                a0 += x_v * (int32_t)w0_oc[w_off + ic];
+                a1 += x_v * (int32_t)w1_oc[w_off + ic];
+                a2 += x_v * (int32_t)w2_oc[w_off + ic];
+                a3 += x_v * (int32_t)w3_oc[w_off + ic];
+                if (!offset_baked) {
+                  sum_w0 += (int32_t)w0_oc[w_off + ic];
+                  sum_w1 += (int32_t)w1_oc[w_off + ic];
+                  sum_w2 += (int32_t)w2_oc[w_off + ic];
+                  sum_w3 += (int32_t)w3_oc[w_off + ic];
+                }
+              }
+            }
+          }
+          if (!offset_baked) {
+            a0 += sum_w0 * input_offset;
+            a1 += sum_w1 * input_offset;
+            a2 += sum_w2 * input_offset;
+            a3 += sum_w3 * input_offset;
+          }
+          int32x4_t accv = vsetq_lane_s32(a0, vdupq_n_s32(0), 0);
+          accv = vsetq_lane_s32(a1, accv, 1);
+          accv = vsetq_lane_s32(a2, accv, 2);
+          accv = vsetq_lane_s32(a3, accv, 3);
+          int32x4_t mult = vld1q_s32(mults + ocb);
+          int32x4_t shft = vld1q_s32(shifts + ocb);
+          accv = mve_requantize_per_channel(accv, mult, shft);
+          accv = vaddq_n_s32(accv, output_offset);
+          accv = vmaxq_s32(accv, v_act_min);
+          accv = vminq_s32(accv, v_act_max);
+          vstrbq_s32(output + (size_t)oh * out_row_stride
+                       + (size_t)ow * out_c + ocb, accv);
+        }
+      }
+    }
+    return;
+  }
+#endif
+
   for (uint32_t oh = 0; oh < out_h; ++oh) {
     for (uint32_t ow = 0; ow < out_w; ++ow) {
       for (uint32_t oc = 0; oc < out_c; ++oc) {
@@ -111,16 +217,6 @@ static void conv2d_s8(const int8_t* input, int8_t* output, const Conv2dParams* p
                               + (size_t)iw * in_c;
             const int8_t* w = w_oc + ((size_t)kh * k_w + kw) * in_c;
             uint32_t ic = 0;
-#if MV2_USE_MVE
-            while (ic + 16 <= in_c) {
-              int8x16_t v_x = vld1q_s8(x + ic);
-              int8x16_t v_w = vld1q_s8(w + ic);
-              acc = vmladavaq_s8(acc, v_x, v_w);
-              /* input_offset contribution from the 16 lanes */
-              acc += vaddvq_s8(v_w) * input_offset;
-              ic += 16;
-            }
-#endif
             for (; ic < in_c; ++ic) {
               acc += ((int32_t)x[ic] + input_offset) * (int32_t)w[ic];
             }

@@ -270,17 +270,54 @@ def extract_quantized_conv2d(node: Node, program: ExportedProgram, offsets, size
     bias_t = _resolve_tensor(program, a["bias"]) if a["bias"] is not None else None
     mults_t = _resolve_tensor(program, a["requantize_multipliers"])
     shifts_t = _resolve_tensor(program, a["requantize_shifts"])
+    # When safe (1x1 conv with no padding, or any conv with padding=0 *and* an
+    # output region fully inside the input — which 1x1 always satisfies), fold
+    # the input_offset contribution into a per-channel bias once AOT.
+    #
+    # Math: cortex_m conv2d has no filter_offset (weights are symmetric with
+    # zero_point == 0), so
+    #   acc[oc] = sum_kh_kw_ic((x + input_offset) * w[oc][...])
+    #          = sum(x * w[oc]) + input_offset * sum_kh_kw_ic(w[oc])
+    # The second term is a per-OC constant when all kernel taps contribute
+    # uniformly across output pixels.  For 1x1 convs that holds trivially.
+    # For non-1x1 convs with padding, edge output pixels use only a subset of
+    # the kernel taps, so the second term varies per pixel — we keep
+    # input_offset as a runtime arg in that case.
+    weight_int32 = weight_t.detach().to(torch.int32).contiguous()
+    kernel_h, kernel_w = weight_int32.shape[1], weight_int32.shape[2]  # OHWI
+    pad_h, pad_w = _coerce_int_pair(a["padding"])
+    safe_to_fold = (
+        kernel_h == 1 and kernel_w == 1 and pad_h == 0 and pad_w == 0
+    )
+    if safe_to_fold:
+        sum_w_per_oc = weight_int32.flatten(1).sum(dim=1)  # [out_c]
+        offset_term = sum_w_per_oc * int(a["input_offset"])
+        if bias_t is not None:
+            bias_with_offset = bias_t.detach().to(torch.int32).flatten() + offset_term
+        else:
+            bias_with_offset = offset_term
+        bias_with_offset = bias_with_offset.to(torch.int32).contiguous()
+        emitted_bias = bias_with_offset
+        emitted_input_offset = 0
+    else:
+        emitted_bias = (
+            bias_t.detach().to(torch.int32).flatten().contiguous()
+            if bias_t is not None else None
+        )
+        emitted_input_offset = int(a["input_offset"])
     return Conv2dLayer(
         input=_slot_from_node(a["input"], offsets, sizes),
         output=_slot_from_node(node, offsets, sizes),
         weight=weight_t.detach().to(torch.int8).contiguous(),
-        bias=bias_t.detach().to(torch.int32).flatten().contiguous() if bias_t is not None else None,
+        bias=emitted_bias,
         requantize_multipliers=mults_t.detach().to(torch.int32).flatten().contiguous(),
         requantize_shifts=shifts_t.detach().to(torch.int32).flatten().contiguous(),
         stride=_coerce_int_pair(a["stride"]),
         padding=_coerce_int_pair(a["padding"]),
         dilation=_coerce_int_pair(a["dilation"]),
-        input_offset=int(a["input_offset"]),
+        # input_offset == 0 signals to the kernel that the offset is already
+        # folded into the bias (skips the runtime sum_w computation).
+        input_offset=emitted_input_offset,
         output_offset=int(a["output_offset"]),
         activation_min=int(a["activation_min"]),
         activation_max=int(a["activation_max"]),
