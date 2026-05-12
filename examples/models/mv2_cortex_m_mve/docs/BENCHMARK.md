@@ -192,31 +192,78 @@ FVP-vs-FVP latency comparison (full MV2, Corstone-300):
 | Standalone (after 5 commits)         | **46,718,954** | **3.69× faster** |
 | cortex_m backend (CMSIS-NN)          | 172,218,932 | 1.00× |
 
-Where the 3.69× comes from:
-- **Per-op dispatch overhead** in the cortex_m runtime.  `Method::execute`
-  iterates the program's chain, creates a `Tensor` view for each
-  kernel input/output, calls `KernelRuntimeContext::allocate_temp`
-  for scratch, and dispatches via function pointer.  Across MV2's
-  ~70 ops that adds tens of thousands of cycles per layer.  The
-  standalone path inlines kernel calls directly into the entry
-  point — zero dispatch overhead.
-- **Per-call CMSIS-NN wrapper setup.**  `arm_convolve_wrapper_s8`
-  takes a `cmsis_nn_dims` struct, picks an inner kernel variant
-  from a dispatch table, threads through a `cmsis_nn_context` for
-  scratch.  Our kernels skip all of that.
-- **Per-channel requantize through the CMSIS-NN scalar path.**
-  CMSIS-NN's MVE conv kernels emit per-channel requantize via the
-  scalar `arm_nn_requantize` helper inside the wrapper, not the
-  vectorized `vqrdmulhq_s32 + vrshlq_s32` form that the MVE conv
-  kernels themselves use internally for the MAC reduction.  Our
-  kernels emit `mve_requantize_per_channel` inline 4-wide.
+### Where the 3.69× actually comes from
 
-It would NOT be accurate to read the 3.69× as "our kernels beat
-CMSIS-NN's kernels."  For individual large 1×1 conv layers
-CMSIS-NN's tuned inner loops are likely tighter than ours (Im2Col
-+ GEMM with hand-scheduled register-blocked microkernels).  We win
-on end-to-end inference *because* we eliminate the dispatch and
-wrapper overhead between layers and call the kernel directly.
+Both binaries use the same MVE int8 reduce instruction (`vmladava.s8`)
+in their hot loops — `arm-none-eabi-objdump` shows it as a generic
+`cdp 15, ...` because the binutils 2.42 disassembler doesn't pretty-
+print MVE encodings, but the underlying bytes match the same intrinsic
+(see "Instruction-level verification" below).  So this is **not** a
+"we use MVE and they don't" win.  The 3.69× decomposes into:
+
+1. **Inner-loop tile geometry — per-output instruction count is ~1.7×
+   better here.**  CMSIS-NN's `arm_nn_mat_mult_nt_t_s8` inner loop
+   processes a 4-row × 1-column tile per iter (5 `vldrb.8` loads +
+   4 `vmladava.s8` + 1 `vaddva.s8` for the input-offset sum = ~10
+   instructions per 64 MACs = 4 outputs).  Our fast 1×1 path processes
+   a 4-OC × 2-pixel tile per iter (6 `vldrb.8` loads + 8 `vmladava.s8`
+   + 0 `vaddva` since input_offset is AOT-folded into bias = 14
+   instructions per 128 MACs = 8 outputs).  Per output: 2.5 instr vs.
+   1.75 instr.
+2. **AOT-folded input_offset for 1×1 convs.**  For 1×1 convs with no
+   padding (all MV2 conv2d except the first 3×3), the
+   `input_offset * sum(weight[oc])` correction is a per-OC constant,
+   so the AOT dumper folds it into the bias.  This eliminates the
+   `vaddva.s8` inside the inner loop — one full vector op per IC chunk
+   per OC across all 34 of those layers.  CMSIS-NN's MVE matmul always
+   carries the `vaddva.s8` because its inner loop is generic over the
+   input zero-point being non-zero.
+3. **Per-op dispatch overhead in `Method::execute`.**  For each of MV2's
+   ~70 ops, the cortex_m runtime walks the chain, constructs a
+   `Tensor` view for each input/output, calls
+   `KernelRuntimeContext::allocate_temp` for scratch, and dispatches
+   the kernel via a function pointer.  The standalone path inlines
+   the kernel calls directly into `mobilenet_v2_inference` with all
+   `LayerParams` constant-folded — zero dispatch.
+4. **Per-call CMSIS-NN wrapper setup.**  `arm_convolve_wrapper_s8`
+   takes a `cmsis_nn_dims` struct, picks an inner kernel variant from
+   a dispatch table, and threads through a `cmsis_nn_context` for
+   Im2Col scratch.  Our kernels skip all of that.
+5. **Vectorized 4-wide requantize at tile boundaries.**  We use
+   `mve_requantize_per_channel(int32x4_t, int32x4_t mult, int32x4_t shift)`
+   to requantize 4 OCs in parallel at the end of each 4-OC tile.
+   CMSIS-NN mixes vector requantize (`arm_requantize_mve`, used in
+   `arm_nn_mat_mult_nt_t_s8`) and scalar requantize
+   (`arm_nn_requantize`, used in tail and `vec_mat_mult` paths) and
+   takes the scalar path more often than ours does.
+
+We win on inner-loop *throughput* because of (1) and (2), and we win
+on per-layer *fixed costs* because of (3) and (4).  Splitting the
+3.69× cleanly between inner-loop and overhead would need cycle
+sampling per layer, which we haven't done.
+
+### Instruction-level verification
+
+Verified that GCC 13.3's `vmladavaq_s8` intrinsic emits the same
+instruction encoding CMSIS-NN hand-writes as `vmladava.s8` in inline
+assembly.  Both encode in the MVE-compute encoding space (coprocessor
+15) and both disassemble identically as `cdp 15, ...` /
+`cdp2 15, ...` with the GNU disassembler (which lacks pretty-printing
+for MVE int8 reduce; LLVM disassembler with `--mcpu=cortex-m55` is
+needed to see `vmladava.s8`).  Counts in the two ELFs:
+
+| Instruction class | Standalone | cortex_m backend |
+|---|---:|---:|
+| MVE compute (`cdp`/`cdp2 15, ...`) — incl. `vmladava.s8`, `vaddva.s8` | 259 | 272 |
+| MVE narrow vector load (`ldc 14, ...`) — `vldrb.s8 q*, [rN], #16` | 88 | 124 |
+| MVE wide load (`ldc 15, ...`) — `vldrw.s32 q*, [rN], #...` | 1,096 | 146 |
+| Scalar DSP MAC (`smlal`) | 1 | 0 |
+
+Both binaries are MVE-vectorized at the int8 MAC inner loop.  The
+standalone's higher MVE-wide-load count (`ldc 15`) reflects the
+inlined per-layer constant loads (`LayerParams` field reads and
+multiplier/shift fetches into vectors); the cortex_m runner does those
+loads through CMSIS-NN's helper functions which mostly stay scalar.
 
 ## How to reproduce
 
