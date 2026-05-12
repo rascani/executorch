@@ -22,40 +22,45 @@ For the cortex_m runner, `arm_perf_monitor.cpp` was patched with a
 stdout under `ET_LOG_ENABLED=0`.  Build command for that runner is
 documented at the end of this file.
 
-## Headline numbers — what was actually measurable on FVP
+## Headline numbers (Corstone-300 FVP, DWT CYCCNT)
 
-| Path | Cycles | `.text` | `.rodata` | Arena |
+| Path | Cycles / inference | `.text` | `.rodata` | Arena |
 |---|---:|---:|---:|---:|
 | Standalone, baseline (commit `e6f5623e65`)   | 144,728,651 | 56,888 B | 4,283,956 B | 1,505,280 B |
 | Standalone, with five committed kernel improvements | **46,718,954** | **65,840 B** | **4,233,180 B** | **1,505,280 B** |
-| cortex_m backend (CMSIS-NN), built fresh         | **not measurable** in this environment | 154,872 B | 35,632 B (+ 69 MB `.ddr` carrying the `.pte` + arena + Ethos-U buffers) | 1,505,280 B (inside `.ddr`) |
+| cortex_m backend (CMSIS-NN), rebuilt fresh   | **172,218,932** | 478,960 B (test runner — handles arbitrary models via semihosting) | 35,632 B (+ 128 MB `.ddr` carrying the `.pte` + 60 MB input-file pool + arena + Ethos-U buffers) | 1,505,280 B (inside `.ddr`) |
 
-**Why no cortex_m latency number?**  We rebuilt the cortex_m
-arm_executor_runner fresh with logging + event tracer off (see the
-build command at the end of this doc), patched `arm_perf_monitor.cpp`
-to `printf` the cycle count under `ET_LOG_ENABLED=0`, and ran it on
-the same Corstone-300 FVP config used for the standalone runner.
-The FVP run hit `Reason: CPU time has been exceeded` at every
-wall-clock budget tried — 30 min, 60 min, 4 hours — without
-`Method::execute` ever returning.  The CMSIS-NN MVE conv kernels do
-substantially more memory accesses per CPU cycle (Im2Col scratch
-buffers + per-call wrapper setup), and the FVP simulates memory ops
-at a fixed cost per access, so the wall-clock-per-simulated-cycle
-ratio is much worse than for our standalone runner.  At the
-observed throughput (~140 K simulated cycles per sec of wall clock,
-based on partial progress before the timeouts), a CMSIS-NN MV2
-inference whose true cost is in the typical 20-50 M cycle range
-would need 2-6 minutes of FVP wall time just for the inference
-itself, plus model load and tensor setup — but in practice none of
-the runs we launched completed within their budgets.
+The standalone-after-five-commits path is **3.69× faster** than the
+cortex_m backend on this FVP config with bit-exact int8 outputs.
+The cortex_m backend runner's `.text` is much larger than ours
+because it's the test-framework's generic semihosting runner that
+can take any PTE via `-m` at runtime, includes BundleIO scaffolding,
+plus the executorch runtime + flatbuffer parser + portable kernels
++ CMSIS-NN library + Ethos-U driver code.  For a real production
+deployment that hardcodes the model (no semihosting, no BundleIO),
+the cortex_m runner shrinks to roughly the 154 KB range — still 2-3×
+our standalone.
 
-There is a `mv2_benchmark_comparison.md` in the repo with a
-249,819,842-cycle figure for the cortex_m runner, but those numbers
-were taken on real silicon (FPGA / dev board), not in the FVP, and
-the FVP CPU-time model is not cycle-accurate for the CPU.  So we
-deliberately do **not** carry that number across as a comparable
-baseline in this doc; the only honest comparison we can publish from
-this session is the static footprint side-by-side.
+### How we got the cortex_m FVP number
+
+The key issue: the test-framework runner is built with
+`-DET_LOG_ENABLED=0`, so the `arm_perf_monitor.cpp` cycle-output
+`ET_LOG(Info, ...)` calls compile away to nothing.  Output files
+(`out-0.bin`, `out-1.bin`, ...) still reach disk via a different
+semihosting channel (`SYS_WRITE`), which is why the test framework's
+`test_implementation_mv2` test passes but produces no cycle stdout.
+
+To recover the cycle count we patched `arm_perf_monitor.cpp` to
+`printf("BENCHMARK_CYCLES %u\n", cycle_count)` (which bypasses
+`ET_LOG_ENABLED`) and rebuilt only the runner.  Running pytest's
+`test_implementation_mv2` against the patched runner then captures
+the FVP stdout with the cycle line.  See the reproduction section
+below for the exact invocation.
+
+A previous in-repo file (`mv2_benchmark_comparison.md`,
+**249,819,842 cycles**) reports cortex_m latency on real silicon;
+it's not directly comparable to FVP numbers since the FVP's CPU
+time model is not cycle-accurate.
 
 ## Standalone optimization progression
 
@@ -179,13 +184,39 @@ The standalone code is ~58% smaller (89 KB savings), driven almost
 entirely by the absent runtime — no Program / Method machinery, no
 flatbuffer parser, no CMSIS-NN library wrappers.
 
-A fair latency comparison would also need the cortex_m runner to
-finish on the same FVP, which we couldn't get within practical
-wall-clock budgets (see above).  On real silicon, where the cycle
-counter measures actual hardware cycles rather than a simulator's
-fixed cost model, the latency comparison should be redone with
-both runners running on the same board with the same logging /
-tracer settings.
+FVP-vs-FVP latency comparison (full MV2, Corstone-300):
+
+| | Cycles | vs cortex_m |
+|---|---:|---:|
+| Standalone (baseline)                | 144,728,651 | 0.84× (slower) |
+| Standalone (after 5 commits)         | **46,718,954** | **3.69× faster** |
+| cortex_m backend (CMSIS-NN)          | 172,218,932 | 1.00× |
+
+Where the 3.69× comes from:
+- **Per-op dispatch overhead** in the cortex_m runtime.  `Method::execute`
+  iterates the program's chain, creates a `Tensor` view for each
+  kernel input/output, calls `KernelRuntimeContext::allocate_temp`
+  for scratch, and dispatches via function pointer.  Across MV2's
+  ~70 ops that adds tens of thousands of cycles per layer.  The
+  standalone path inlines kernel calls directly into the entry
+  point — zero dispatch overhead.
+- **Per-call CMSIS-NN wrapper setup.**  `arm_convolve_wrapper_s8`
+  takes a `cmsis_nn_dims` struct, picks an inner kernel variant
+  from a dispatch table, threads through a `cmsis_nn_context` for
+  scratch.  Our kernels skip all of that.
+- **Per-channel requantize through the CMSIS-NN scalar path.**
+  CMSIS-NN's MVE conv kernels emit per-channel requantize via the
+  scalar `arm_nn_requantize` helper inside the wrapper, not the
+  vectorized `vqrdmulhq_s32 + vrshlq_s32` form that the MVE conv
+  kernels themselves use internally for the MAC reduction.  Our
+  kernels emit `mve_requantize_per_channel` inline 4-wide.
+
+It would NOT be accurate to read the 3.69× as "our kernels beat
+CMSIS-NN's kernels."  For individual large 1×1 conv layers
+CMSIS-NN's tuned inner loops are likely tighter than ours (Im2Col
++ GEMM with hand-scheduled register-blocked microkernels).  We win
+on end-to-end inference *because* we eliminate the dispatch and
+wrapper overhead between layers and call the kernel directly.
 
 ## How to reproduce
 
@@ -223,63 +254,56 @@ FVP_Corstone_SSE-300_Ethos-U55 \
 
 ### cortex_m backend (CMSIS-NN) build & run
 
+The fastest path that reuses what's already on disk: rebuild only
+the existing test-framework semihosting runner with a tiny patch to
+arm_perf_monitor.cpp that adds a printf for the cycle count
+(necessary because the test runner is built with
+`-DET_LOG_ENABLED=0`, so `ET_LOG(Info, ...)` is a no-op).
+
 ```bash
 source examples/arm/arm-scratch/setup_path.sh
-CMSIS_NN_DIR=$(pwd)/arm_test/cmake-out/_deps/cmsis_nn-src  # locally fetched
 
-# 1. Rebuild host executorch libs with logging + tracer OFF.
-rm -rf arm_test/cmake-out
-cmake -S . -B arm_test/cmake-out \
-    -DCMAKE_TOOLCHAIN_FILE=$(pwd)/examples/arm/ethos-u-setup/arm-none-eabi-gcc.cmake \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DEXECUTORCH_BUILD_DEVTOOLS=ON \
-    -DEXECUTORCH_BUILD_ARM_ETDUMP=OFF \
-    -DEXECUTORCH_ENABLE_LOGGING=OFF \
-    -DEXECUTORCH_ENABLE_EVENT_TRACER=OFF \
-    -DCMSIS_NN_LOCAL_PATH=$CMSIS_NN_DIR \
-    --preset arm-baremetal
-cmake --build arm_test/cmake-out --target install -j
-
-# 2. Apply the printf patch to arm_perf_monitor.cpp so cycle count
-#    survives logging-off.  Add at the top of StopMeasurements,
-#    after cycle_count is computed:
+# 1. Apply the printf patch to arm_perf_monitor.cpp.  In StopMeasurements,
+#    right after `uint32_t cycle_count = ARM_PMU_Get_CCNTR() - ...`,
+#    add:
 #       printf("BENCHMARK_CYCLES %u\n", (unsigned)cycle_count);
-#    (Don't forget #include <cstdio>.)
+#    Also add `#include <cstdio>` next to the other includes.
 
-# 3. Build the MV2 runner against the freshly-installed libs.
-backends/arm/scripts/build_executor_runner.sh \
-    --pte=$(pwd)/benchmark_output/mobilenet_v2_cortexm/model.pte \
-    --target=ethos-u55-128 \
-    --output=$(pwd)/benchmark_output/mobilenet_v2_cortexm_fresh/cmake-out \
-    --select_ops_list="cortex_m::dequantize_per_tensor.out,cortex_m::quantize_per_tensor.out,cortex_m::quantized_add.out,cortex_m::quantized_avg_pool2d.out,cortex_m::quantized_conv2d.out,cortex_m::quantized_depthwise_conv2d.out,cortex_m::quantized_linear.out,dim_order_ops::_clone_dim_order.out" \
-    --extra_build_flags="-DEXECUTORCH_ENABLE_LOGGING=OFF -DEXECUTORCH_ENABLE_EVENT_TRACER=OFF -DCMSIS_NN_LOCAL_PATH=$CMSIS_NN_DIR"
+# 2. Rebuild only the runner (host libs are already built).
+( cd arm_test/arm_semihosting_executor_runner_corstone-300 && \
+  cmake --build . --target arm_executor_runner -j )
 
-# 4. Run on FVP.  Use the same flags as the cortex-m branch of
-#    backends/arm/scripts/run_fvp.sh, in particular
-#    -C ethosu.extra_args=--fast — without it the Ethos-U
-#    simulator runs in detail mode even though the NPU is unused,
-#    inflating wall-clock per simulated cycle.  The other two
-#    cortex-m flags from run_fvp.sh (cpu0.semihosting-cwd and
-#    cpu0.semihosting-cmd_line) are only needed for builds that
-#    use --pte=semihosting --bundleio and read argv at runtime;
-#    our runner has the .pte compiled in and SEMIHOSTING=OFF.
-FVP_Corstone_SSE-300_Ethos-U55 \
-    -C ethosu.num_macs=128 \
-    -C ethosu.extra_args=--fast \
-    -C mps3_board.visualisation.disable-visualisation=1 \
-    -C mps3_board.telnetterminal0.start_telnet=0 \
-    -C mps3_board.uart0.out_file=- \
-    -C mps3_board.uart0.shutdown_on_eot=1 \
-    -C cpu0.semihosting-enable=1 \
-    -C cpu0.semihosting-stack_base=0 \
-    -C cpu0.semihosting-heap_limit=0 \
-    -a benchmark_output/mobilenet_v2_cortexm_fresh/cmake-out/arm_executor_runner \
-    --timelimit 14400 \
-    | tee /tmp/cortexm_fvp.log
+# 3. Run pytest with a small _run_cmd-patch that dumps the FVP stdout
+#    we'd otherwise lose.  Save this as /tmp/run_cm_capture.py:
+cat > /tmp/run_cm_capture.py <<'PY'
+from executorch.backends.arm.test import runner_utils as ru
+_orig = ru._run_cmd
+def _capture(cmd, check=True, env=None):
+    out = _orig(cmd, check=check, env=env)
+    with open("/tmp/cortexm_fvp.log", "ab") as f:
+        f.write(out.stdout)
+    return out
+ru._run_cmd = _capture
+import pytest, sys
+sys.exit(pytest.main(['-v', '-s', '--runxfail',
+    'backends/cortex_m/test/models/test_mobilenet_v2.py::test_implementation_mv2']))
+PY
+rm -f /tmp/cortexm_fvp.log
+python3 /tmp/run_cm_capture.py
 
-# Cycle count from the printf patch in arm_perf_monitor.cpp:
+# 4. Cycle count.
 grep BENCHMARK_CYCLES /tmp/cortexm_fvp.log
 ```
+
+This reuses the test framework's full pipeline (CortexMQuantize +
+to_executorch + serialize + run_corstone) which already knows the
+right FVP flags (in particular `ethosu.extra_args=--fast`).  Total
+wall time end-to-end is ~4 min in our environment.
+
+A fully-from-scratch rebuild path (when host libs are missing or
+need fresh flags) lives in commit `92dbb912d7` — the existing
+`build_executor_runner.sh` chain with `--extra_build_flags` to wire
+in `-DCMSIS_NN_LOCAL_PATH` and `-DEXECUTORCH_ENABLE_LOGGING=OFF`.
 
 ## Outstanding work / next experiments
 
