@@ -419,7 +419,42 @@ static void add_s8(const int8_t* a, const int8_t* b, int8_t* out,
    * Matches operators.py:168 quantized_add_impl bit-exactly. */
   const uint32_t n = p->num_elements;
   const int32_t SHIFT_INT8 = 20;
-  for (uint32_t i = 0; i < n; ++i) {
+  uint32_t i = 0;
+
+#if MV2_USE_MVE
+  /* Vector path: 4 int8 elements per iter. ~4x throughput vs scalar
+   * because three of the per-element steps (two input requantizes + the
+   * output requantize) collapse into vector ops. */
+  const int32x4_t v_self_zp = vdupq_n_s32(p->self_zero_point);
+  const int32x4_t v_other_zp = vdupq_n_s32(p->other_zero_point);
+  const int32x4_t v_self_mult = vdupq_n_s32(p->self_multiplier);
+  const int32x4_t v_self_shift = vdupq_n_s32(p->self_shift);
+  const int32x4_t v_other_mult = vdupq_n_s32(p->other_multiplier);
+  const int32x4_t v_other_shift = vdupq_n_s32(p->other_shift);
+  const int32x4_t v_out_mult = vdupq_n_s32(p->output_multiplier);
+  const int32x4_t v_out_shift = vdupq_n_s32(p->output_shift);
+  const int32x4_t v_act_min = vdupq_n_s32(p->activation_min);
+  const int32x4_t v_act_max = vdupq_n_s32(p->activation_max);
+  while (i + 4 <= n) {
+    int32x4_t av = vldrbq_s32(a + i);
+    int32x4_t bv = vldrbq_s32(b + i);
+    av = vsubq_s32(av, v_self_zp);
+    bv = vsubq_s32(bv, v_other_zp);
+    av = vshlq_n_s32(av, SHIFT_INT8);
+    bv = vshlq_n_s32(bv, SHIFT_INT8);
+    int32x4_t a_fp = mve_requantize_per_channel(av, v_self_mult, v_self_shift);
+    int32x4_t b_fp = mve_requantize_per_channel(bv, v_other_mult, v_other_shift);
+    int32x4_t sum_fp = vaddq_s32(a_fp, b_fp);
+    int32x4_t result = mve_requantize_per_channel(sum_fp, v_out_mult, v_out_shift);
+    result = vaddq_n_s32(result, p->output_zero_point);
+    result = vmaxq_s32(result, v_act_min);
+    result = vminq_s32(result, v_act_max);
+    vstrbq_s32(out + i, result);
+    i += 4;
+  }
+#endif
+
+  for (; i < n; ++i) {
     int32_t self_lifted = ((int32_t)a[i] - p->self_zero_point) << SHIFT_INT8;
     int32_t other_lifted = ((int32_t)b[i] - p->other_zero_point) << SHIFT_INT8;
     int32_t self_fp = scalar_requantize(self_lifted, p->self_multiplier, p->self_shift);
