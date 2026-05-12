@@ -15,31 +15,67 @@ MobileNetV2 on the Corstone-300 FVP.
 | Model | torchvision `mobilenet_v2`, int8 quantized via `CortexMQuantizer` + `convert_pt2e` |
 | Memory planner | `exir.memory_planning.greedy` (same planner used by `MemoryPlanningPass`) |
 | Logging | `EXECUTORCH_ENABLE_LOGGING=OFF`, `EXECUTORCH_ENABLE_EVENT_TRACER=OFF` for both |
-| Cycle counter | DWT `CYCCNT`, read in C around the inference call |
+| Cycle counter | **PMU `CCNTR`** read via `ARM_PMU_Get_CCNTR()` (see "Cycle counter calibration" below) |
 
 For the cortex_m runner, `arm_perf_monitor.cpp` was patched with a
-`printf("BENCHMARK_CYCLES %u\n", cycle_count)` so the count reaches
+`printf("BENCHMARK_CYCLES %u\n", cycle_count)` so the PMU count reaches
 stdout under `ET_LOG_ENABLED=0`.  Build command for that runner is
 documented at the end of this file.
 
-## Headline numbers (Corstone-300 FVP, DWT CYCCNT)
+### Cycle counter calibration (important!)
+
+The Corstone-300 FVP exposes two cycle counters on Cortex-M55, **and
+they don't agree**.  We measured a constant 8.00× ratio between them
+across NOP loops (100 and 10,000 iterations), an MVE MAC microbench
+(1,000 `vmladavaq_s8`), and the full MV2 inference:
+
+| Workload | DWT_CYCCNT | PMU CCNTR | ratio |
+|---|---:|---:|---:|
+| 100 `nop` loop | 90 | 710 | 7.89 |
+| 10,000 `nop` loop | 8,751 | 70,010 | 8.00 |
+| 1,000 `vmladavaq_s8` | 251 | 2,005 | 7.99 |
+| Full MV2 inference | 46,718,953 | 373,751,624 | 8.00 |
+
+A `volatile`-int NOP loop should take ~7 cycles per iter on Cortex-M55
+at `-O3`.  PMU's 7.0 cycles/iter matches; DWT's 0.87 cycles/iter is
+sub-issue-rate (impossible — there's at least one branch per iter).
+**PMU is the real cycle counter on this FVP; DWT appears to be aliased
+by a factor of 8.**  The cortex_m runner's existing instrumentation
+uses PMU (`ARM_PMU_Get_CCNTR`), so all cross-runner comparisons in
+this document use PMU.
+
+> **Earlier versions of this document compared standalone DWT cycles to
+> cortex_m PMU cycles and reported a "3.69× faster" headline.  That was
+> wrong — the counters are on different scales.  The corrected
+> comparison below uses PMU on both runners.**
+
+## Headline numbers (Corstone-300 FVP, PMU CCNTR)
 
 | Path | Cycles / inference | `.text` | `.rodata` | Arena |
 |---|---:|---:|---:|---:|
-| Standalone, baseline (commit `e6f5623e65`)   | 144,728,651 | 56,888 B | 4,283,956 B | 1,505,280 B |
-| Standalone, with five committed kernel improvements | **46,718,954** | **65,840 B** | **4,233,180 B** | **1,505,280 B** |
-| cortex_m backend (CMSIS-NN), rebuilt fresh   | **172,218,932** | 478,960 B (test runner — handles arbitrary models via semihosting) | 35,632 B (+ 128 MB `.ddr` carrying the `.pte` + 60 MB input-file pool + arena + Ethos-U buffers) | 1,505,280 B (inside `.ddr`) |
+| Standalone, baseline (commit `e6f5623e65`)   | ~1,158 M (extrapolated 8×) | 56,888 B | 4,283,956 B | 1,505,280 B |
+| Standalone, with five committed kernel improvements | **373,751,624** | **65,840 B** | **4,233,180 B** | **1,505,280 B** |
+| cortex_m backend (CMSIS-NN), rebuilt fresh   | **172,218,932** | 478,960 B (test runner) | 35,632 B (+ DDR data) | 1,505,280 B |
 
-The standalone-after-five-commits path is **3.69× faster** than the
-cortex_m backend on this FVP config with bit-exact int8 outputs.
+**The cortex_m backend is ~2.17× faster than the standalone path on
+this FVP config**, with both producing bit-exact int8 outputs (max int8
+diff = 0 across all 1000 logits).  Numbers above are PMU cycle counts
+read identically (`ARM_PMU_Get_CCNTR()`) in both runners.
+
 The cortex_m backend runner's `.text` is much larger than ours
-because it's the test-framework's generic semihosting runner that
-can take any PTE via `-m` at runtime, includes BundleIO scaffolding,
-plus the executorch runtime + flatbuffer parser + portable kernels
-+ CMSIS-NN library + Ethos-U driver code.  For a real production
-deployment that hardcodes the model (no semihosting, no BundleIO),
-the cortex_m runner shrinks to roughly the 154 KB range — still 2-3×
-our standalone.
+because it's the test-framework's generic semihosting runner that can
+take any PTE via `-m` at runtime, includes BundleIO scaffolding, plus
+the executorch runtime + flatbuffer parser + portable kernels + the
+CMSIS-NN library + Ethos-U driver code.  For a real production
+deployment that hardcodes the model (no semihosting, no BundleIO), the
+cortex_m runner shrinks to roughly the 154 KB range — still 2-3× our
+standalone.
+
+So the standalone path's win is **smaller code + smaller rodata
++ smaller arena footprint reachable without ExecuTorch runtime
+dependencies**, *not* latency.  Earlier versions of this doc claimed a
+latency win in the opposite direction; that was the mismatched-counter
+artifact described above.
 
 ### How we got the cortex_m FVP number
 
@@ -66,19 +102,26 @@ time model is not cycle-accurate.
 
 Each row is a committed change.  All measured at the same Corstone-300
 FVP config, with bit-exact output (max int8 diff vs. cortex_m runtime
-reference = 0 across all 1000 logits).
+reference = 0 across all 1000 logits).  The columns below report the
+DWT counter because that's what was wired into the runner during these
+measurements; the **internal ratios between standalone configurations
+are valid** (DWT and PMU are linearly related by 8×, so percentage
+improvements transfer directly).  Only cross-runner comparisons require
+the PMU conversion.
 
-| # | Commit | Change | Cycles | Speedup over previous | Cumulative | `.text` |
-|---:|---|---|---:|---:|---:|---:|
-| 0 | `e6f5623e65` | Baseline: scalar dwconv, scalar requantize per OC | 144,728,651 | — | 1.00× | 56,888 B |
-| 1 | `802c00e3fb` | MVE channel-major dwconv (4 OC per inner iter) | 87,265,364 | 1.66× | 1.66× | n/a |
-| 2 | `5351678930` | conv2d: 4-OC blocked w/ shared input + folded input_offset | 55,933,708 | 1.56× | 2.59× | 48,696 B |
-| 3 | `27c363b09f` | 1×1 conv: 2 output pixels per inner iter | 48,975,234 | 1.14× | 2.95× | 64,336 B |
-| 4 | `fa9b4c1f86` | Pack requant shifts as int8 (memory: -51 KB rodata) | 47,964,461 | 1.02× | 3.02× | 64,600 B |
-| 5 | `a56407f7e2` | Vectorize `add_s8` 4-wide | 46,718,954 | 1.03× | 3.10× | 65,840 B |
+| # | Commit | Change | DWT cycles | PMU (×8) | Speedup over previous | Cumulative | `.text` |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 0 | `e6f5623e65` | Baseline: scalar dwconv, scalar requantize per OC | 144,728,651 | ~1,157.8 M | — | 1.00× | 56,888 B |
+| 1 | `802c00e3fb` | MVE channel-major dwconv (4 OC per inner iter) | 87,265,364 | ~698.1 M | 1.66× | 1.66× | n/a |
+| 2 | `5351678930` | conv2d: 4-OC blocked w/ shared input + folded input_offset | 55,933,708 | ~447.5 M | 1.56× | 2.59× | 48,696 B |
+| 3 | `27c363b09f` | 1×1 conv: 2 output pixels per inner iter | 48,975,234 | ~391.8 M | 1.14× | 2.95× | 64,336 B |
+| 4 | `fa9b4c1f86` | Pack requant shifts as int8 (memory: -51 KB rodata) | 47,964,461 | ~383.7 M | 1.02× | 3.02× | 64,600 B |
+| 5 | `a56407f7e2` | Vectorize `add_s8` 4-wide | 46,718,954 | 373,751,624 | 1.03× | 3.10× | 65,840 B |
 
-Headline: **3.10× faster, +9 KB code, -51 KB read-only data**, bit-exact
-output throughout.
+Headline: **3.10× faster than its own baseline, +9 KB code, -51 KB
+read-only data**, bit-exact output throughout.  Each commit is still
+a real perf improvement — that part of the analysis was unaffected by
+the counter confusion because all rows used the same DWT counter.
 
 ### What each experiment did
 
@@ -184,63 +227,64 @@ The standalone code is ~58% smaller (89 KB savings), driven almost
 entirely by the absent runtime — no Program / Method machinery, no
 flatbuffer parser, no CMSIS-NN library wrappers.
 
-FVP-vs-FVP latency comparison (full MV2, Corstone-300):
+FVP-vs-FVP latency comparison (full MV2, Corstone-300, PMU CCNTR):
 
-| | Cycles | vs cortex_m |
+| | PMU cycles | vs cortex_m |
 |---|---:|---:|
-| Standalone (baseline)                | 144,728,651 | 0.84× (slower) |
-| Standalone (after 5 commits)         | **46,718,954** | **3.69× faster** |
-| cortex_m backend (CMSIS-NN)          | 172,218,932 | 1.00× |
+| Standalone (baseline)                | ~1,157,829,208 (DWT 144,728,651 × 8) | 0.15× (much slower) |
+| Standalone (after 5 commits)         | **373,751,624** | **0.46× (2.17× slower)** |
+| cortex_m backend (CMSIS-NN)          | **172,218,932** | 1.00× |
 
-### Where the 3.69× actually comes from
+So **cortex_m is faster than our standalone on this FVP**, by ~2.17×
+after our five optimization commits and by ~6.7× before them.
 
-Both binaries use the same MVE int8 reduce instruction (`vmladava.s8`)
-in their hot loops — `arm-none-eabi-objdump` shows it as a generic
-`cdp 15, ...` because the binutils 2.42 disassembler doesn't pretty-
-print MVE encodings, but the underlying bytes match the same intrinsic
-(see "Instruction-level verification" below).  So this is **not** a
-"we use MVE and they don't" win.  The 3.69× decomposes into:
+### Why cortex_m is faster (likely)
 
-1. **Inner-loop tile geometry — per-output instruction count is ~1.7×
-   better here.**  CMSIS-NN's `arm_nn_mat_mult_nt_t_s8` inner loop
-   processes a 4-row × 1-column tile per iter (5 `vldrb.8` loads +
-   4 `vmladava.s8` + 1 `vaddva.s8` for the input-offset sum = ~10
-   instructions per 64 MACs = 4 outputs).  Our fast 1×1 path processes
-   a 4-OC × 2-pixel tile per iter (6 `vldrb.8` loads + 8 `vmladava.s8`
-   + 0 `vaddva` since input_offset is AOT-folded into bias = 14
-   instructions per 128 MACs = 8 outputs).  Per output: 2.5 instr vs.
-   1.75 instr.
-2. **AOT-folded input_offset for 1×1 convs.**  For 1×1 convs with no
-   padding (all MV2 conv2d except the first 3×3), the
-   `input_offset * sum(weight[oc])` correction is a per-OC constant,
-   so the AOT dumper folds it into the bias.  This eliminates the
-   `vaddva.s8` inside the inner loop — one full vector op per IC chunk
-   per OC across all 34 of those layers.  CMSIS-NN's MVE matmul always
-   carries the `vaddva.s8` because its inner loop is generic over the
-   input zero-point being non-zero.
-3. **Per-op dispatch overhead in `Method::execute`.**  For each of MV2's
-   ~70 ops, the cortex_m runtime walks the chain, constructs a
-   `Tensor` view for each input/output, calls
-   `KernelRuntimeContext::allocate_temp` for scratch, and dispatches
-   the kernel via a function pointer.  The standalone path inlines
-   the kernel calls directly into `mobilenet_v2_inference` with all
-   `LayerParams` constant-folded — zero dispatch.
-4. **Per-call CMSIS-NN wrapper setup.**  `arm_convolve_wrapper_s8`
-   takes a `cmsis_nn_dims` struct, picks an inner kernel variant from
-   a dispatch table, and threads through a `cmsis_nn_context` for
-   Im2Col scratch.  Our kernels skip all of that.
-5. **Vectorized 4-wide requantize at tile boundaries.**  We use
-   `mve_requantize_per_channel(int32x4_t, int32x4_t mult, int32x4_t shift)`
-   to requantize 4 OCs in parallel at the end of each 4-OC tile.
-   CMSIS-NN mixes vector requantize (`arm_requantize_mve`, used in
-   `arm_nn_mat_mult_nt_t_s8`) and scalar requantize
-   (`arm_nn_requantize`, used in tail and `vec_mat_mult` paths) and
-   takes the scalar path more often than ours does.
+The earlier version of this document tried to explain a 3.69× win
+in our favor that turned out to be the counter mismatch.  The actual
+direction of the comparison flips that — cortex_m wins.  The most
+likely reasons it does:
 
-We win on inner-loop *throughput* because of (1) and (2), and we win
-on per-layer *fixed costs* because of (3) and (4).  Splitting the
-3.69× cleanly between inner-loop and overhead would need cycle
-sampling per layer, which we haven't done.
+1. **CMSIS-NN inner kernels are heavily tuned.**  `arm_nn_mat_mult_nt_t_s8`
+   is hand-written inline asm with one cycle per `vmladava.s8` in the
+   steady state, and an `lcalc`-style hardware loop wrapper.  Our
+   intrinsic-driven kernels rely on GCC to schedule the same
+   instructions — for the 4-OC × 2-pixel tile the compiler does a
+   reasonable job, but there's room.
+2. **Im2Col reuses + larger output tiles.**  CMSIS-NN's `arm_convolve_s8`
+   pre-converts the input window into a column-major scratch buffer
+   per output row, then runs the matmul over a wide row × all-of-OC
+   tile.  This amortizes outer-loop bookkeeping more than our
+   per-output-pixel kernel.  We pay an arena cost (the cortex_m
+   arena and ours are the same size, so the scratch is included);
+   they recover the cycles.
+3. **Activation buffer reuse across calls.**  CMSIS-NN's wrapper
+   passes `cmsis_nn_context` that holds the Im2Col scratch across
+   layers, avoiding any per-call zero-init.  Our kernels each write
+   their full output once; that's nominally equivalent, but they
+   also each pay per-call function entry/exit + register spill cost
+   because GCC can't always inline through every call site.
+4. **Vector load alignment & contiguous strides.**  CMSIS-NN's
+   layouts (and the input-offset AOT-fold pattern in their kernels)
+   are tuned for the specific stride patterns CMSIS-NN's matmul
+   expects.  Our generic NHWC layout occasionally produces
+   non-contiguous weight reads in the depthwise kernels.
+
+Splitting the 2.17× cleanly between these would require per-layer
+cycle sampling, which we haven't done.
+
+### Where the standalone path still wins
+
+- **Code size:** 65,840 B vs CMSIS-NN test runner's 478,960 B (or
+  ~154 KB for a hardcoded-model production cortex_m runner).  No
+  ExecuTorch Program/Method machinery, no flatbuffer parser, no
+  Ethos-U driver code.
+- **No runtime dependency.**  The standalone path is a single C
+  function with no calls into ExecuTorch.  Easier to slot into a
+  baremetal RTOS task with no DDR or filesystem.
+- **AOT memory plan reuse.**  We still use exir's `greedy` planner
+  to produce the activation arena offsets, so the arena size matches
+  cortex_m's exactly.
 
 ### Instruction-level verification
 
@@ -354,21 +398,30 @@ in `-DCMSIS_NN_LOCAL_PATH` and `-DEXECUTORCH_ENABLE_LOGGING=OFF`.
 
 ## Outstanding work / next experiments
 
-Not yet committed, but candidates for further optimization:
+Now that we know cortex_m wins on latency, closing the 2.17× gap is
+the highest-impact direction:
 
+- **Match CMSIS-NN's matmul tiling.**  Their `arm_nn_mat_mult_nt_t_s8`
+  produces a 4-row × 4-col output tile via a 4-OC × 4-spatial-pixel
+  inner kernel, twice the spatial tile width we currently use.  Going
+  from our 4×2 to 4×4 would amortize weight loads 2× over the inner
+  loop at the cost of doubling accumulator register count (8 → 16
+  int32 accumulators, fits in the 16 q-registers but spills the
+  weight pointers to memory more often).
+- **Im2Col scratch for 3×3 stride-2 convs.**  CMSIS-NN's depthwise
+  kernels lean on a per-row Im2Col scratch buffer that we don't have.
+  Adding a small (~kernel_size² × in_c bytes) scratch to the AOT
+  arena plan would let us collapse the kernel-row loop into a single
+  contiguous matmul.
 - **Specialize the first 3×3 conv (`Cin = 3`).**  The MVE 16-wide
   inner reduction can't be used (Cin too small), so this layer falls
   to the scalar fallback and probably takes ~5 M cycles.  A
   hand-written 3-wide MVE inner with `vldrbq_s32`-style loads could
   cut it.
-- **Wider spatial tiling for 1×1 convs.**  Going from 2 pixels to 4
-  pixels per inner iter would amortize weight loads even more, but
-  hits register pressure (16 scalar accumulators for 4×4 blocking).
-  Need to check if 3-wide (12 accumulators) fits.
 - **Custom memory planner.**  exir greedy gives 1.5 MB; an optimal
   interval-graph allocator could possibly hit 700-900 KB for MV2's
   lifetime pattern (~600 KB of two largest concurrent activations).
-  Significant implementation effort.
+  Significant implementation effort, doesn't affect latency directly.
 - **Drop the FVP fixture from production builds.**  Trivial: a
   CMake option that omits `runner_fvp.cpp` + `input_fixture.h` saves
   600 KB of `.rodata` immediately.

@@ -18,6 +18,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "ARMCM55.h"
+
 #include "mv2_inference.h"
 #include "mv2_arena.h"
 #include "input_fixture.h"
@@ -36,6 +38,13 @@ static void enable_cycle_counter(void) {
   DEMCR    |= DEMCR_TRCENA;
   DWT_CYCCNT = 0;
   DWT_CTRL |= DWT_CTRL_CYCCNTENA;
+
+  /* Enable PMU cycle counter (same source the cortex_m backend's runner
+   * uses via ARM_PMU_Get_CCNTR) so we can print both counters and verify
+   * they agree on this FVP config. */
+  ARM_PMU_Enable();
+  ARM_PMU_CYCCNT_Reset();
+  ARM_PMU_CNTR_Enable(PMU_CNTENSET_CCNTR_ENABLE_Msk);
 }
 
 int main(void) {
@@ -44,11 +53,21 @@ int main(void) {
   static int8_t output[MV2_OUTPUT_NUM_ELEMENTS];
 
   enable_cycle_counter();
-  uint32_t start_cycles = DWT_CYCCNT;
-  mobilenet_v2_inference(mv2_fixture_input, output);
-  uint32_t elapsed_cycles = DWT_CYCCNT - start_cycles;
 
-  printf("CYCLES %u\n", (unsigned)elapsed_cycles);
+  uint32_t dwt_start = DWT_CYCCNT;
+  uint32_t pmu_start = ARM_PMU_Get_CCNTR();
+  mobilenet_v2_inference(mv2_fixture_input, output);
+  uint32_t dwt_elapsed = DWT_CYCCNT - dwt_start;
+  uint32_t pmu_elapsed = ARM_PMU_Get_CCNTR() - pmu_start;
+
+  /* CYCLES is the PMU value — that's the counter the cortex_m runner
+   * also uses for its BENCHMARK_CYCLES output, so apples-to-apples
+   * comparisons should use this number.  DWT is reported separately
+   * for cross-check; on the Corstone-300 FVP it consistently reads
+   * 1/8 of PMU regardless of workload. */
+  printf("CYCLES %u\n", (unsigned)pmu_elapsed);
+  printf("CYCLES_DWT %u\n", (unsigned)dwt_elapsed);
+  printf("CYCLES_PMU %u\n", (unsigned)pmu_elapsed);
 
   printf("RESULT_BEGIN\n");
   for (unsigned i = 0; i < MV2_OUTPUT_NUM_ELEMENTS; ++i) {
