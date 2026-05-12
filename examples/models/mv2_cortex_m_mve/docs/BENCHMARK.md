@@ -254,11 +254,18 @@ backends/arm/scripts/build_executor_runner.sh \
     --select_ops_list="cortex_m::dequantize_per_tensor.out,cortex_m::quantize_per_tensor.out,cortex_m::quantized_add.out,cortex_m::quantized_avg_pool2d.out,cortex_m::quantized_conv2d.out,cortex_m::quantized_depthwise_conv2d.out,cortex_m::quantized_linear.out,dim_order_ops::_clone_dim_order.out" \
     --extra_build_flags="-DEXECUTORCH_ENABLE_LOGGING=OFF -DEXECUTORCH_ENABLE_EVENT_TRACER=OFF -DCMSIS_NN_LOCAL_PATH=$CMSIS_NN_DIR"
 
-# 4. Run on FVP.  Note the long --timelimit: the CMSIS-NN runner
-#    appears to take significantly longer FVP wall time per simulated
-#    cycle than our standalone runner does.
+# 4. Run on FVP.  Use the same flags as the cortex-m branch of
+#    backends/arm/scripts/run_fvp.sh, in particular
+#    -C ethosu.extra_args=--fast — without it the Ethos-U
+#    simulator runs in detail mode even though the NPU is unused,
+#    inflating wall-clock per simulated cycle.  The other two
+#    cortex-m flags from run_fvp.sh (cpu0.semihosting-cwd and
+#    cpu0.semihosting-cmd_line) are only needed for builds that
+#    use --pte=semihosting --bundleio and read argv at runtime;
+#    our runner has the .pte compiled in and SEMIHOSTING=OFF.
 FVP_Corstone_SSE-300_Ethos-U55 \
     -C ethosu.num_macs=128 \
+    -C ethosu.extra_args=--fast \
     -C mps3_board.visualisation.disable-visualisation=1 \
     -C mps3_board.telnetterminal0.start_telnet=0 \
     -C mps3_board.uart0.out_file=- \
@@ -267,8 +274,11 @@ FVP_Corstone_SSE-300_Ethos-U55 \
     -C cpu0.semihosting-stack_base=0 \
     -C cpu0.semihosting-heap_limit=0 \
     -a benchmark_output/mobilenet_v2_cortexm_fresh/cmake-out/arm_executor_runner \
-    --timelimit 14400
-# Grep for BENCHMARK_CYCLES in the output.
+    --timelimit 14400 \
+    | tee /tmp/cortexm_fvp.log
+
+# Cycle count from the printf patch in arm_perf_monitor.cpp:
+grep BENCHMARK_CYCLES /tmp/cortexm_fvp.log
 ```
 
 ## Outstanding work / next experiments
