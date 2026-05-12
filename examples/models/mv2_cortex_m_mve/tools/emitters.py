@@ -96,9 +96,9 @@ def emit_weights(out_dir: Path, layers: Iterable, header_guard: str = "MV2_WEIGH
                 defns.append(_emit_int32_array(f"{stem}_bias", layer.bias))
                 decls.append(f"extern const int32_t {stem}_bias[];")
             defns.append(_emit_int32_array(f"{stem}_requant_mults", layer.requantize_multipliers))
-            defns.append(_emit_int32_array(f"{stem}_requant_shifts", layer.requantize_shifts))
+            defns.append(_emit_int8_array(f"{stem}_requant_shifts", layer.requantize_shifts))
             decls.append(f"extern const int32_t {stem}_requant_mults[];")
-            decls.append(f"extern const int32_t {stem}_requant_shifts[];")
+            decls.append(f"extern const int8_t  {stem}_requant_shifts[];")
         elif isinstance(layer, DepthwiseConv2dLayer):
             stem = f"L{i}_dwconv2d"
             defns.append(_emit_int8_array(f"{stem}_weight", layer.weight))
@@ -107,9 +107,9 @@ def emit_weights(out_dir: Path, layers: Iterable, header_guard: str = "MV2_WEIGH
                 defns.append(_emit_int32_array(f"{stem}_bias", layer.bias))
                 decls.append(f"extern const int32_t {stem}_bias[];")
             defns.append(_emit_int32_array(f"{stem}_requant_mults", layer.requantize_multipliers))
-            defns.append(_emit_int32_array(f"{stem}_requant_shifts", layer.requantize_shifts))
+            defns.append(_emit_int8_array(f"{stem}_requant_shifts", layer.requantize_shifts))
             decls.append(f"extern const int32_t {stem}_requant_mults[];")
-            decls.append(f"extern const int32_t {stem}_requant_shifts[];")
+            decls.append(f"extern const int8_t  {stem}_requant_shifts[];")
 
     header = (
         f"#ifndef {header_guard}\n"

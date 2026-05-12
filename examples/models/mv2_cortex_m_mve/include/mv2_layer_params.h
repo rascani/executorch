@@ -60,7 +60,7 @@ typedef struct {
   const int8_t* weight;            // [out_c, kernel_h, kernel_w, in_c] (OHWI)
   const int32_t* bias;             // [out_c]; nullable
   const int32_t* requant_mults;    // [out_c]
-  const int32_t* requant_shifts;   // [out_c]
+  const int8_t*  requant_shifts;   // [out_c] — fits in int8 (frexp exponent, ~[-30, +5])
   int32_t input_offset;
   int32_t output_offset;
   int8_t activation_min;
@@ -84,7 +84,7 @@ typedef struct {
   const int8_t* weight;            // [1, kernel_h, kernel_w, out_c] (IHWO)
   const int32_t* bias;             // [out_c]; nullable
   const int32_t* requant_mults;    // [out_c]
-  const int32_t* requant_shifts;   // [out_c]
+  const int8_t*  requant_shifts;   // [out_c] — int8 packed
   int32_t input_offset;
   int32_t output_offset;
   int8_t activation_min;

@@ -311,7 +311,8 @@ def extract_quantized_conv2d(node: Node, program: ExportedProgram, offsets, size
         weight=weight_t.detach().to(torch.int8).contiguous(),
         bias=emitted_bias,
         requantize_multipliers=mults_t.detach().to(torch.int32).flatten().contiguous(),
-        requantize_shifts=shifts_t.detach().to(torch.int32).flatten().contiguous(),
+        # frexp exponent — always in roughly [-30, +5], packs into int8.
+        requantize_shifts=shifts_t.detach().to(torch.int8).flatten().contiguous(),
         stride=_coerce_int_pair(a["stride"]),
         padding=_coerce_int_pair(a["padding"]),
         dilation=_coerce_int_pair(a["dilation"]),
@@ -343,7 +344,7 @@ def extract_quantized_depthwise_conv2d(node: Node, program: ExportedProgram, off
         weight=weight_t.detach().to(torch.int8).contiguous(),
         bias=bias_t.detach().to(torch.int32).flatten().contiguous() if bias_t is not None else None,
         requantize_multipliers=mults_t.detach().to(torch.int32).flatten().contiguous(),
-        requantize_shifts=shifts_t.detach().to(torch.int32).flatten().contiguous(),
+        requantize_shifts=shifts_t.detach().to(torch.int8).flatten().contiguous(),
         stride=_coerce_int_pair(a["stride"]),
         padding=_coerce_int_pair(a["padding"]),
         dilation=_coerce_int_pair(a["dilation"]),

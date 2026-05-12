@@ -90,7 +90,7 @@ static void conv2d_s8(const int8_t* input, int8_t* output, const Conv2dParams* p
   const int8_t* weight = p->weight;
   const int32_t* bias = p->bias;
   const int32_t* mults = p->requant_mults;
-  const int32_t* shifts = p->requant_shifts;
+  const int8_t*  shifts = p->requant_shifts;
 
   const size_t in_row_stride = (size_t)in_w * in_c;
   const size_t out_row_stride = (size_t)out_w * out_c;
@@ -154,7 +154,7 @@ static void conv2d_s8(const int8_t* input, int8_t* output, const Conv2dParams* p
             a3_0 += x0_v * w3_v;  a3_1 += x1_v * w3_v;
           }
           int32x4_t mult = vld1q_s32(mults + ocb);
-          int32x4_t shft = vld1q_s32(shifts + ocb);
+          int32x4_t shft = vldrbq_s32(shifts + ocb);
           int32x4_t accv0 = vsetq_lane_s32(a0_0, vdupq_n_s32(0), 0);
           accv0 = vsetq_lane_s32(a1_0, accv0, 1);
           accv0 = vsetq_lane_s32(a2_0, accv0, 2);
@@ -267,7 +267,7 @@ static void conv2d_s8(const int8_t* input, int8_t* output, const Conv2dParams* p
           accv = vsetq_lane_s32(a2, accv, 2);
           accv = vsetq_lane_s32(a3, accv, 3);
           int32x4_t mult = vld1q_s32(mults + ocb);
-          int32x4_t shft = vld1q_s32(shifts + ocb);
+          int32x4_t shft = vldrbq_s32(shifts + ocb);
           accv = mve_requantize_per_channel(accv, mult, shft);
           accv = vaddq_n_s32(accv, output_offset);
           accv = vmaxq_s32(accv, v_act_min);
@@ -341,7 +341,7 @@ static void dwconv2d_s8(const int8_t* input, int8_t* output,
   const int8_t* weight = p->weight;
   const int32_t* bias = p->bias;
   const int32_t* mults = p->requant_mults;
-  const int32_t* shifts = p->requant_shifts;
+  const int8_t*  shifts = p->requant_shifts;
   const size_t in_row_stride = (size_t)in_w * in_c;
   const size_t out_row_stride = (size_t)out_w * out_c;
   const size_t w_row_stride = (size_t)k_w * out_c;
@@ -371,7 +371,7 @@ static void dwconv2d_s8(const int8_t* input, int8_t* output,
             }
           }
           int32x4_t mult = vld1q_s32(mults + cb);
-          int32x4_t shft = vld1q_s32(shifts + cb);
+          int32x4_t shft = vldrbq_s32(shifts + cb);
           acc = mve_requantize_per_channel(acc, mult, shft);
           acc = vaddq_n_s32(acc, output_offset);
           acc = vmaxq_s32(acc, v_act_min);
