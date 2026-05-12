@@ -97,10 +97,89 @@ static void conv2d_s8(const int8_t* input, int8_t* output, const Conv2dParams* p
   const size_t w_oc_stride = (size_t)k_h * k_w * in_c;
 
 #if MV2_USE_MVE
-  /* Fast path: process 4 output channels per inner iteration, sharing the
-   * input load across the 4 weight rows.  Cuts input bandwidth 4x and
-   * collapses the per-channel requantize into one vector op.  Triggers when
-   * out_c % 4 == 0 — true for every conv2d layer in torchvision MV2. */
+  /* Fastest path: 1x1 stride-1 conv, no padding, even out_w.  Tiles 2 output
+   * pixels per inner iteration sharing the 4 weight-row loads, on top of the
+   * 4-OC blocking.  Each IC chunk runs 8 MVE MACs against 6 loads — ~22%
+   * fewer instructions per output pixel than the single-pixel path.  All MV2
+   * 1x1 convs except the head (out_w=7) hit this path. */
+  if (k_h == 1u && k_w == 1u && pad_h == 0 && pad_w == 0
+      && stride_h == 1u && stride_w == 1u
+      && (out_c & 3u) == 0u && (out_w & 1u) == 0u
+      && input_offset == 0) {
+    const int32x4_t v_act_min = vdupq_n_s32(act_min);
+    const int32x4_t v_act_max = vdupq_n_s32(act_max);
+    for (uint32_t oh = 0; oh < out_h; ++oh) {
+      const int8_t* row_in = input + (size_t)oh * in_row_stride;
+      int8_t* row_out = output + (size_t)oh * out_row_stride;
+      for (uint32_t ow = 0; ow < out_w; ow += 2) {
+        const int8_t* x0 = row_in + (size_t)(ow + 0) * in_c;
+        const int8_t* x1 = row_in + (size_t)(ow + 1) * in_c;
+        for (uint32_t ocb = 0; ocb < out_c; ocb += 4) {
+          int32_t a0_0 = bias[ocb + 0], a0_1 = bias[ocb + 0];
+          int32_t a1_0 = bias[ocb + 1], a1_1 = bias[ocb + 1];
+          int32_t a2_0 = bias[ocb + 2], a2_1 = bias[ocb + 2];
+          int32_t a3_0 = bias[ocb + 3], a3_1 = bias[ocb + 3];
+          const int8_t* w0 = weight + (size_t)(ocb + 0) * w_oc_stride;
+          const int8_t* w1 = weight + (size_t)(ocb + 1) * w_oc_stride;
+          const int8_t* w2 = weight + (size_t)(ocb + 2) * w_oc_stride;
+          const int8_t* w3 = weight + (size_t)(ocb + 3) * w_oc_stride;
+          uint32_t ic = 0;
+          while (ic + 16 <= in_c) {
+            int8x16_t v_x0 = vld1q_s8(x0 + ic);
+            int8x16_t v_x1 = vld1q_s8(x1 + ic);
+            int8x16_t v_w0 = vld1q_s8(w0 + ic);
+            int8x16_t v_w1 = vld1q_s8(w1 + ic);
+            int8x16_t v_w2 = vld1q_s8(w2 + ic);
+            int8x16_t v_w3 = vld1q_s8(w3 + ic);
+            a0_0 = vmladavaq_s8(a0_0, v_x0, v_w0);
+            a1_0 = vmladavaq_s8(a1_0, v_x0, v_w1);
+            a2_0 = vmladavaq_s8(a2_0, v_x0, v_w2);
+            a3_0 = vmladavaq_s8(a3_0, v_x0, v_w3);
+            a0_1 = vmladavaq_s8(a0_1, v_x1, v_w0);
+            a1_1 = vmladavaq_s8(a1_1, v_x1, v_w1);
+            a2_1 = vmladavaq_s8(a2_1, v_x1, v_w2);
+            a3_1 = vmladavaq_s8(a3_1, v_x1, v_w3);
+            ic += 16;
+          }
+          for (; ic < in_c; ++ic) {
+            int32_t x0_v = (int32_t)x0[ic];
+            int32_t x1_v = (int32_t)x1[ic];
+            int32_t w0_v = (int32_t)w0[ic];
+            int32_t w1_v = (int32_t)w1[ic];
+            int32_t w2_v = (int32_t)w2[ic];
+            int32_t w3_v = (int32_t)w3[ic];
+            a0_0 += x0_v * w0_v;  a0_1 += x1_v * w0_v;
+            a1_0 += x0_v * w1_v;  a1_1 += x1_v * w1_v;
+            a2_0 += x0_v * w2_v;  a2_1 += x1_v * w2_v;
+            a3_0 += x0_v * w3_v;  a3_1 += x1_v * w3_v;
+          }
+          int32x4_t mult = vld1q_s32(mults + ocb);
+          int32x4_t shft = vld1q_s32(shifts + ocb);
+          int32x4_t accv0 = vsetq_lane_s32(a0_0, vdupq_n_s32(0), 0);
+          accv0 = vsetq_lane_s32(a1_0, accv0, 1);
+          accv0 = vsetq_lane_s32(a2_0, accv0, 2);
+          accv0 = vsetq_lane_s32(a3_0, accv0, 3);
+          accv0 = mve_requantize_per_channel(accv0, mult, shft);
+          accv0 = vaddq_n_s32(accv0, output_offset);
+          accv0 = vmaxq_s32(accv0, v_act_min);
+          accv0 = vminq_s32(accv0, v_act_max);
+          vstrbq_s32(row_out + (size_t)(ow + 0) * out_c + ocb, accv0);
+          int32x4_t accv1 = vsetq_lane_s32(a0_1, vdupq_n_s32(0), 0);
+          accv1 = vsetq_lane_s32(a1_1, accv1, 1);
+          accv1 = vsetq_lane_s32(a2_1, accv1, 2);
+          accv1 = vsetq_lane_s32(a3_1, accv1, 3);
+          accv1 = mve_requantize_per_channel(accv1, mult, shft);
+          accv1 = vaddq_n_s32(accv1, output_offset);
+          accv1 = vmaxq_s32(accv1, v_act_min);
+          accv1 = vminq_s32(accv1, v_act_max);
+          vstrbq_s32(row_out + (size_t)(ow + 1) * out_c + ocb, accv1);
+        }
+      }
+    }
+    return;
+  }
+  /* Generic 4-OC-blocked path: handles all out_w cases (incl. odd) plus
+   * convs with kernel > 1, padding, stride > 1. */
   if ((out_c & 3u) == 0u) {
     const int32x4_t v_act_min = vdupq_n_s32(act_min);
     const int32x4_t v_act_max = vdupq_n_s32(act_max);
