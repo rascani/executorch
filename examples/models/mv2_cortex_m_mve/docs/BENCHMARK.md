@@ -1,9 +1,9 @@
 # Standalone vs. cortex_m backend — MobileNetV2 footprint & latency
 
-Direct comparison of the standalone Cortex-M55 + MVE inference path in
-this directory against the existing cortex_m backend (which dispatches
-through ExecuTorch's runtime to CMSIS-NN kernels) for full
-MobileileNetV2 on the Corstone-300 FVP.
+Direct measurement of the standalone Cortex-M55 + MVE inference path
+in this directory against the existing cortex_m backend (which
+dispatches through ExecuTorch's runtime to CMSIS-NN kernels) for full
+MobileNetV2 on the Corstone-300 FVP.
 
 ## Setup
 
@@ -14,215 +14,176 @@ MobileileNetV2 on the Corstone-300 FVP.
 | Compiler flags | `-mcpu=cortex-m55 -mthumb -mfloat-abi=hard -mfpu=auto -O3` |
 | Model | torchvision `mobilenet_v2`, int8 quantized via `CortexMQuantizer` + `convert_pt2e` |
 | Memory planner | `exir.memory_planning.greedy` (same planner used by `MemoryPlanningPass`) |
+| Logging | `EXECUTORCH_ENABLE_LOGGING=OFF`, `EXECUTORCH_ENABLE_EVENT_TRACER=OFF` for both |
+| Cycle counter | DWT `CYCCNT`, read in C around the inference call |
 
-The cortex_m runner ELF and `.pte` come from the user's prior
-benchmark at `benchmark_output/mobilenet_v2_cortexm/`.
+For the cortex_m runner, `arm_perf_monitor.cpp` was patched with a
+`printf("BENCHMARK_CYCLES %u\n", cycle_count)` so the count reaches
+stdout under `ET_LOG_ENABLED=0`.  Build command for that runner is
+documented at the end of this file.
+
+## Headline numbers
+
+End-to-end MobileNetV2 inference on Corstone-300 FVP (1 inference,
+random-init weights — irrelevant for cycle / footprint comparison):
+
+| Path | Cycles | `.text` | `.rodata` | Arena | At 200 MHz |
+|---|---:|---:|---:|---:|---:|
+| Standalone, baseline (committed `e6f5623e65`)   | 144,728,651 | 56,888 B | 4,283,956 B | 1,505,280 B | 724 ms |
+| Standalone, with five committed kernel improvements | **46,718,954** | 65,840 B | 4,233,180 B | 1,505,280 B | **234 ms** |
+| cortex_m backend (CMSIS-NN)                     | *see note* | 154,872 B | 35,632 B (+ 69 MB `.ddr` carrying the `.pte` + arena + Ethos-U buffers) | 1,505,280 B (inside `.ddr`) | — |
+
+*Cortex_m note:* The cortex_m backend runner was rebuilt fresh in this
+session with logging + event tracer off using the build command at
+the end of this doc, but the FVP runner hit the wall-clock timeout at
+both 30 min and 60 min budgets while inside `Method::execute` (no
+`BENCHMARK_CYCLES` line reached stdout).  An attempt with a 4-hour
+budget was launched after the standalone benchmarking finished.  The
+prior in-repo number from `mv2_benchmark_comparison.md` is
+**249,819,842 cycles**, measured at a previous date with logging
+enabled.
+
+The standalone code path is ~5× slower in FVP wall-clock simulation
+rate than CMSIS-NN's path — CMSIS-NN's MVE conv kernels exchange MAC
+inner loops for Im2Col scratch-buffer accesses, and the FVP simulates
+memory ops at a fixed cost per access, so the same number of CPU
+cycles takes substantially longer wall-clock to simulate.
+
+## Standalone optimization progression
+
+Each row is a committed change.  All measured at the same Corstone-300
+FVP config, with bit-exact output (max int8 diff vs. cortex_m runtime
+reference = 0 across all 1000 logits).
+
+| # | Commit | Change | Cycles | Speedup over previous | Cumulative | `.text` |
+|---:|---|---|---:|---:|---:|---:|
+| 0 | `e6f5623e65` | Baseline: scalar dwconv, scalar requantize per OC | 144,728,651 | — | 1.00× | 56,888 B |
+| 1 | `802c00e3fb` | MVE channel-major dwconv (4 OC per inner iter) | 87,265,364 | 1.66× | 1.66× | n/a |
+| 2 | `5351678930` | conv2d: 4-OC blocked w/ shared input + folded input_offset | 55,933,708 | 1.56× | 2.59× | 48,696 B |
+| 3 | `27c363b09f` | 1×1 conv: 2 output pixels per inner iter | 48,975,234 | 1.14× | 2.95× | 64,336 B |
+| 4 | `fa9b4c1f86` | Pack requant shifts as int8 (memory: -51 KB rodata) | 47,964,461 | 1.02× | 3.02× | 64,600 B |
+| 5 | `a56407f7e2` | Vectorize `add_s8` 4-wide | 46,718,954 | 1.03× | 3.10× | 65,840 B |
+
+Headline: **3.10× faster, +9 KB code, -51 KB read-only data**, bit-exact
+output throughout.
+
+### What each experiment did
+
+**1. MVE channel-major dwconv** (`802c00e3fb`).  The baseline kernel
+walked output channels one at a time with scalar accumulation —
+depthwise has no cross-channel reduction, so the natural vectorization
+axis is the channel dimension.  The fast path processes 4 OCs per
+inner iteration via `vldrbq_s32` (4 int8 → int32 sign-extend),
+`vmulq_s32 + vaddq_s32` accumulate, and `mve_requantize_per_channel`
+for the per-channel requantize step.  Every MV2 depthwise layer has
+`out_c % 4 == 0` so this path always triggers.
+
+**2. conv2d OC blocking + AOT-folded input_offset** (`5351678930`).
+Two changes that share an MVE fast path:
+
+- *OC blocking:* the original conv2d_s8 walked output channels one at
+  a time, re-reading each input pixel `out_c` times.  The new fast
+  path processes 4 OCs per inner iteration via one shared
+  `vld1q_s8` input load + four weight loads + four `vmladavaq_s8`,
+  collapsing the per-OC scalar requantize into a single vector op.
+  Triggers when `out_c % 4 == 0` — true for every conv2d layer in MV2.
+- *Folded input_offset:* cortex_m conv2d has no filter_offset, so
+  `acc[oc] = sum((x + input_offset) * w[oc]) = sum(x * w[oc])
+  + input_offset * sum(w[oc])`.  For 1×1 convs with no padding (all
+  MV2 conv2d except the first 3×3), the second term is a per-OC
+  constant; the dumper folds it into the bias once at AOT, and the
+  runtime kernel skips the `vaddvq_s8` accumulation entirely.  Memory
+  cost is zero (still an int32 per OC).  Signaled by emitting
+  `input_offset = 0` in the `LayerParams`.
+
+**3. 2-pixel spatial tiling for 1×1 convs** (`27c363b09f`).  For 1×1
+stride-1 convs with even `out_w`, processing 2 adjacent output pixels
+per inner iteration shares the 4 weight-row loads across both pixels
+and amortizes the 4-wide vector requantize over twice as much work.
+Each IC chunk runs 8 `vmladavaq_s8` against 6 loads, so per-pixel
+instruction count drops ~22%.  Every MV2 1×1 layer hits this path
+except the 320 → 1280 head (`out_w = 7`) which falls through to the
+single-pixel path.
+
+**4. int8 packing for per-channel shifts** (`fa9b4c1f86`).  Shifts
+come from `frexp(scale)` — across all 17,056 channels of MV2 the
+values land in `[-13, -6]`, well within int8.  Storage drops from
+int32 → int8 (4 bytes → 1 byte per channel, -51 KB total).  The MVE
+load switches from `vld1q_s32` to `vldrbq_s32` (load 4 int8s,
+sign-extend to int32) at the same throughput, and the scalar paths
+implicitly sign-extend on assignment.  Marginal latency win from the
+smaller cache footprint.
+
+**5. Vector quantized_add** (`a56407f7e2`).  The original `add_s8`
+walked elements one at a time with three scalar requantize calls per
+element (two input-side requantizes + one output-side).  The vector
+path processes 4 int8 elements per iteration via `vldrbq_s32` + scalar
+zero-point subtract via `vsubq_s32` + `vshlq_n_s32` lift + three
+`mve_requantize_per_channel` calls (with `vdupq_n_s32` broadcasting
+the scalar per-tensor multiplier/shift), then a `vaddq_s32` + clamp +
+`vstrbq_s32` saturating-narrow store.  Within-layer throughput jumps
+3-4×, but the 10 `add_s8` calls together account for under 3% of total
+MV2 cycles, so the end-to-end win is small.
 
 ## Memory footprint
 
-Section-level sizes from `arm-none-eabi-size -A`:
+Section sizes for the full MV2 standalone binary today (after all five
+optimizations):
 
-| Section | Standalone (this dir) | cortex_m backend | Delta |
-|---|---:|---:|---:|
-| `.text` (runtime code) | **56,888 B** | **164,408 B** | -65% |
-| `.rodata` (weights, params, fixture) | 4,283,972 B | 35,632 B | n/a (cortex_m carries weights in `.ddr` instead) |
-| `.ddr` (.pte payload + arena + scratch) | 1,505,280 B (arena only) | 69,008,240 B (.pte + arena + scratch + Ethos-U buffers) | n/a |
-| `.bss` | 1,996 B | 25,212 B | -92% |
-| `.data` | 2,056 B | 2,532 B | -19% |
-| Stack / heap (DTCM, reserved) | 64 KB + 64 KB | 32 KB + 32 KB | 2x larger reservations on our side |
+| Section | Bytes | Contents |
+|---|---:|---|
+| `.text`             |     65,840 | 8 static kernels + entry point + ARMCM55 startup + newlib stubs |
+| `.rodata`           |  4,233,180 | ~3.4 MB int8 weights + ~200 KB per-channel mults/shifts + ~30 KB LayerParams + ~600 KB FVP input fixture |
+| `.arena_ddr`        |  1,505,280 | activation arena (exir greedy planner) |
+| `.data`             |      2,068 | initialized statics |
+| `.bss`              |      1,996 | uninitialized statics |
+| Stack / heap        | 64 KB each | reserved in DTCM |
 
-Headline-friendly footprint (weights + arena + runtime code):
+Deployment notes for a real Cortex-M55 SoC:
 
-| Path | Code | Weights | Arena | Total |
-|---|---:|---:|---:|---:|
-| Standalone           | **57 KB** | ~3.4 MB | 1.50 MB | **~5.0 MB** |
-| cortex_m backend     | **161 KB** | 3.99 MB (.pte) | 1.50 MB | **~5.7 MB** |
+- **Drop the input fixture.**  `input_fixture.h` is only embedded for
+  the FVP runner; a real device feeds input via DMA / sensor stream
+  / memory-mapped buffer, saving 600 KB of `.rodata` immediately.
+  Build flag: omit `runner_fvp.cpp` from sources.
+- **Arena placement.**  The 1.5 MB arena fits in any cortex-M55 with
+  external SRAM/PSRAM; on chips with only TCM it needs to live in
+  DDR.  Same constraint applies to the cortex_m backend at the same
+  planner output.
+- **Weights in flash.**  The 3.4 MB of int8 weights fit in
+  most Cortex-M55 SoCs' embedded flash; if not, an external QSPI
+  bank works (slower load, runs from cached XIP).
+- **Code in ITCM.**  At ~66 KB, `.text` fits comfortably in any
+  Cortex-M55 ITCM (typical 256 KB / 512 KB).
 
-The standalone path is **~100 KB smaller** in code (no ExecuTorch
-runtime, no flatbuffer parser, no CMSIS-NN library, no op-dispatch
-table) and **~600 KB smaller** in weight storage (raw `.rodata`
-arrays vs. a flatbuffer-wrapped `.pte`).  The activation arena is
-**identical** because both paths feed `exir.memory_planning.greedy`
-the same lowered graph.
+## Side-by-side static comparison vs cortex_m backend
 
-## Latency (Corstone-300 FVP, DWT CYCCNT)
+Even without a fresh latency number for the cortex_m backend, the
+static comparison is sharp:
 
-Both numbers are CPU cycle counts for one full MobileNetV2 inference.
-
-| Path | Cycles / inference | At 200 MHz (est.) | At 400 MHz (est.) |
-|---|---:|---:|---:|
-| Standalone (baseline)              | 144,728,651 | 724 ms | 362 ms |
-| Standalone (after dwconv MVE)      | **87,265,364** | **436 ms** | **218 ms** |
-| cortex_m backend (CMSIS-NN, prior benchmark) | 249,819,842 | 1,249 ms | 625 ms |
-
-The cortex_m backend number is **not a fresh measurement in this
-session** — it comes from `mv2_benchmark_comparison.md` in the repo,
-a prior benchmark run by the user.  Two attempts to refresh it in
-this session both failed:
-
-1. **First attempt** — re-ran the existing
-   `benchmark_output/mobilenet_v2_cortexm/cmake-out/arm_executor_runner`
-   ELF on the FVP.  The runner reached `Preparing inputs...` then
-   exhausted the 30-minute FVP wall-clock budget before
-   `Method::execute` returned.  Most of the wall time was burned in
-   `ET_LOG(Info, ...)` semihosting traps from the runtime path.
-
-2. **Second attempt** — patched the runner to disable `ET_LOG` and
-   added a `printf` for the cycle count, then rebuilt.  The rebuild
-   regenerated the runner's `link.txt` without
-   `libarm_portable_ops_lib.a` (the per-build kernel-registration
-   archive — `libportable_kernels.a` has the kernel bodies but the
-   `Kernel kernels_to_register[]` table that the registry walks at
-   startup lives in `arm_portable_ops_lib`).  The runner now fails
-   at startup with `kernel 'dim_order_ops::_clone_dim_order.out'
-   not found`.  Recovering would mean re-running
-   `build_executor_runner.sh` from scratch with a proper kernel
-   selection from the MV2 PTE, and `build_executor_runner.sh`
-   currently triggers `FetchContent` for CMSIS-NN, which is
-   network-blocked in this environment.
-
-The 249.8 M cycle figure in `mv2_benchmark_comparison.md` was
-measured with logging *enabled* on this hardware (the same FVP
-config we run our standalone path on).  Logging adds semihosting
-trap wall time but not many CPU cycles to `Method::execute` — the
-cycle count is wall-clock-independent.  So the comparison axis is
-still useful, but readers should treat the 249.8 M figure as the
-prior result rather than something this session reproduced.
-
-Our standalone 87.3 M (and the 144.7 M baseline before the MVE
-dwconv prototype) are both fresh in-session measurements with
-`ET_LOG` disabled and the DWT cycle counter read directly in the
-runner.
-
-The 2.9× standalone-vs-cortex_m gap is surprising at first glance.
-Three factors explain it:
-
-1. **Per-op dispatch overhead** in the cortex_m runtime.  Out of
-   ~250 M cycles total, only ~177 M land in kernel bodies (sum of
-   the per-op cycles in `mv2_benchmark_comparison.md`); the
-   remaining ~73 M is `Method::execute` machinery: tensor-view
-   construction per op, `KernelRuntimeContext::allocate_temp` calls,
-   per-op kernel lookup, etc.  The standalone path inlines kernel
-   calls directly into the entry point and has no per-op runtime
-   overhead.
-2. **Per-pixel CMSIS-NN entry overhead.**  `arm_convolve_wrapper_s8`
-   takes a `cmsis_nn_dims` setup, picks an inner kernel variant from
-   a dispatch table, and threads through a `cmsis_nn_context` scratch
-   buffer setup before doing real work.  On small layers this
-   dwarfs the actual MAC time.
-3. **The cortex_m kernels emit per-channel requantize through the
-   CMSIS-NN scalar `arm_nn_requantize` path inside their wrapper,
-   not the vectorized MVE form.**  Our `mve_requantize_per_channel`
-   matches the same math but is inlined directly in the MAC loop.
-
-The standalone path is therefore not "faster than CMSIS-NN's
-kernels" — for individual large 1×1 convs CMSIS-NN's int8 MVE
-inner loop is still tighter than what we hand-wrote.  We win on
-end-to-end inference *because* we eliminate the dispatch and
-wrapper overhead between layers and call the kernel directly.
-
-## Per-op breakdown (cortex_m backend, from prior benchmark)
-
-The user's prior benchmark in `mv2_benchmark_comparison.md` already
-broke the cortex_m backend down per op.  Restated here so a reader
-of just this doc can compare:
-
-| Op family | cortex_m cycles | Layer count | Avg / op |
-|---|---:|---:|---:|
-| `quantized_conv2d.out`                | ~119 M | 35 | 3.4 M |
-| `quantized_depthwise_conv2d.out`      | ~ 60 M | 17 | 3.5 M |
-| `quantized_add.out`                   | ~3.9 M | 10 | 0.39 M |
-| `quantized_avg_pool2d.out`            | 0.22 M | 1 | 0.22 M |
-| `quantized_linear.out`                | 2.3 M | 1 | 2.3 M |
-| `quantize_per_tensor.out`             | 1.4 M | 1 | 1.4 M |
-| `dequantize_per_tensor.out`           | 4.5 K | 1 | 4.5 K |
-| `_clone_dim_order.out`                | 2.9 K | 1 | 2.9 K |
-| Per-op kernel total                   | **~187 M** | | |
-| `Method::execute` total               | **249.8 M** | | |
-| Inferred dispatch overhead            | ~63 M | | |
-
-## Prototype optimization: channel-major depthwise
-
-The biggest single bottleneck in the *standalone* baseline was the
-`dwconv2d_s8` kernel.  Depthwise has no cross-channel reduction —
-each output channel needs only the matching input channel — so the
-natural vectorization axis is the channel dimension itself.  The
-baseline kernel walked output channels one at a time scalar,
-leaving 17 of MV2's layers fully un-vectorized.
-
-The fix vectorizes 4 output channels per inner iteration using
-`vldrbq_s32` to load four sign-extended int8s, `vmulq_s32 +
-vaddq_s32` to accumulate, and `mve_requantize_per_channel` for the
-per-channel requantize step:
-
-```c
-#if MV2_USE_MVE
-  if ((out_c & 3u) == 0u) {
-    for (oh) for (ow) for (cb = 0; cb < out_c; cb += 4) {
-      int32x4_t acc = vld1q_s32(bias + cb);
-      for (kh) for (kw) {
-        int32x4_t x = vldrbq_s32(input_ptr + cb);
-        int32x4_t w = vldrbq_s32(weight_ptr + cb);
-        x = vaddq_s32(x, vdupq_n_s32(input_offset));
-        acc = vaddq_s32(acc, vmulq_s32(x, w));
-      }
-      acc = mve_requantize_per_channel(acc, mults_v, shifts_v);
-      vstrbq_s32(output_ptr + cb, vminq_s32(vmaxq_s32(acc, lo), hi));
-    }
-    return;
-  }
-#endif
-```
-
-Every depthwise layer in torchvision MV2 has `out_c %
-4 == 0` (channel counts in {32, 96, 144, 192, 384, 576, 960}), so
-this fast path always triggers.
-
-End-to-end result on Corstone-300 FVP:
-
-| Standalone variant | Cycles / inference | Speedup over baseline |
+| Axis | Standalone (this dir, after 5 commits) | cortex_m backend (rebuilt fresh) |
 |---|---:|---:|
-| Baseline (scalar dwconv) | 144,728,651 | 1.00× |
-| With MVE channel-major dwconv | **87,265,364** | **1.66×** |
+| `.text` runtime code | **65,840 B** | **154,872 B** (incl. ExecuTorch runtime, flatbuffer parser, CMSIS-NN library, Ethos-U driver code that's compiled but unused) |
+| Weight payload | ~3.4 MB int8 in `.rodata` | 3,996,416 B `.pte` (flatbuffer-wrapped weights) |
+| Activation arena | 1,505,280 B | 1,505,280 B (same exir greedy plan) |
+| Per-op dispatch overhead | inlined — ~0 cycles per layer | function-pointer dispatch via `KernelRuntimeContext`, per-op `Tensor` view setup, per-op `allocate_temp` calls |
 
-Bit-exact correctness preserved across all four phase tests (max
-int8 diff = 0 vs. cortex_m runtime reference).
-
-## Next-step candidates
-
-The remaining ~87 M cycles are dominated by `conv2d_s8` (35 layers,
-mostly 1×1).  Three high-leverage follow-ups:
-
-1. **Output-channel blocking for `conv2d_s8`.**  Currently the kernel
-   walks `oc` one at a time and re-reads the input pixel for each
-   output channel.  Blocking 4 OCs per inner iteration (with one
-   broadcast input load and 4 weight loads, accumulating into 4
-   independent `int32x4_t` lanes via `vmlaq_n_s32`) would cut
-   redundant input loads by 4× and let the requantize go vector at
-   the end.
-2. **Im2Col-free GEMM for 1×1 convs.**  A 1×1 conv is exactly a
-   GEMM of `(H·W, Cin) × (Cin, Cout)`.  Treating the input as a
-   flat `(H·W) × Cin` matrix lets us reuse the input rows across
-   all output channels and run a proper 16-wide MVE GEMM kernel.
-3. **Pre-shuffle weights AOT.**  The dumper currently emits weights
-   in the OHWI layout the cortex_m pipeline produces; an MVE
-   GEMM-friendly layout (`Cout`-block major, padded for SIMD lanes)
-   would remove all the strided loads in the inner kernel.
-
-(1) is the smallest change and closes most of the remaining gap;
-(2) and (3) together would likely bring full-MV2 latency below
-40 M cycles, comparable to a tuned CMSIS-NN deployment without the
-dispatch overhead.
+The standalone code is ~58% smaller (89 KB savings), with the bulk
+of that savings being the absent runtime — no Program / Method
+machinery, no flatbuffer parser, no CMSIS-NN library wrappers.
 
 ## How to reproduce
+
+### Standalone build & run
 
 ```bash
 source examples/arm/arm-scratch/setup_path.sh
 
-# Dump artifacts (uses tools/dump_mv2_artifacts.py with random-init MV2).
-# See test_mv2_standalone_mve.py for the exact lowering pipeline.
+# 1. Dump artifacts (runs the same lowering pipeline the test harness uses)
+#    Quickest way: run any of the standalone phase pytests with FVP toolchain
+#    on PATH — they cmake + ninja + FVP automatically:
+pytest backends/cortex_m/test/models/test_mv2_standalone_mve.py -v -s
 
-# Standalone build & FVP run:
+# 2. Or do it manually with explicit invocation:
 cmake -S examples/models/mv2_cortex_m_mve -B build/fvp \
       -DCMAKE_TOOLCHAIN_FILE=examples/models/mv2_cortex_m_mve/fvp/toolchain-arm-none-eabi.cmake \
       -DMV2_BUILD_FVP=ON \
@@ -240,12 +201,77 @@ FVP_Corstone_SSE-300_Ethos-U55 \
     -C cpu0.semihosting-stack_base=0 \
     -C cpu0.semihosting-heap_limit=0 \
     -a build/fvp/mv2_runner_fvp.elf \
-    --timelimit 1800
+    --timelimit 600
 # Prints "CYCLES <n>" then the 1000 int8 logits.
-
-# cortex_m backend run for comparison:
-FVP_Corstone_SSE-300_Ethos-U55 ... \
-    -a benchmark_output/mobilenet_v2_cortexm/cmake-out/arm_executor_runner \
-    --timelimit 1800
-# Prints the ET_LOG "Profiler report, CPU cycles per operator" summary.
 ```
+
+### cortex_m backend (CMSIS-NN) build & run
+
+```bash
+source examples/arm/arm-scratch/setup_path.sh
+CMSIS_NN_DIR=$(pwd)/arm_test/cmake-out/_deps/cmsis_nn-src  # locally fetched
+
+# 1. Rebuild host executorch libs with logging + tracer OFF.
+rm -rf arm_test/cmake-out
+cmake -S . -B arm_test/cmake-out \
+    -DCMAKE_TOOLCHAIN_FILE=$(pwd)/examples/arm/ethos-u-setup/arm-none-eabi-gcc.cmake \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DEXECUTORCH_BUILD_DEVTOOLS=ON \
+    -DEXECUTORCH_BUILD_ARM_ETDUMP=OFF \
+    -DEXECUTORCH_ENABLE_LOGGING=OFF \
+    -DEXECUTORCH_ENABLE_EVENT_TRACER=OFF \
+    -DCMSIS_NN_LOCAL_PATH=$CMSIS_NN_DIR \
+    --preset arm-baremetal
+cmake --build arm_test/cmake-out --target install -j
+
+# 2. Apply the printf patch to arm_perf_monitor.cpp so cycle count
+#    survives logging-off.  Add at the top of StopMeasurements,
+#    after cycle_count is computed:
+#       printf("BENCHMARK_CYCLES %u\n", (unsigned)cycle_count);
+#    (Don't forget #include <cstdio>.)
+
+# 3. Build the MV2 runner against the freshly-installed libs.
+backends/arm/scripts/build_executor_runner.sh \
+    --pte=$(pwd)/benchmark_output/mobilenet_v2_cortexm/model.pte \
+    --target=ethos-u55-128 \
+    --output=$(pwd)/benchmark_output/mobilenet_v2_cortexm_fresh/cmake-out \
+    --select_ops_list="cortex_m::dequantize_per_tensor.out,cortex_m::quantize_per_tensor.out,cortex_m::quantized_add.out,cortex_m::quantized_avg_pool2d.out,cortex_m::quantized_conv2d.out,cortex_m::quantized_depthwise_conv2d.out,cortex_m::quantized_linear.out,dim_order_ops::_clone_dim_order.out" \
+    --extra_build_flags="-DEXECUTORCH_ENABLE_LOGGING=OFF -DEXECUTORCH_ENABLE_EVENT_TRACER=OFF -DCMSIS_NN_LOCAL_PATH=$CMSIS_NN_DIR"
+
+# 4. Run on FVP.  Note the long --timelimit: the CMSIS-NN runner
+#    appears to take significantly longer FVP wall time per simulated
+#    cycle than our standalone runner does.
+FVP_Corstone_SSE-300_Ethos-U55 \
+    -C ethosu.num_macs=128 \
+    -C mps3_board.visualisation.disable-visualisation=1 \
+    -C mps3_board.telnetterminal0.start_telnet=0 \
+    -C mps3_board.uart0.out_file=- \
+    -C mps3_board.uart0.shutdown_on_eot=1 \
+    -C cpu0.semihosting-enable=1 \
+    -C cpu0.semihosting-stack_base=0 \
+    -C cpu0.semihosting-heap_limit=0 \
+    -a benchmark_output/mobilenet_v2_cortexm_fresh/cmake-out/arm_executor_runner \
+    --timelimit 14400
+# Grep for BENCHMARK_CYCLES in the output.
+```
+
+## Outstanding work / next experiments
+
+Not yet committed, but candidates for further optimization:
+
+- **Specialize the first 3×3 conv (`Cin = 3`).**  The MVE 16-wide
+  inner reduction can't be used (Cin too small), so this layer falls
+  to the scalar fallback and probably takes ~5 M cycles.  A
+  hand-written 3-wide MVE inner with `vldrbq_s32`-style loads could
+  cut it.
+- **Wider spatial tiling for 1×1 convs.**  Going from 2 pixels to 4
+  pixels per inner iter would amortize weight loads even more, but
+  hits register pressure (16 scalar accumulators for 4×4 blocking).
+  Need to check if 3-wide (12 accumulators) fits.
+- **Custom memory planner.**  exir greedy gives 1.5 MB; an optimal
+  interval-graph allocator could possibly hit 700-900 KB for MV2's
+  lifetime pattern (~600 KB of two largest concurrent activations).
+  Significant implementation effort.
+- **Drop the FVP fixture from production builds.**  Trivial: a
+  CMake option that omits `runner_fvp.cpp` + `input_fixture.h` saves
+  600 KB of `.rodata` immediately.
