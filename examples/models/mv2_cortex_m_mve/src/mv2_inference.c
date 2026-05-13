@@ -495,8 +495,8 @@ static __attribute__((always_inline)) inline void conv2d_s8(const int8_t* input,
 #endif
 }
 
-static void dwconv2d_s8(const int8_t* input, int8_t* output,
-                        const DepthwiseConv2dParams* p) {
+static __attribute__((always_inline)) inline void dwconv2d_s8(
+    const int8_t* input, int8_t* output, const DepthwiseConv2dParams* p) {
   PROF_START(dwconv2d);
   /* NHWC int8 input, IHWO int8 weights [1, kH, kW, C], depth_multiplier=1
    * (out_c == in_c).  Per-channel requant, fused ReLU bounds.
