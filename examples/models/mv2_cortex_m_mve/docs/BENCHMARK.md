@@ -53,14 +53,15 @@ this document use PMU.
 
 | Path | Cycles / inference | `.text` | `.rodata` | Arena |
 |---|---:|---:|---:|---:|
-| Standalone, baseline (commit `e6f5623e65`)   | ~1,158 M (extrapolated 8×) | 56,888 B | 4,283,956 B | 1,505,280 B |
-| Standalone, with five committed kernel improvements | **373,751,624** | **65,840 B** | **4,233,180 B** | **1,505,280 B** |
-| cortex_m backend (CMSIS-NN), rebuilt fresh   | **172,218,932** | 478,960 B (test runner) | 35,632 B (+ DDR data) | 1,505,280 B |
+| Standalone, baseline (commit `e6f5623e65`)        | ~1,158 M (extrapolated 8×) | 56,888 B | 4,283,956 B | 1,505,280 B |
+| Standalone, all 17 committed kernel improvements  | **154,310,972** | ~66 KB | ~4.2 MB | 1,505,280 B |
+| cortex_m backend (CMSIS-NN), rebuilt fresh        | **172,218,932** | 478,960 B (test runner) | 35,632 B (+ DDR data) | 1,505,280 B |
 
-**The cortex_m backend is ~2.17× faster than the standalone path on
-this FVP config**, with both producing bit-exact int8 outputs (max int8
-diff = 0 across all 1000 logits).  Numbers above are PMU cycle counts
-read identically (`ARM_PMU_Get_CCNTR()`) in both runners.
+**Standalone is now ~10.4% faster than the cortex_m backend on this
+FVP config** (17.9M PMU cycle margin), with both producing bit-exact
+int8 outputs (max int8 diff = 0 across all 1000 logits).  Numbers
+above are PMU cycle counts read identically (`ARM_PMU_Get_CCNTR()`)
+in both runners.
 
 The cortex_m backend runner's `.text` is much larger than ours
 because it's the test-framework's generic semihosting runner that can
@@ -71,11 +72,12 @@ deployment that hardcodes the model (no semihosting, no BundleIO), the
 cortex_m runner shrinks to roughly the 154 KB range — still 2-3× our
 standalone.
 
-So the standalone path's win is **smaller code + smaller rodata
-+ smaller arena footprint reachable without ExecuTorch runtime
-dependencies**, *not* latency.  Earlier versions of this doc claimed a
-latency win in the opposite direction; that was the mismatched-counter
-artifact described above.
+So the standalone path now wins on **all three axes**: latency
+(154.3M vs 172.2M PMU), code size (66 KB vs ~150 KB stripped), and
+runtime dependencies (none — no flatbuffer parser, no kernel registry,
+no driver layer).  Earlier versions of this doc reported the cortex_m
+backend leading on latency; the 17-step optimization sequence below
+flipped that.
 
 ### How we got the cortex_m FVP number
 
