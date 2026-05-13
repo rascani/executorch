@@ -209,14 +209,8 @@ void mv2_conv2d_1x1_fast(const int8_t* input, int8_t* output,
         );
         int32x4_t mult = vld1q_s32(mults + ocb);
         int32x4_t shft = vldrbq_s32(shifts + ocb);
-        int32x4_t accv0 = vsetq_lane_s32(a0_0, vdupq_n_s32(0), 0);
-        accv0 = vsetq_lane_s32(a1_0, accv0, 1);
-        accv0 = vsetq_lane_s32(a2_0, accv0, 2);
-        accv0 = vsetq_lane_s32(a3_0, accv0, 3);
-        int32x4_t accv1 = vsetq_lane_s32(a0_1, vdupq_n_s32(0), 0);
-        accv1 = vsetq_lane_s32(a1_1, accv1, 1);
-        accv1 = vsetq_lane_s32(a2_1, accv1, 2);
-        accv1 = vsetq_lane_s32(a3_1, accv1, 3);
+        int32x4_t accv0 = {a0_0, a1_0, a2_0, a3_0};
+        int32x4_t accv1 = {a0_1, a1_1, a2_1, a3_1};
         accv0 = mve_requantize_per_channel_neg_shift(accv0, mult, shft);
         accv0 = vaddq_n_s32(accv0, output_offset);
         accv0 = vminq_s32(vmaxq_s32(accv0, v_act_min), v_act_max);
@@ -264,10 +258,7 @@ void mv2_conv2d_1x1_fast(const int8_t* input, int8_t* output,
         );
         int32x4_t mult = vld1q_s32(mults + ocb);
         int32x4_t shft = vldrbq_s32(shifts + ocb);
-        int32x4_t accv = vsetq_lane_s32(a0, vdupq_n_s32(0), 0);
-        accv = vsetq_lane_s32(a1, accv, 1);
-        accv = vsetq_lane_s32(a2, accv, 2);
-        accv = vsetq_lane_s32(a3, accv, 3);
+        int32x4_t accv = {a0, a1, a2, a3};
         accv = mve_requantize_per_channel_neg_shift(accv, mult, shft);
         accv = vaddq_n_s32(accv, output_offset);
         accv = vminq_s32(vmaxq_s32(accv, v_act_min), v_act_max);
@@ -398,10 +389,7 @@ static __attribute__((always_inline)) inline void conv2d_s8(const int8_t* input,
 
           int32x4_t mult = vld1q_s32(mults + ocb);
           int32x4_t shft = vldrbq_s32(shifts + ocb);
-          int32x4_t accv = vsetq_lane_s32(a0, vdupq_n_s32(0), 0);
-          accv = vsetq_lane_s32(a1, accv, 1);
-          accv = vsetq_lane_s32(a2, accv, 2);
-          accv = vsetq_lane_s32(a3, accv, 3);
+          int32x4_t accv = {a0, a1, a2, a3};
           accv = mve_requantize_per_channel_neg_shift(accv, mult, shft);
           accv = vaddq_n_s32(accv, output_offset);
           accv = vminq_s32(vmaxq_s32(accv, v_act_min), v_act_max);
@@ -524,10 +512,7 @@ static __attribute__((always_inline)) inline void conv2d_s8(const int8_t* input,
             a2 += sum_w2 * input_offset;
             a3 += sum_w3 * input_offset;
           }
-          int32x4_t accv = vsetq_lane_s32(a0, vdupq_n_s32(0), 0);
-          accv = vsetq_lane_s32(a1, accv, 1);
-          accv = vsetq_lane_s32(a2, accv, 2);
-          accv = vsetq_lane_s32(a3, accv, 3);
+          int32x4_t accv = {a0, a1, a2, a3};
           int32x4_t mult = vld1q_s32(mults + ocb);
           int32x4_t shft = vldrbq_s32(shifts + ocb);
           accv = mve_requantize_per_channel_neg_shift(accv, mult, shft);
