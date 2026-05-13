@@ -58,6 +58,24 @@ static inline int32x4_t mve_requantize_per_channel(
   int32x4_t fixed = vqaddq_s32(product, fixup);
   return vrshlq_s32(fixed, right);
 }
+
+/* Specialized requantize for the common case where all per-channel
+ * shift values are <= 0 (always true in MV2: scale = in_scale *
+ * weight_scale / out_scale is < 1 for activation layers, so frexp
+ * gives a non-positive exponent).  Drops the left-shift step
+ * (`vmaxq` + `vshlq`) and the `vminq` that was clamping shift to <= 0,
+ * saving 3 MVE ops per call.  4 ops total vs 7 in the general helper.
+ *
+ * Bit-exact w.r.t. mve_requantize_per_channel when all shift lanes
+ * are <= 0 — the operations skipped are no-ops in that regime
+ * (left = 0, vshlq(acc, 0) = acc, vminq(shift, 0) = shift). */
+static inline int32x4_t mve_requantize_per_channel_neg_shift(
+    int32x4_t acc, int32x4_t multiplier, int32x4_t shift) {
+  int32x4_t product = vqrdmulhq_s32(acc, multiplier);
+  int32x4_t fixup = vshrq_n_s32(vandq_s32(product, shift), 31);
+  int32x4_t fixed = vqaddq_s32(product, fixup);
+  return vrshlq_s32(fixed, shift);
+}
 #endif /* MV2_HAVE_MVE */
 
 static inline int32_t scalar_requantize(int32_t acc, int32_t multiplier, int32_t shift) {

@@ -54,11 +54,11 @@ this document use PMU.
 | Path | Cycles / inference | `.text` | `.rodata` | Arena |
 |---|---:|---:|---:|---:|
 | Standalone, baseline (commit `e6f5623e65`)        | ~1,158 M (extrapolated 8×) | 56,888 B | 4,283,956 B | 1,505,280 B |
-| Standalone, all 17 committed kernel improvements  | **154,310,972** | ~66 KB | ~4.2 MB | 1,505,280 B |
+| Standalone, all 18 committed kernel improvements  | **149,244,121** | ~66 KB | ~4.2 MB | 1,505,280 B |
 | cortex_m backend (CMSIS-NN), rebuilt fresh        | **172,218,932** | 478,960 B (test runner) | 35,632 B (+ DDR data) | 1,505,280 B |
 
-**Standalone is now ~10.4% faster than the cortex_m backend on this
-FVP config** (17.9M PMU cycle margin), with both producing bit-exact
+**Standalone is now ~14.6% faster than the cortex_m backend on this
+FVP config** (23.0M PMU cycle margin), with both producing bit-exact
 int8 outputs (max int8 diff = 0 across all 1000 logits).  Numbers
 above are PMU cycle counts read identically (`ARM_PMU_Get_CCNTR()`)
 in both runners.
@@ -130,7 +130,8 @@ the PMU conversion.
 | 14 | (same commit, stride-2) | AOT-fold dwconv input_offset for interior stride-2 tile | 24,145,665 | 193,164,664 | 1.01× | 5.99× |
 | 15 | `9e865f3251` | conv1x1 reshape: 2-OC × 2-pixel asm block, shared input load | 23,583,681 | 188,669,439 | 1.024× | 6.14× |
 | 16 | `8884a03e37` | conv1x1 fast path: handle odd `out_w` via 1-pixel tail | 21,716,754 | 173,734,023 | 1.086× | 6.66× |
-| 17 | `3569979d4e` | requantize: CMSIS-NN-style fixup + `vrshlq_s32` (cuts ~10 MVE ops/call) | **19,288,873** | **154,310,972** | 1.126× | **7.50×** |
+| 17 | `3569979d4e` | requantize: CMSIS-NN-style fixup + `vrshlq_s32` (cuts ~10 MVE ops/call) | 19,288,873 | 154,310,972 | 1.126× | 7.50× |
+| 18 | (pending) | requantize: drop left-shift step (shift ≤ 0 in MV2; saves 3 ops/call) | **18,655,515** | **149,244,121** | 1.034× | **7.76×** |
 
 Headline: **7.50× faster than the original baseline**, bit-exact output
 across all 1000 logits.  cortex_m backend on the same FVP/PMU: 172.2M
@@ -251,6 +252,33 @@ layer.
 End-to-end PMU: 173.7M → 154.3M (-11.2%), bit-exact across all 1000
 int8 logits.  Standalone now **beats CMSIS-NN by 10.4%** (154.3M vs
 172.2M PMU).
+
+**18. Specialized requantize for `shift ≤ 0` (the MV2 norm).**
+`mve_requantize_per_channel` from step 17 still pays for the left-shift
+step (`vmaxq` + `vshlq`) and the `vminq` that clamps `shift` to `≤ 0`
+— those are no-ops in the common case where every per-channel shift
+value is already non-positive.  And in MV2 every requantize scale is
+`< 1` (input × weight scale divided by output scale), so `frexp` always
+returns a non-positive exponent.
+
+This step adds a specialized `mve_requantize_per_channel_neg_shift`
+helper that drops the three skipped ops and swaps it in at every
+callsite (conv2d, dwconv, add_s8, avgpool, gemv).  Bit-exactness is
+preserved by inspection — the skipped ops collapse to identity for
+`shift ≤ 0` — and confirmed by `max int8 diff = 0` across all 1000
+logits.
+
+```c
+int32x4_t product = vqrdmulhq_s32(acc, multiplier);
+int32x4_t fixup = vshrq_n_s32(vandq_s32(product, shift), 31);
+int32x4_t fixed = vqaddq_s32(product, fixup);
+return vrshlq_s32(fixed, shift);
+```
+
+End-to-end PMU: 154.3M → 149.2M (-3.3%).  Standalone now **beats
+CMSIS-NN by 14.6%** (23.0M PMU cycle margin).  The original helper
+remains in the header as a safe fallback for kernels whose shift
+distribution may include positive values.
 
 ## Memory footprint
 
