@@ -109,6 +109,9 @@ def emit_weights(out_dir: Path, layers: Iterable, header_guard: str = "MV2_WEIGH
             if layer.bias is not None:
                 defns.append(_emit_int32_array(f"{stem}_bias", layer.bias))
                 decls.append(f"extern const int32_t {stem}_bias[];")
+            if layer.bias_with_offset_full is not None:
+                defns.append(_emit_int32_array(f"{stem}_bias_off", layer.bias_with_offset_full))
+                decls.append(f"extern const int32_t {stem}_bias_off[];")
             defns.append(_emit_int32_array(f"{stem}_requant_mults", layer.requantize_multipliers))
             defns.append(_emit_int8_array(f"{stem}_requant_shifts", layer.requantize_shifts))
             decls.append(f"extern const int32_t {stem}_requant_mults[];")
@@ -252,6 +255,10 @@ def emit_params(
             out_h, out_w, _ = _spatial_dims(layer.output.shape)
             _, k_h, k_w, out_c = layer.weight.shape
             bias_ref = f"L{i}_dwconv2d_bias" if layer.bias is not None else "(const int32_t*)0"
+            bias_off_ref = (
+                f"L{i}_dwconv2d_bias_off"
+                if layer.bias_with_offset_full is not None else "(const int32_t*)0"
+            )
             lines.append(
                 f"static const DepthwiseConv2dParams P_L{i}_dwconv2d = {{\n"
                 f"  .in_h = {in_h}u, .in_w = {in_w}u, .in_c = {in_c}u,\n"
@@ -267,6 +274,7 @@ def emit_params(
                 f"  .output_offset = {layer.output_offset},\n"
                 f"  .activation_min = {layer.activation_min},\n"
                 f"  .activation_max = {layer.activation_max},\n"
+                f"  .bias_with_offset_full = {bias_off_ref},\n"
                 "};"
             )
         elif isinstance(layer, QuantizedAddLayer):

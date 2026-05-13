@@ -95,6 +95,11 @@ typedef struct {
   int32_t output_offset;
   int8_t activation_min;
   int8_t activation_max;
+  /* Optional bias + input_offset * sum(weight[c]) over ALL kernel positions.
+   * Used by fast-path tiles when every (kh, kw) is in-bounds (i.e., away
+   * from the pad ring) so the runtime can skip the per-tap input_offset
+   * add.  NULL if not pre-computed for this layer. */
+  const int32_t* bias_with_offset_full;
 } DepthwiseConv2dParams;
 
 typedef struct {

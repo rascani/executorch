@@ -97,6 +97,12 @@ class DepthwiseConv2dLayer:
     output_offset: int = 0
     activation_min: int = -128
     activation_max: int = 127
+    # Optional bias-with-offset: bias + input_offset * sum(weight[c]) over
+    # all kernel positions.  Used by the fast 4-pixel tile for pixels where
+    # all kH×kW kernel taps are valid (i.e., away from the padding ring).
+    # Lets the runtime skip the per-tap vaddq_s32(x, v_in_off) for those
+    # pixels; the boundary path keeps the original bias and runtime offset.
+    bias_with_offset_full: Optional[torch.Tensor] = None  # int32 [C]
 
 
 @dataclass
@@ -381,11 +387,22 @@ def extract_quantized_depthwise_conv2d(node: Node, program: ExportedProgram, off
     bias_t = _resolve_tensor(program, a["bias"]) if a["bias"] is not None else None
     mults_t = _resolve_tensor(program, a["requantize_multipliers"])
     shifts_t = _resolve_tensor(program, a["requantize_shifts"])
+    # Pre-compute bias_with_offset_full for the fast 4-pixel tile.  Layout
+    # is IHWO [1, kH, kW, C]; sum over (kH, kW) axes gives per-channel total.
+    bias_with_offset_full = None
+    if bias_t is not None and int(a["input_offset"]) != 0:
+        w_int32 = weight_t.detach().to(torch.int32)
+        sum_w_per_c = w_int32.sum(dim=(0, 1, 2))  # [C]
+        offset_term = sum_w_per_c * int(a["input_offset"])
+        bias_with_offset_full = (
+            bias_t.detach().to(torch.int32).flatten() + offset_term
+        ).to(torch.int32).contiguous()
     return DepthwiseConv2dLayer(
         input=_slot_from_node(a["input"], offsets, sizes),
         output=_slot_from_node(node, offsets, sizes),
         weight=weight_t.detach().to(torch.int8).contiguous(),
         bias=bias_t.detach().to(torch.int32).flatten().contiguous() if bias_t is not None else None,
+        bias_with_offset_full=bias_with_offset_full,
         requantize_multipliers=mults_t.detach().to(torch.int32).flatten().contiguous(),
         requantize_shifts=shifts_t.detach().to(torch.int8).flatten().contiguous(),
         stride=_coerce_int_pair(a["stride"]),

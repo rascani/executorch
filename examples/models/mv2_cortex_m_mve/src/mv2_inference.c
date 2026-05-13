@@ -635,12 +635,21 @@ static __attribute__((always_inline)) inline void dwconv2d_s8(
 
       /* Interior 4-pixel tiles: ow_base in [1, out_w-5].  Each tile reads
        * 6 contiguous input columns iw in [ow_base-1 .. ow_base+4] which are
-       * all in-bounds. */
+       * all in-bounds.  When the kh dimension is also fully in-bounds
+       * (middle rows: 1 <= oh <= out_h-2), all 9 kernel positions
+       * contribute, so we can use the AOT-folded bias_with_offset_full
+       * and skip the per-tap vaddq_s32(x, v_in_off) entirely. */
+      const int32_t* bias_ptr_interior =
+          (kh_valid[0] && kh_valid[1] && kh_valid[2]
+           && p->bias_with_offset_full != (const int32_t*)0)
+          ? p->bias_with_offset_full : bias;
+      const int skip_offset_add =
+          (bias_ptr_interior == p->bias_with_offset_full);
       uint32_t ow_base = 1;
       for (; ow_base + 5 <= out_w; ow_base += 4) {
         for (uint32_t cb = 0; cb < out_c; cb += 4) {
-          int32x4_t bias_v = (bias != (const int32_t*)0)
-              ? vld1q_s32(bias + cb) : vdupq_n_s32(0);
+          int32x4_t bias_v = (bias_ptr_interior != (const int32_t*)0)
+              ? vld1q_s32(bias_ptr_interior + cb) : vdupq_n_s32(0);
           int32x4_t acc0 = bias_v;
           int32x4_t acc1 = bias_v;
           int32x4_t acc2 = bias_v;
@@ -655,21 +664,29 @@ static __attribute__((always_inline)) inline void dwconv2d_s8(
             int32x4_t w0 = vldrbq_s32(w_base + 0 * out_c);
             int32x4_t w1 = vldrbq_s32(w_base + 1 * out_c);
             int32x4_t w2 = vldrbq_s32(w_base + 2 * out_c);
-            int32x4_t x0 = vaddq_s32(vldrbq_s32(x_base + 0 * in_c), v_in_off);
-            int32x4_t x1 = vaddq_s32(vldrbq_s32(x_base + 1 * in_c), v_in_off);
-            int32x4_t x2 = vaddq_s32(vldrbq_s32(x_base + 2 * in_c), v_in_off);
+            int32x4_t x0 = vldrbq_s32(x_base + 0 * in_c);
+            int32x4_t x1 = vldrbq_s32(x_base + 1 * in_c);
+            int32x4_t x2 = vldrbq_s32(x_base + 2 * in_c);
+            if (!skip_offset_add) {
+              x0 = vaddq_s32(x0, v_in_off);
+              x1 = vaddq_s32(x1, v_in_off);
+              x2 = vaddq_s32(x2, v_in_off);
+            }
             acc0 = vaddq_s32(acc0, vmulq_s32(x0, w0));
             acc0 = vaddq_s32(acc0, vmulq_s32(x1, w1));
             acc0 = vaddq_s32(acc0, vmulq_s32(x2, w2));
-            int32x4_t x3 = vaddq_s32(vldrbq_s32(x_base + 3 * in_c), v_in_off);
+            int32x4_t x3 = vldrbq_s32(x_base + 3 * in_c);
+            if (!skip_offset_add) x3 = vaddq_s32(x3, v_in_off);
             acc1 = vaddq_s32(acc1, vmulq_s32(x1, w0));
             acc1 = vaddq_s32(acc1, vmulq_s32(x2, w1));
             acc1 = vaddq_s32(acc1, vmulq_s32(x3, w2));
-            int32x4_t x4 = vaddq_s32(vldrbq_s32(x_base + 4 * in_c), v_in_off);
+            int32x4_t x4 = vldrbq_s32(x_base + 4 * in_c);
+            if (!skip_offset_add) x4 = vaddq_s32(x4, v_in_off);
             acc2 = vaddq_s32(acc2, vmulq_s32(x2, w0));
             acc2 = vaddq_s32(acc2, vmulq_s32(x3, w1));
             acc2 = vaddq_s32(acc2, vmulq_s32(x4, w2));
-            int32x4_t x5 = vaddq_s32(vldrbq_s32(x_base + 5 * in_c), v_in_off);
+            int32x4_t x5 = vldrbq_s32(x_base + 5 * in_c);
+            if (!skip_offset_add) x5 = vaddq_s32(x5, v_in_off);
             acc3 = vaddq_s32(acc3, vmulq_s32(x3, w0));
             acc3 = vaddq_s32(acc3, vmulq_s32(x4, w1));
             acc3 = vaddq_s32(acc3, vmulq_s32(x5, w2));
@@ -780,13 +797,20 @@ static __attribute__((always_inline)) inline void dwconv2d_s8(
 
       /* Interior 2-pixel tiles.  Pixel ow uses iw cols [2*ow-1, 2*ow, 2*ow+1].
        * Pair (ow_base, ow_base+1) uses cols [2*ow_base-1 .. 2*ow_base+3] (5
-       * cols).  All in-bounds when 2*ow_base-1 >= 0 AND 2*ow_base+3 < in_w. */
+       * cols).  All in-bounds when 2*ow_base-1 >= 0 AND 2*ow_base+3 < in_w.
+       * When all 3 kh rows are also valid, swap in bias_with_offset_full to
+       * skip per-tap input_offset adds. */
+      const int32_t* s2_bias_ptr =
+          (kh_valid[0] && kh_valid[1] && kh_valid[2]
+           && p->bias_with_offset_full != (const int32_t*)0)
+          ? p->bias_with_offset_full : bias;
+      const int s2_skip_off = (s2_bias_ptr == p->bias_with_offset_full);
       uint32_t ow_base = 1;
       for (; ow_base + 2 <= out_w && (int32_t)(ow_base * 2u + 3) < (int32_t)in_w;
            ow_base += 2) {
         for (uint32_t cb = 0; cb < out_c; cb += 4) {
-          int32x4_t bias_v = (bias != (const int32_t*)0)
-              ? vld1q_s32(bias + cb) : vdupq_n_s32(0);
+          int32x4_t bias_v = (s2_bias_ptr != (const int32_t*)0)
+              ? vld1q_s32(s2_bias_ptr + cb) : vdupq_n_s32(0);
           int32x4_t acc0 = bias_v;
           int32x4_t acc1 = bias_v;
 
@@ -799,14 +823,23 @@ static __attribute__((always_inline)) inline void dwconv2d_s8(
             int32x4_t w0 = vldrbq_s32(w_base + 0 * out_c);
             int32x4_t w1 = vldrbq_s32(w_base + 1 * out_c);
             int32x4_t w2 = vldrbq_s32(w_base + 2 * out_c);
-            int32x4_t x0 = vaddq_s32(vldrbq_s32(x_base + 0 * in_c), v_in_off);
-            int32x4_t x1 = vaddq_s32(vldrbq_s32(x_base + 1 * in_c), v_in_off);
-            int32x4_t x2 = vaddq_s32(vldrbq_s32(x_base + 2 * in_c), v_in_off);
+            int32x4_t x0 = vldrbq_s32(x_base + 0 * in_c);
+            int32x4_t x1 = vldrbq_s32(x_base + 1 * in_c);
+            int32x4_t x2 = vldrbq_s32(x_base + 2 * in_c);
+            if (!s2_skip_off) {
+              x0 = vaddq_s32(x0, v_in_off);
+              x1 = vaddq_s32(x1, v_in_off);
+              x2 = vaddq_s32(x2, v_in_off);
+            }
             acc0 = vaddq_s32(acc0, vmulq_s32(x0, w0));
             acc0 = vaddq_s32(acc0, vmulq_s32(x1, w1));
             acc0 = vaddq_s32(acc0, vmulq_s32(x2, w2));
-            int32x4_t x3 = vaddq_s32(vldrbq_s32(x_base + 3 * in_c), v_in_off);
-            int32x4_t x4 = vaddq_s32(vldrbq_s32(x_base + 4 * in_c), v_in_off);
+            int32x4_t x3 = vldrbq_s32(x_base + 3 * in_c);
+            int32x4_t x4 = vldrbq_s32(x_base + 4 * in_c);
+            if (!s2_skip_off) {
+              x3 = vaddq_s32(x3, v_in_off);
+              x4 = vaddq_s32(x4, v_in_off);
+            }
             acc1 = vaddq_s32(acc1, vmulq_s32(x2, w0));
             acc1 = vaddq_s32(acc1, vmulq_s32(x3, w1));
             acc1 = vaddq_s32(acc1, vmulq_s32(x4, w2));
