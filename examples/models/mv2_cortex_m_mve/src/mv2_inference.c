@@ -39,6 +39,51 @@
 
 extern uint8_t mv2_arena[];
 
+#if defined(__ARM_FEATURE_MVE) && (__ARM_FEATURE_MVE & 1)
+/* Outlined inline-asm inner kernel for 1x1 conv: processes one output pixel
+ * × 4 output channels.  Uses Cortex-M55's low-overhead loop (wls + le.tp)
+ * and explicit `vmladava.s8` so we don't pay GCC's ~16 register-shuffle
+ * mov instructions per intrinsic-based iteration.  Caller passes
+ * accumulators via memory (pointer); we read them at function entry,
+ * keep them in r4..r7 during the loop, and write back at exit.
+ *
+ * in_c_bytes must be the byte count (n_blocks * 16) so wlstp.8 can
+ * tail-predicate the final partial lane.  Returns updated x and w*
+ * pointers via the "+r" out-constraints. */
+static __attribute__((noinline))
+void mv2_1x1_inner_4oc_1px(
+    int32_t accs[4],
+    const int8_t* x,
+    const int8_t* w0,
+    const int8_t* w1,
+    const int8_t* w2,
+    const int8_t* w3,
+    uint32_t in_c_bytes)
+{
+  int32_t a0 = accs[0], a1 = accs[1], a2 = accs[2], a3 = accs[3];
+  __asm__ volatile (
+    "wlstp.8     lr, %[n], 1f                 \n"
+    "2:                                       \n"
+    "  vldrb.8     q0, [%[x]], #16            \n"
+    "  vldrb.8     q1, [%[w0]], #16           \n"
+    "  vmladava.s8 %[a0], q0, q1              \n"
+    "  vldrb.8     q1, [%[w1]], #16           \n"
+    "  vmladava.s8 %[a1], q0, q1              \n"
+    "  vldrb.8     q1, [%[w2]], #16           \n"
+    "  vmladava.s8 %[a2], q0, q1              \n"
+    "  vldrb.8     q1, [%[w3]], #16           \n"
+    "  vmladava.s8 %[a3], q0, q1              \n"
+    "  letp        lr, 2b                     \n"
+    "1:                                       \n"
+    : [x] "+r"(x), [w0] "+r"(w0), [w1] "+r"(w1), [w2] "+r"(w2), [w3] "+r"(w3),
+      [a0] "+Te"(a0), [a1] "+Te"(a1), [a2] "+Te"(a2), [a3] "+Te"(a3)
+    : [n] "r"(in_c_bytes)
+    : "q0", "q1", "lr", "memory"
+  );
+  accs[0] = a0; accs[1] = a1; accs[2] = a2; accs[3] = a3;
+}
+#endif
+
 #ifdef MV2_PROFILE_KERNELS
 /* Per-kernel cycle accounting.  Off by default — set MV2_PROFILE_KERNELS
  * at compile time to enable.  Counters are uint64_t to handle whole-model
@@ -253,10 +298,12 @@ static __attribute__((always_inline)) inline void conv2d_s8(const int8_t* input,
   }
 
   /* Fastest path: 1x1 stride-1 conv, no padding, even out_w.  Tiles 2 output
-   * pixels per inner iteration sharing the 4 weight-row loads, on top of the
-   * 4-OC blocking.  Each IC chunk runs 8 MVE MACs against 6 loads — ~22%
-   * fewer instructions per output pixel than the single-pixel path.  All MV2
-   * 1x1 convs except the head (out_w=7) hit this path. */
+   * pixels per inner iteration, calling an outlined asm helper per pixel.
+   * The helper does 4-OC × 1-pixel with wlstp.8 / letp tail-predicated loop;
+   * this eliminates the ~16 register-shuffle movs GCC inserts in the
+   * intrinsic form (no scalar-acc spills in the helper since it sees a
+   * clean 4-acc frame).  Trade-off: weights are reloaded for the second
+   * pixel; the per-pixel asm body is ~7 instr vs ~14 for the 8-acc form. */
   if (k_h == 1u && k_w == 1u && pad_h == 0 && pad_w == 0
       && stride_h == 1u && stride_w == 1u
       && (out_c & 3u) == 0u && (out_w & 1u) == 0u
@@ -270,63 +317,30 @@ static __attribute__((always_inline)) inline void conv2d_s8(const int8_t* input,
         const int8_t* x0 = row_in + (size_t)(ow + 0) * in_c;
         const int8_t* x1 = row_in + (size_t)(ow + 1) * in_c;
         for (uint32_t ocb = 0; ocb < out_c; ocb += 4) {
-          int32_t a0_0 = bias[ocb + 0], a0_1 = bias[ocb + 0];
-          int32_t a1_0 = bias[ocb + 1], a1_1 = bias[ocb + 1];
-          int32_t a2_0 = bias[ocb + 2], a2_1 = bias[ocb + 2];
-          int32_t a3_0 = bias[ocb + 3], a3_1 = bias[ocb + 3];
+          int32_t accs0[4] = { bias[ocb + 0], bias[ocb + 1], bias[ocb + 2], bias[ocb + 3] };
+          int32_t accs1[4] = { bias[ocb + 0], bias[ocb + 1], bias[ocb + 2], bias[ocb + 3] };
           const int8_t* w0 = weight + (size_t)(ocb + 0) * w_oc_stride;
           const int8_t* w1 = weight + (size_t)(ocb + 1) * w_oc_stride;
           const int8_t* w2 = weight + (size_t)(ocb + 2) * w_oc_stride;
           const int8_t* w3 = weight + (size_t)(ocb + 3) * w_oc_stride;
-          uint32_t ic = 0;
-          while (ic + 16 <= in_c) {
-            int8x16_t v_x0 = vld1q_s8(x0 + ic);
-            int8x16_t v_x1 = vld1q_s8(x1 + ic);
-            int8x16_t v_w0 = vld1q_s8(w0 + ic);
-            int8x16_t v_w1 = vld1q_s8(w1 + ic);
-            int8x16_t v_w2 = vld1q_s8(w2 + ic);
-            int8x16_t v_w3 = vld1q_s8(w3 + ic);
-            a0_0 = vmladavaq_s8(a0_0, v_x0, v_w0);
-            a1_0 = vmladavaq_s8(a1_0, v_x0, v_w1);
-            a2_0 = vmladavaq_s8(a2_0, v_x0, v_w2);
-            a3_0 = vmladavaq_s8(a3_0, v_x0, v_w3);
-            a0_1 = vmladavaq_s8(a0_1, v_x1, v_w0);
-            a1_1 = vmladavaq_s8(a1_1, v_x1, v_w1);
-            a2_1 = vmladavaq_s8(a2_1, v_x1, v_w2);
-            a3_1 = vmladavaq_s8(a3_1, v_x1, v_w3);
-            ic += 16;
-          }
-          for (; ic < in_c; ++ic) {
-            int32_t x0_v = (int32_t)x0[ic];
-            int32_t x1_v = (int32_t)x1[ic];
-            int32_t w0_v = (int32_t)w0[ic];
-            int32_t w1_v = (int32_t)w1[ic];
-            int32_t w2_v = (int32_t)w2[ic];
-            int32_t w3_v = (int32_t)w3[ic];
-            a0_0 += x0_v * w0_v;  a0_1 += x1_v * w0_v;
-            a1_0 += x0_v * w1_v;  a1_1 += x1_v * w1_v;
-            a2_0 += x0_v * w2_v;  a2_1 += x1_v * w2_v;
-            a3_0 += x0_v * w3_v;  a3_1 += x1_v * w3_v;
-          }
+          mv2_1x1_inner_4oc_1px(accs0, x0, w0, w1, w2, w3, in_c);
+          /* Reset w pointers; they were post-incremented by the helper. */
+          w0 = weight + (size_t)(ocb + 0) * w_oc_stride;
+          w1 = weight + (size_t)(ocb + 1) * w_oc_stride;
+          w2 = weight + (size_t)(ocb + 2) * w_oc_stride;
+          w3 = weight + (size_t)(ocb + 3) * w_oc_stride;
+          mv2_1x1_inner_4oc_1px(accs1, x1, w0, w1, w2, w3, in_c);
           int32x4_t mult = vld1q_s32(mults + ocb);
           int32x4_t shft = vldrbq_s32(shifts + ocb);
-          int32x4_t accv0 = vsetq_lane_s32(a0_0, vdupq_n_s32(0), 0);
-          accv0 = vsetq_lane_s32(a1_0, accv0, 1);
-          accv0 = vsetq_lane_s32(a2_0, accv0, 2);
-          accv0 = vsetq_lane_s32(a3_0, accv0, 3);
+          int32x4_t accv0 = vld1q_s32(accs0);
+          int32x4_t accv1 = vld1q_s32(accs1);
           accv0 = mve_requantize_per_channel(accv0, mult, shft);
           accv0 = vaddq_n_s32(accv0, output_offset);
-          accv0 = vmaxq_s32(accv0, v_act_min);
-          accv0 = vminq_s32(accv0, v_act_max);
+          accv0 = vminq_s32(vmaxq_s32(accv0, v_act_min), v_act_max);
           vstrbq_s32(row_out + (size_t)(ow + 0) * out_c + ocb, accv0);
-          int32x4_t accv1 = vsetq_lane_s32(a0_1, vdupq_n_s32(0), 0);
-          accv1 = vsetq_lane_s32(a1_1, accv1, 1);
-          accv1 = vsetq_lane_s32(a2_1, accv1, 2);
-          accv1 = vsetq_lane_s32(a3_1, accv1, 3);
           accv1 = mve_requantize_per_channel(accv1, mult, shft);
           accv1 = vaddq_n_s32(accv1, output_offset);
-          accv1 = vmaxq_s32(accv1, v_act_min);
-          accv1 = vminq_s32(accv1, v_act_max);
+          accv1 = vminq_s32(vmaxq_s32(accv1, v_act_min), v_act_max);
           vstrbq_s32(row_out + (size_t)(ow + 1) * out_c + ocb, accv1);
         }
       }
