@@ -126,12 +126,13 @@ the PMU conversion.
 | 12 | `8c97186c06` | Out-of-line conv2d_1x1 fast path, asm inlined directly | 25,133,178 | 201,064,764 | 1.04× | 5.76× |
 | 13 | `2fee56d501` | AOT-fold dwconv input_offset for interior tiles (stride-1) | 24,325,407 | 194,602,599 | 1.03× | 5.95× |
 | 14 | (same commit, stride-2) | AOT-fold dwconv input_offset for interior stride-2 tile | 24,145,665 | 193,164,664 | 1.01× | 5.99× |
-| 15 | (pending) | conv1x1 reshape: 2-OC × 2-pixel asm block, shared input load | **23,583,681** | **188,669,439** | 1.024× | **6.14×** |
+| 15 | (committed) | conv1x1 reshape: 2-OC × 2-pixel asm block, shared input load | 23,583,681 | 188,669,439 | 1.024× | 6.14× |
+| 16 | (pending) | conv1x1 fast path: handle odd `out_w` via 1-pixel tail | **21,716,754** | **173,734,023** | 1.086× | **6.66×** |
 
-Headline: **6.14× faster than the original baseline**, bit-exact output
-across all 1000 logits.  cortex_m backend on the same FVP/PMU: 172M PMU
-— standalone is now **~9.7% short** of cortex_m latency (was 5.4× slower
-before any optimization).
+Headline: **6.66× faster than the original baseline**, bit-exact output
+across all 1000 logits.  cortex_m backend on the same FVP/PMU: 172.2M
+PMU — standalone is now **within 0.9% of cortex_m latency** (was 5.4×
+slower before any optimization).
 
 ### What each experiment did
 
@@ -206,6 +207,21 @@ in an even GPR (Cortex-M55 has 7 evens), and 4 accs per asm block
 fits comfortably; the previously-attempted single-block 8-accumulator
 variant exceeded the constraint.  End-to-end PMU drops from 193.2M
 to 188.7M (2.3%), with bit-exact output preserved.
+
+**16. conv1x1 fast path handles odd `out_w`.**  The previous fast-path
+dispatch required `(out_w & 1u) == 0u` because the inner kernel processed
+two pixels per asm block.  Layers with `out_w = 7` (the head 7×7×320 →
+7×7×1280 layer plus ~8 other `1x1` layers in the 7×7 stage of blocks
+14–17) fell through to the generic 4-OC × 1-pixel path, which is much
+slower per output.  This change drops the even-only check and appends a
+4-OC × 1-pixel asm tail block (matching the per-pixel kernel) for the
+final column when `out_w` is odd.
+
+For the head conv alone — 49 spatial outputs × 1280 OCs against in_c=320
+— this moves ~85% of the work (6/7 columns) onto the fast 2-pixel path
+and only 1/7 onto the per-pixel tail.  End-to-end PMU drops from 188.7M
+to 173.7M (-7.9%), bit-exact preserved.  Standalone is now within 0.9%
+of CMSIS-NN's 172.2M PMU.
 
 ## Memory footprint
 

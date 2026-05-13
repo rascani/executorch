@@ -142,7 +142,8 @@ void mv2_conv2d_1x1_fast(const int8_t* input, int8_t* output,
   for (uint32_t oh = 0; oh < out_h; ++oh) {
     const int8_t* row_in = input + (size_t)oh * (size_t)out_w * (size_t)in_c;
     int8_t* row_out = output + (size_t)oh * out_row_stride;
-    for (uint32_t ow = 0; ow < out_w; ow += 2) {
+    uint32_t ow = 0;
+    for (; ow + 1 < out_w; ow += 2) {
       const int8_t* x0 = row_in + (size_t)(ow + 0) * in_c;
       const int8_t* x1 = row_in + (size_t)(ow + 1) * in_c;
       for (uint32_t ocb = 0; ocb < out_c; ocb += 4) {
@@ -224,6 +225,53 @@ void mv2_conv2d_1x1_fast(const int8_t* input, int8_t* output,
         accv1 = vaddq_n_s32(accv1, output_offset);
         accv1 = vminq_s32(vmaxq_s32(accv1, v_act_min), v_act_max);
         vstrbq_s32(row_out + (size_t)(ow + 1) * out_c + ocb, accv1);
+      }
+    }
+    /* Odd-out_w tail: process the final pixel with a 4-OC × 1-pixel asm
+     * block.  Required for out_w in {1, 7}; without this, layers like the
+     * head conv (out_w=7) fall to the slow generic path. */
+    if (ow < out_w) {
+      const int8_t* x0 = row_in + (size_t)ow * in_c;
+      for (uint32_t ocb = 0; ocb < out_c; ocb += 4) {
+        int32_t a0 = bias[ocb + 0];
+        int32_t a1 = bias[ocb + 1];
+        int32_t a2 = bias[ocb + 2];
+        int32_t a3 = bias[ocb + 3];
+        const int8_t* x_p  = x0;
+        const int8_t* w0_p = weight + (size_t)(ocb + 0) * w_oc_stride;
+        const int8_t* w1_p = weight + (size_t)(ocb + 1) * w_oc_stride;
+        const int8_t* w2_p = weight + (size_t)(ocb + 2) * w_oc_stride;
+        const int8_t* w3_p = weight + (size_t)(ocb + 3) * w_oc_stride;
+        __asm__ volatile (
+          "wlstp.8     lr, %[n], 1f                 \n"
+          "2:                                       \n"
+          "  vldrb.8     q0, [%[x]], #16            \n"
+          "  vldrb.8     q1, [%[w0]], #16           \n"
+          "  vmladava.s8 %[a0], q0, q1              \n"
+          "  vldrb.8     q1, [%[w1]], #16           \n"
+          "  vmladava.s8 %[a1], q0, q1              \n"
+          "  vldrb.8     q1, [%[w2]], #16           \n"
+          "  vmladava.s8 %[a2], q0, q1              \n"
+          "  vldrb.8     q1, [%[w3]], #16           \n"
+          "  vmladava.s8 %[a3], q0, q1              \n"
+          "  letp        lr, 2b                     \n"
+          "1:                                       \n"
+          : [x] "+r"(x_p),
+            [w0] "+r"(w0_p), [w1] "+r"(w1_p), [w2] "+r"(w2_p), [w3] "+r"(w3_p),
+            [a0] "+Te"(a0), [a1] "+Te"(a1), [a2] "+Te"(a2), [a3] "+Te"(a3)
+          : [n] "r"(in_c)
+          : "q0", "q1", "lr", "memory"
+        );
+        int32x4_t mult = vld1q_s32(mults + ocb);
+        int32x4_t shft = vldrbq_s32(shifts + ocb);
+        int32x4_t accv = vsetq_lane_s32(a0, vdupq_n_s32(0), 0);
+        accv = vsetq_lane_s32(a1, accv, 1);
+        accv = vsetq_lane_s32(a2, accv, 2);
+        accv = vsetq_lane_s32(a3, accv, 3);
+        accv = mve_requantize_per_channel(accv, mult, shft);
+        accv = vaddq_n_s32(accv, output_offset);
+        accv = vminq_s32(vmaxq_s32(accv, v_act_min), v_act_max);
+        vstrbq_s32(row_out + (size_t)ow * out_c + ocb, accv);
       }
     }
   }
@@ -372,13 +420,15 @@ static __attribute__((always_inline)) inline void conv2d_s8(const int8_t* input,
     return;
   }
 
-  /* Fastest path: 1x1 stride-1 conv, no padding, even out_w.  Dispatches to
-   * a noinline helper so the inner-loop inline asm gets a clean register
-   * context (no surrounding always_inline live values to fight over r-reg
-   * allocation). */
+  /* Fastest path: 1x1 stride-1 conv, no padding.  Dispatches to a noinline
+   * helper so the inner-loop inline asm gets a clean register context (no
+   * surrounding always_inline live values to fight over r-reg allocation).
+   * Handles odd out_w via a 4-OC × 1-pixel tail after the 2-pixel-paired
+   * main loop, so out_w=7 layers (head + several block layers in the 7×7
+   * stage) hit this path instead of the slower generic 4-OC path. */
   if (k_h == 1u && k_w == 1u && pad_h == 0 && pad_w == 0
       && stride_h == 1u && stride_w == 1u
-      && (out_c & 3u) == 0u && (out_w & 1u) == 0u
+      && (out_c & 3u) == 0u
       && input_offset == 0) {
     mv2_conv2d_1x1_fast(input, output, p);
 #ifdef MV2_PROFILE_KERNELS
