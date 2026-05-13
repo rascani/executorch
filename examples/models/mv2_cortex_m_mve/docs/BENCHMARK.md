@@ -127,12 +127,13 @@ the PMU conversion.
 | 13 | `2fee56d501` | AOT-fold dwconv input_offset for interior tiles (stride-1) | 24,325,407 | 194,602,599 | 1.03× | 5.95× |
 | 14 | (same commit, stride-2) | AOT-fold dwconv input_offset for interior stride-2 tile | 24,145,665 | 193,164,664 | 1.01× | 5.99× |
 | 15 | (committed) | conv1x1 reshape: 2-OC × 2-pixel asm block, shared input load | 23,583,681 | 188,669,439 | 1.024× | 6.14× |
-| 16 | (pending) | conv1x1 fast path: handle odd `out_w` via 1-pixel tail | **21,716,754** | **173,734,023** | 1.086× | **6.66×** |
+| 16 | (committed) | conv1x1 fast path: handle odd `out_w` via 1-pixel tail | 21,716,754 | 173,734,023 | 1.086× | 6.66× |
+| 17 | (pending) | requantize: CMSIS-NN-style fixup + `vrshlq_s32` (cuts ~10 MVE ops/call) | **19,288,873** | **154,310,972** | 1.126× | **7.50×** |
 
-Headline: **6.66× faster than the original baseline**, bit-exact output
+Headline: **7.50× faster than the original baseline**, bit-exact output
 across all 1000 logits.  cortex_m backend on the same FVP/PMU: 172.2M
-PMU — standalone is now **within 0.9% of cortex_m latency** (was 5.4×
-slower before any optimization).
+PMU — standalone is now **10.4% FASTER than cortex_m / CMSIS-NN**
+(154.3M vs 172.2M PMU, 17.9M cycle margin).
 
 ### What each experiment did
 
@@ -222,6 +223,32 @@ For the head conv alone — 49 spatial outputs × 1280 OCs against in_c=320
 and only 1/7 onto the per-pixel tail.  End-to-end PMU drops from 188.7M
 to 173.7M (-7.9%), bit-exact preserved.  Standalone is now within 0.9%
 of CMSIS-NN's 172.2M PMU.
+
+**17. CMSIS-NN-style `mve_requantize_per_channel`.**  The original
+helper implemented round-half-away-from-zero using an explicit
+remainder-vs-threshold comparison plus a predicated bump.  Per call:
+~16 MVE vector ops (after CSE'ing the `vdupq_n_s32(0/1)` constants).
+
+The new helper uses CMSIS-NN's trick from
+`arm_divide_by_power_of_two_mve`: pre-add a `fixup` of `-1` to negative
+products and then use `vrshlq_s32` (round-half-up).  Because vrshlq's
+half-up matches half-away-from-zero for positive values and (after the
+fixup) for negative values too, this collapses the post-multiply step
+to just 4 MVE ops:
+
+```c
+int32x4_t fixup = vshrq_n_s32(vandq_s32(product, right), 31);
+int32x4_t fixed = vqaddq_s32(product, fixup);
+return vrshlq_s32(fixed, right);
+```
+
+Total per call: ~7 ops, half of what we had.  This helper is on every
+conv2d / dwconv / avgpool / gemv / add output, so the savings hit every
+layer.
+
+End-to-end PMU: 173.7M → 154.3M (-11.2%), bit-exact across all 1000
+int8 logits.  Standalone now **beats CMSIS-NN by 10.4%** (154.3M vs
+172.2M PMU).
 
 ## Memory footprint
 
