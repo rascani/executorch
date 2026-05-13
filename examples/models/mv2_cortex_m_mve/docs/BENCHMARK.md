@@ -109,19 +109,25 @@ are valid** (DWT and PMU are linearly related by 8×, so percentage
 improvements transfer directly).  Only cross-runner comparisons require
 the PMU conversion.
 
-| # | Commit | Change | DWT cycles | PMU (×8) | Speedup over previous | Cumulative | `.text` |
-|---:|---|---|---:|---:|---:|---:|---:|
-| 0 | `e6f5623e65` | Baseline: scalar dwconv, scalar requantize per OC | 144,728,651 | ~1,157.8 M | — | 1.00× | 56,888 B |
-| 1 | `802c00e3fb` | MVE channel-major dwconv (4 OC per inner iter) | 87,265,364 | ~698.1 M | 1.66× | 1.66× | n/a |
-| 2 | `5351678930` | conv2d: 4-OC blocked w/ shared input + folded input_offset | 55,933,708 | ~447.5 M | 1.56× | 2.59× | 48,696 B |
-| 3 | `27c363b09f` | 1×1 conv: 2 output pixels per inner iter | 48,975,234 | ~391.8 M | 1.14× | 2.95× | 64,336 B |
-| 4 | `fa9b4c1f86` | Pack requant shifts as int8 (memory: -51 KB rodata) | 47,964,461 | ~383.7 M | 1.02× | 3.02× | 64,600 B |
-| 5 | `a56407f7e2` | Vectorize `add_s8` 4-wide | 46,718,954 | 373,751,624 | 1.03× | 3.10× | 65,840 B |
+| # | Commit | Change | DWT cycles | PMU (×8) | Speedup over previous | Cumulative |
+|---:|---|---|---:|---:|---:|---:|
+| 0 | `e6f5623e65` | Baseline: scalar dwconv, scalar requantize per OC | 144,728,651 | ~1,157.8 M | — | 1.00× |
+| 1 | `802c00e3fb` | MVE channel-major dwconv (4 OC per inner iter) | 87,265,364 | ~698.1 M | 1.66× | 1.66× |
+| 2 | `5351678930` | conv2d: 4-OC blocked w/ shared input + folded input_offset | 55,933,708 | ~447.5 M | 1.56× | 2.59× |
+| 3 | `27c363b09f` | 1×1 conv: 2 output pixels per inner iter | 48,975,234 | ~391.8 M | 1.14× | 2.95× |
+| 4 | `fa9b4c1f86` | Pack requant shifts as int8 (memory: -51 KB rodata) | 47,964,461 | ~383.7 M | 1.02× | 3.02× |
+| 5 | `a56407f7e2` | Vectorize `add_s8` 4-wide | 46,718,954 | 373,751,624 | 1.03× | 3.10× |
+| 6 | `f3f21c62ad` | Fix calibration (degenerate scale was masking saturated outputs); `always_inline` conv2d_s8 | 37,802,072 | 302,415,918 | 1.24× | 3.83× |
+| 7 | `8245f5b2cc` | dwconv 4-pixel spatial tile (3x3 stride-1) | 35,918,876 | 287,350,999 | 1.05× | 4.03× |
+| 8 | `29dbdf2dad` | First 3x3 conv (in_c=3) AOT-packed im2col path | 30,215,560 | 241,723,824 | 1.19× | 4.79× |
+| 9 | `1eaf666c67` | `always_inline` dwconv2d_s8 | 29,861,094 | 238,888,097 | 1.01× | 4.85× |
+| 10 | `d06c04b6af` | dwconv 2-pixel spatial tile (3x3 stride-2) | 29,394,384 | 235,154,411 | 1.02× | 4.92× |
+| 11 | `7df24efe95` | Inline-asm wlstp/letp inner kernel for 1x1 conv | **26,021,579** | **208,171,977** | 1.13× | **5.56×** |
 
-Headline: **3.10× faster than its own baseline, +9 KB code, -51 KB
-read-only data**, bit-exact output throughout.  Each commit is still
-a real perf improvement — that part of the analysis was unaffected by
-the counter confusion because all rows used the same DWT counter.
+Headline: **5.56× faster than the original baseline**, bit-exact output
+across all 1000 logits.  cortex_m backend on the same FVP/PMU: 172M PMU
+— standalone is now **~21% short** of cortex_m latency (was 5.4× slower
+before any optimization).
 
 ### What each experiment did
 
