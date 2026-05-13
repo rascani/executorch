@@ -142,6 +142,116 @@ static __attribute__((always_inline)) inline void conv2d_s8(const int8_t* input,
   const size_t w_oc_stride = (size_t)k_h * k_w * in_c;
 
 #if MV2_USE_MVE
+  /* First-conv specialization: 3x3 stride-2 pad-1 in_c=3.  Uses pre-packed
+   * weights (27 OHWI bytes + 5 zero bytes per OC) and an im2col patch built
+   * inline per output pixel.  Math: AOT folds `input_offset * sum(w[oc])`
+   * into bias; runtime fills cropped patch positions with -input_offset so
+   * the algebra still produces the correct per-pixel partial sum.
+   *
+   * Per output pixel: 1 patch build (~10 cycles incl. bounds checks) +
+   * 8 OC blocks × (2 vmladavaq_s8 + bias load + requant + scatter store +
+   * setup) ≈ 90 cycles.  vs ~560 cycles in the generic 4-OC path → ~6×. */
+  if (p->weight_packed_32 != (const int8_t*)0
+      && k_h == 3u && k_w == 3u && in_c == 3u
+      && stride_h == 2u && stride_w == 2u
+      && pad_h == 1 && pad_w == 1
+      && (out_c & 3u) == 0u) {
+    const int8_t* w_packed = p->weight_packed_32;
+    const int8_t  pad_byte = (int8_t)(-input_offset);
+    const int32x4_t v_act_min = vdupq_n_s32(act_min);
+    const int32x4_t v_act_max = vdupq_n_s32(act_max);
+    for (uint32_t oh = 0; oh < out_h; ++oh) {
+      const int32_t ih_base = (int32_t)(oh * 2u) - 1;  // pad=1
+      const int kh_valid[3] = {
+        (ih_base + 0 >= 0 && ih_base + 0 < (int32_t)in_h) ? 1 : 0,
+        (ih_base + 1 >= 0 && ih_base + 1 < (int32_t)in_h) ? 1 : 0,
+        (ih_base + 2 >= 0 && ih_base + 2 < (int32_t)in_h) ? 1 : 0,
+      };
+      for (uint32_t ow = 0; ow < out_w; ++ow) {
+        const int32_t iw_base = (int32_t)(ow * 2u) - 1;  // pad=1
+        /* Build the 32-byte patch: 27 input bytes in (kh, kw, ic) order,
+         * with -input_offset for cropped positions, followed by 5 zero pads
+         * (which match the zero-padded weight tail and contribute nothing
+         * to the MAC). */
+        int8_t patch[32] = {0};
+        for (uint32_t kh = 0; kh < 3; ++kh) {
+          int32_t ih = ih_base + (int32_t)kh;
+          int8_t* p_row = patch + kh * 9;
+          if (kh_valid[kh]) {
+            const int8_t* x_row = input + (size_t)ih * in_row_stride;
+            for (uint32_t kw = 0; kw < 3; ++kw) {
+              int32_t iw = iw_base + (int32_t)kw;
+              int8_t* p_pos = p_row + kw * 3;
+              if (iw >= 0 && iw < (int32_t)in_w) {
+                const int8_t* x_pos = x_row + (size_t)iw * 3;
+                p_pos[0] = x_pos[0];
+                p_pos[1] = x_pos[1];
+                p_pos[2] = x_pos[2];
+              } else {
+                p_pos[0] = pad_byte;
+                p_pos[1] = pad_byte;
+                p_pos[2] = pad_byte;
+              }
+            }
+          } else {
+            /* All 9 ints in this row are pad */
+            p_row[0] = pad_byte; p_row[1] = pad_byte; p_row[2] = pad_byte;
+            p_row[3] = pad_byte; p_row[4] = pad_byte; p_row[5] = pad_byte;
+            p_row[6] = pad_byte; p_row[7] = pad_byte; p_row[8] = pad_byte;
+          }
+        }
+
+        int8x16_t vx_lo = vld1q_s8(patch + 0);
+        int8x16_t vx_hi = vld1q_s8(patch + 16);
+
+        for (uint32_t ocb = 0; ocb < out_c; ocb += 4) {
+          int32_t a0 = bias[ocb + 0];
+          int32_t a1 = bias[ocb + 1];
+          int32_t a2 = bias[ocb + 2];
+          int32_t a3 = bias[ocb + 3];
+
+          int8x16_t w0_lo = vld1q_s8(w_packed + (size_t)(ocb + 0) * 32 + 0);
+          int8x16_t w0_hi = vld1q_s8(w_packed + (size_t)(ocb + 0) * 32 + 16);
+          int8x16_t w1_lo = vld1q_s8(w_packed + (size_t)(ocb + 1) * 32 + 0);
+          int8x16_t w1_hi = vld1q_s8(w_packed + (size_t)(ocb + 1) * 32 + 16);
+          int8x16_t w2_lo = vld1q_s8(w_packed + (size_t)(ocb + 2) * 32 + 0);
+          int8x16_t w2_hi = vld1q_s8(w_packed + (size_t)(ocb + 2) * 32 + 16);
+          int8x16_t w3_lo = vld1q_s8(w_packed + (size_t)(ocb + 3) * 32 + 0);
+          int8x16_t w3_hi = vld1q_s8(w_packed + (size_t)(ocb + 3) * 32 + 16);
+
+          a0 = vmladavaq_s8(a0, vx_lo, w0_lo);
+          a0 = vmladavaq_s8(a0, vx_hi, w0_hi);
+          a1 = vmladavaq_s8(a1, vx_lo, w1_lo);
+          a1 = vmladavaq_s8(a1, vx_hi, w1_hi);
+          a2 = vmladavaq_s8(a2, vx_lo, w2_lo);
+          a2 = vmladavaq_s8(a2, vx_hi, w2_hi);
+          a3 = vmladavaq_s8(a3, vx_lo, w3_lo);
+          a3 = vmladavaq_s8(a3, vx_hi, w3_hi);
+
+          int32x4_t mult = vld1q_s32(mults + ocb);
+          int32x4_t shft = vldrbq_s32(shifts + ocb);
+          int32x4_t accv = vsetq_lane_s32(a0, vdupq_n_s32(0), 0);
+          accv = vsetq_lane_s32(a1, accv, 1);
+          accv = vsetq_lane_s32(a2, accv, 2);
+          accv = vsetq_lane_s32(a3, accv, 3);
+          accv = mve_requantize_per_channel(accv, mult, shft);
+          accv = vaddq_n_s32(accv, output_offset);
+          accv = vminq_s32(vmaxq_s32(accv, v_act_min), v_act_max);
+          vstrbq_s32(output + (size_t)oh * out_row_stride
+                       + (size_t)ow * out_c + ocb, accv);
+        }
+      }
+    }
+#ifdef MV2_PROFILE_KERNELS
+    {
+      uint32_t __prof_dt = prof_read_cycles() - __prof_t0;
+      mv2_prof_conv2d_3x3_first += __prof_dt;
+      mv2_prof_n_conv2d_3x3_first++;
+    }
+#endif
+    return;
+  }
+
   /* Fastest path: 1x1 stride-1 conv, no padding, even out_w.  Tiles 2 output
    * pixels per inner iteration sharing the 4 weight-row loads, on top of the
    * 4-OC blocking.  Each IC chunk runs 8 MVE MACs against 6 loads — ~22%

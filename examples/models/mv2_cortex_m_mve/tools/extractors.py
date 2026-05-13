@@ -75,6 +75,9 @@ class Conv2dLayer:
     output_offset: int = 0
     activation_min: int = -128
     activation_max: int = 127
+    # Optional packed-32 weight blob for the first 3x3 stride-2 in_c=3 conv.
+    # See Conv2dParams.weight_packed_32 in mv2_layer_params.h for the layout.
+    weight_packed_32: Optional[torch.Tensor] = None  # int8 [out_C, 32]
 
 
 @dataclass
@@ -284,12 +287,38 @@ def extract_quantized_conv2d(node: Node, program: ExportedProgram, offsets, size
     # the kernel taps, so the second term varies per pixel — we keep
     # input_offset as a runtime arg in that case.
     weight_int32 = weight_t.detach().to(torch.int32).contiguous()
+    out_c = weight_int32.shape[0]
     kernel_h, kernel_w = weight_int32.shape[1], weight_int32.shape[2]  # OHWI
+    in_c = weight_int32.shape[3]
     pad_h, pad_w = _coerce_int_pair(a["padding"])
-    safe_to_fold = (
+    stride_h, stride_w = _coerce_int_pair(a["stride"])
+
+    # 3x3 stride-2 pad-1 in_c=3 special case (the MV2 first conv).  The
+    # 16-wide vmladavaq_s8 inner loop can't trigger on in_c=3 alone, but we
+    # can pack each OC's 27 weights + 5 zero pads into a 32-byte vector and
+    # use 2 vmladavaq_s8 per output channel.  Boundary pixels are handled by
+    # putting -input_offset in the cropped patch positions so the AOT
+    # offset-fold still produces the correct result (the zero-padded weight
+    # positions contribute nothing regardless).
+    pack_first_3x3 = (
+        kernel_h == 3 and kernel_w == 3 and in_c == 3
+        and stride_h == 2 and stride_w == 2
+        and pad_h == 1 and pad_w == 1
+    )
+
+    safe_to_fold_1x1 = (
         kernel_h == 1 and kernel_w == 1 and pad_h == 0 and pad_w == 0
     )
-    if safe_to_fold:
+
+    weight_packed_32 = None
+    if pack_first_3x3:
+        # OHWI flatten = (kh, kw, ic) order = exactly the 27-element packing.
+        flat = weight_int32.reshape(out_c, kernel_h * kernel_w * in_c)  # [out_c, 27]
+        pad = torch.zeros((out_c, 32 - flat.shape[1]), dtype=torch.int32)
+        packed = torch.cat([flat, pad], dim=1)
+        weight_packed_32 = packed.to(torch.int8).contiguous()
+
+    if safe_to_fold_1x1 or pack_first_3x3:
         sum_w_per_oc = weight_int32.flatten(1).sum(dim=1)  # [out_c]
         offset_term = sum_w_per_oc * int(a["input_offset"])
         if bias_t is not None:
@@ -305,6 +334,17 @@ def extract_quantized_conv2d(node: Node, program: ExportedProgram, offsets, size
             if bias_t is not None else None
         )
         emitted_input_offset = int(a["input_offset"])
+
+    # For the packed first conv, the runtime needs the original input_offset
+    # to put -input_offset in cropped patch positions.  Stash it in the
+    # padding=p->pad_h fields?  No: we just keep input_offset != 0 alongside
+    # the packed marker.  Override emitted_input_offset to keep the offset
+    # available to the kernel while still signalling "offset is folded into
+    # bias_with_offset".  We use the packed pointer non-null as the signal,
+    # not input_offset == 0.
+    if pack_first_3x3:
+        emitted_input_offset = int(a["input_offset"])
+
     return Conv2dLayer(
         input=_slot_from_node(a["input"], offsets, sizes),
         output=_slot_from_node(node, offsets, sizes),
@@ -316,12 +356,15 @@ def extract_quantized_conv2d(node: Node, program: ExportedProgram, offsets, size
         stride=_coerce_int_pair(a["stride"]),
         padding=_coerce_int_pair(a["padding"]),
         dilation=_coerce_int_pair(a["dilation"]),
-        # input_offset == 0 signals to the kernel that the offset is already
-        # folded into the bias (skips the runtime sum_w computation).
+        # input_offset == 0 signals to the 1x1-fast-path kernel that the
+        # offset is already folded into the bias.  For the packed first-conv
+        # path, input_offset stays non-zero and the kernel reads it to fill
+        # cropped patch positions; the packed pointer is the signal.
         input_offset=emitted_input_offset,
         output_offset=int(a["output_offset"]),
         activation_min=int(a["activation_min"]),
         activation_max=int(a["activation_max"]),
+        weight_packed_32=weight_packed_32,
     )
 
 

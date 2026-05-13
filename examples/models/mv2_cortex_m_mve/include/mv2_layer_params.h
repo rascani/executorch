@@ -65,6 +65,12 @@ typedef struct {
   int32_t output_offset;
   int8_t activation_min;
   int8_t activation_max;
+  /* Optional packed weight blob for the first 3x3 stride-2 in_c=3 conv.
+   * Layout: [out_c, 32] int8.  Each row is the 27 OHWI weights for one OC
+   * (in kh, kw, ic order) followed by 5 zero padding bytes.  When non-null,
+   * `bias` is required to hold bias_with_offset (bias + input_offset * sum_w),
+   * `input_offset` is 0, and the runtime uses a vmladavaq_s8 im2col path. */
+  const int8_t* weight_packed_32;
 } Conv2dParams;
 
 typedef struct {

@@ -92,6 +92,9 @@ def emit_weights(out_dir: Path, layers: Iterable, header_guard: str = "MV2_WEIGH
             stem = f"L{i}_conv2d"
             defns.append(_emit_int8_array(f"{stem}_weight", layer.weight))
             decls.append(f"extern const int8_t {stem}_weight[];")
+            if layer.weight_packed_32 is not None:
+                defns.append(_emit_int8_array(f"{stem}_weight_packed_32", layer.weight_packed_32))
+                decls.append(f"extern const int8_t {stem}_weight_packed_32[];")
             if layer.bias is not None:
                 defns.append(_emit_int32_array(f"{stem}_bias", layer.bias))
                 decls.append(f"extern const int32_t {stem}_bias[];")
@@ -222,6 +225,10 @@ def emit_params(
             # weight tensor: OHWI [out_C, kH, kW, in_C]
             out_c, k_h, k_w, weight_in_c = layer.weight.shape
             bias_ref = f"L{i}_conv2d_bias" if layer.bias is not None else "(const int32_t*)0"
+            packed_ref = (
+                f"L{i}_conv2d_weight_packed_32"
+                if layer.weight_packed_32 is not None else "(const int8_t*)0"
+            )
             lines.append(
                 f"static const Conv2dParams P_L{i}_conv2d = {{\n"
                 f"  .in_h = {in_h}u, .in_w = {in_w}u, .in_c = {in_c}u,\n"
@@ -237,6 +244,7 @@ def emit_params(
                 f"  .output_offset = {layer.output_offset},\n"
                 f"  .activation_min = {layer.activation_min},\n"
                 f"  .activation_max = {layer.activation_max},\n"
+                f"  .weight_packed_32 = {packed_ref},\n"
                 "};"
             )
         elif isinstance(layer, DepthwiseConv2dLayer):
