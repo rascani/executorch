@@ -25,9 +25,8 @@
 #include "input_fixture.h"
 
 /* DWT cycle counter registers — Cortex-M55 implements both DWT and the
- * cycle counter (CYCCNT).  FVP simulates these accurately enough for
- * sequential comparisons even though the CPU is not cycle-accurate as
- * a whole. */
+ * cycle counter (CYCCNT).  Read alongside the PMU CCNTR for cross-check;
+ * see docs/BENCHMARK.md for why we report PMU as the canonical CYCLES. */
 #define DWT_CTRL    (*(volatile uint32_t*)0xE0001000u)
 #define DWT_CYCCNT  (*(volatile uint32_t*)0xE0001004u)
 #define DEMCR       (*(volatile uint32_t*)0xE000EDFCu)
@@ -40,8 +39,8 @@ static void enable_cycle_counter(void) {
   DWT_CTRL |= DWT_CTRL_CYCCNTENA;
 
   /* Enable PMU cycle counter (same source the cortex_m backend's runner
-   * uses via ARM_PMU_Get_CCNTR) so we can print both counters and verify
-   * they agree on this FVP config. */
+   * uses via ARM_PMU_Get_CCNTR), so cross-runner comparisons read the
+   * same counter. */
   ARM_PMU_Enable();
   ARM_PMU_CYCCNT_Reset();
   ARM_PMU_CNTR_Enable(PMU_CNTENSET_CCNTR_ENABLE_Msk);
@@ -53,21 +52,39 @@ int main(void) {
   static int8_t output[MV2_OUTPUT_NUM_ELEMENTS];
 
   enable_cycle_counter();
-
   uint32_t dwt_start = DWT_CYCCNT;
   uint32_t pmu_start = ARM_PMU_Get_CCNTR();
   mobilenet_v2_inference(mv2_fixture_input, output);
   uint32_t dwt_elapsed = DWT_CYCCNT - dwt_start;
   uint32_t pmu_elapsed = ARM_PMU_Get_CCNTR() - pmu_start;
 
-  /* CYCLES is the PMU value — that's the counter the cortex_m runner
-   * also uses for its BENCHMARK_CYCLES output, so apples-to-apples
-   * comparisons should use this number.  DWT is reported separately
-   * for cross-check; on the Corstone-300 FVP it consistently reads
-   * 1/8 of PMU regardless of workload. */
+  /* CYCLES reports PMU (matches cortex_m runner's source). */
   printf("CYCLES %u\n", (unsigned)pmu_elapsed);
   printf("CYCLES_DWT %u\n", (unsigned)dwt_elapsed);
   printf("CYCLES_PMU %u\n", (unsigned)pmu_elapsed);
+
+#ifdef MV2_PROFILE_KERNELS
+  extern uint64_t mv2_prof_quantize_input, mv2_prof_conv2d_3x3_first,
+                  mv2_prof_conv2d_1x1, mv2_prof_dwconv2d, mv2_prof_add_s8,
+                  mv2_prof_avgpool, mv2_prof_gemv;
+  extern uint32_t mv2_prof_n_quantize_input, mv2_prof_n_conv2d_3x3_first,
+                  mv2_prof_n_conv2d_1x1, mv2_prof_n_dwconv2d, mv2_prof_n_add_s8,
+                  mv2_prof_n_avgpool, mv2_prof_n_gemv;
+  printf("PROF quantize_input n=%u dwt=%llu\n",
+         mv2_prof_n_quantize_input, (unsigned long long)mv2_prof_quantize_input);
+  printf("PROF conv2d_3x3_first n=%u dwt=%llu\n",
+         mv2_prof_n_conv2d_3x3_first, (unsigned long long)mv2_prof_conv2d_3x3_first);
+  printf("PROF conv2d_1x1 n=%u dwt=%llu\n",
+         mv2_prof_n_conv2d_1x1, (unsigned long long)mv2_prof_conv2d_1x1);
+  printf("PROF dwconv2d n=%u dwt=%llu\n",
+         mv2_prof_n_dwconv2d, (unsigned long long)mv2_prof_dwconv2d);
+  printf("PROF add_s8 n=%u dwt=%llu\n",
+         mv2_prof_n_add_s8, (unsigned long long)mv2_prof_add_s8);
+  printf("PROF avgpool n=%u dwt=%llu\n",
+         mv2_prof_n_avgpool, (unsigned long long)mv2_prof_avgpool);
+  printf("PROF gemv n=%u dwt=%llu\n",
+         mv2_prof_n_gemv, (unsigned long long)mv2_prof_gemv);
+#endif
 
   printf("RESULT_BEGIN\n");
   for (unsigned i = 0; i < MV2_OUTPUT_NUM_ELEMENTS; ++i) {

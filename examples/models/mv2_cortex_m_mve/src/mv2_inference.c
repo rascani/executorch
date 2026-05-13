@@ -39,7 +39,42 @@
 
 extern uint8_t mv2_arena[];
 
+#ifdef MV2_PROFILE_KERNELS
+/* Per-kernel cycle accounting.  Off by default — set MV2_PROFILE_KERNELS
+ * at compile time to enable.  Counters are uint64_t to handle whole-model
+ * accumulation; the runner prints them after inference. */
+#include <stdio.h>
+
+uint64_t mv2_prof_quantize_input = 0;
+uint64_t mv2_prof_conv2d_3x3_first = 0;
+uint64_t mv2_prof_conv2d_1x1 = 0;
+uint64_t mv2_prof_dwconv2d = 0;
+uint64_t mv2_prof_add_s8 = 0;
+uint64_t mv2_prof_avgpool = 0;
+uint64_t mv2_prof_gemv = 0;
+uint32_t mv2_prof_n_quantize_input = 0;
+uint32_t mv2_prof_n_conv2d_3x3_first = 0;
+uint32_t mv2_prof_n_conv2d_1x1 = 0;
+uint32_t mv2_prof_n_dwconv2d = 0;
+uint32_t mv2_prof_n_add_s8 = 0;
+uint32_t mv2_prof_n_avgpool = 0;
+uint32_t mv2_prof_n_gemv = 0;
+
+static inline uint32_t prof_read_cycles(void) {
+  return *(volatile uint32_t*)0xE0001004u;  /* DWT_CYCCNT */
+}
+#define PROF_START(name) uint32_t __prof_start_##name = prof_read_cycles()
+#define PROF_END(name)   do { \
+    mv2_prof_##name += (uint64_t)(prof_read_cycles() - __prof_start_##name); \
+    mv2_prof_n_##name++; \
+  } while (0)
+#else
+#define PROF_START(name) ((void)0)
+#define PROF_END(name)   ((void)0)
+#endif
+
 static void quantize_input(const float* in, int8_t* out, const QuantInputParams* p) {
+  PROF_START(quantize_input);
   const float inv_scale = 1.0f / p->scale;
   const int32_t zp = p->zero_point;
   const int32_t qmin = p->qmin;
@@ -72,12 +107,22 @@ static void quantize_input(const float* in, int8_t* out, const QuantInputParams*
     if (q > qmax) q = qmax;
     out[i] = (int8_t)q;
   }
+  PROF_END(quantize_input);
 }
 
-static void conv2d_s8(const int8_t* input, int8_t* output, const Conv2dParams* p) {
+static __attribute__((always_inline)) inline void conv2d_s8(const int8_t* input, int8_t* output, const Conv2dParams* p) {
   /* NHWC int8 input, NHWC int8 output, OHWI int8 weights, per-channel requant.
    * Matches the math in backends/cortex_m/ops/operators.py:751
-   * quantized_conv2d_impl bit-exactly when using scalar_requantize. */
+   * quantized_conv2d_impl bit-exactly when using scalar_requantize.
+   *
+   * always_inline so the LayerParams (a static const struct in mv2_params.h)
+   * gets const-folded into the kernel per-call: gate-checks become
+   * compile-time constants and dead paths drop out.  Trades code size
+   * for inner-loop quality. */
+#ifdef MV2_PROFILE_KERNELS
+  uint32_t __prof_t0 = prof_read_cycles();
+  const int __prof_is_first = (p->kernel_h > 1u);
+#endif
   const uint32_t in_h = p->in_h, in_w = p->in_w, in_c = p->in_c;
   const uint32_t out_h = p->out_h, out_w = p->out_w, out_c = p->out_c;
   const uint32_t k_h = p->kernel_h, k_w = p->kernel_w;
@@ -176,6 +221,13 @@ static void conv2d_s8(const int8_t* input, int8_t* output, const Conv2dParams* p
         }
       }
     }
+#ifdef MV2_PROFILE_KERNELS
+    {
+      uint32_t __prof_dt = prof_read_cycles() - __prof_t0;
+      mv2_prof_conv2d_1x1 += __prof_dt;
+      mv2_prof_n_conv2d_1x1++;
+    }
+#endif
     return;
   }
   /* Generic 4-OC-blocked path: handles all out_w cases (incl. odd) plus
@@ -277,6 +329,18 @@ static void conv2d_s8(const int8_t* input, int8_t* output, const Conv2dParams* p
         }
       }
     }
+#ifdef MV2_PROFILE_KERNELS
+    {
+      uint32_t __prof_dt = prof_read_cycles() - __prof_t0;
+      if (__prof_is_first) {
+        mv2_prof_conv2d_3x3_first += __prof_dt;
+        mv2_prof_n_conv2d_3x3_first++;
+      } else {
+        mv2_prof_conv2d_1x1 += __prof_dt;
+        mv2_prof_n_conv2d_1x1++;
+      }
+    }
+#endif
     return;
   }
 #endif
@@ -309,10 +373,21 @@ static void conv2d_s8(const int8_t* input, int8_t* output, const Conv2dParams* p
       }
     }
   }
+#ifdef MV2_PROFILE_KERNELS
+  uint32_t __prof_dt = prof_read_cycles() - __prof_t0;
+  if (__prof_is_first) {
+    mv2_prof_conv2d_3x3_first += __prof_dt;
+    mv2_prof_n_conv2d_3x3_first++;
+  } else {
+    mv2_prof_conv2d_1x1 += __prof_dt;
+    mv2_prof_n_conv2d_1x1++;
+  }
+#endif
 }
 
 static void dwconv2d_s8(const int8_t* input, int8_t* output,
                         const DepthwiseConv2dParams* p) {
+  PROF_START(dwconv2d);
   /* NHWC int8 input, IHWO int8 weights [1, kH, kW, C], depth_multiplier=1
    * (out_c == in_c).  Per-channel requant, fused ReLU bounds.
    * Mirrors quantized_depthwise_conv2d_impl in operators.py:858 bit-exactly.
@@ -381,6 +456,7 @@ static void dwconv2d_s8(const int8_t* input, int8_t* output,
         }
       }
     }
+    PROF_END(dwconv2d);
     return;
   }
 #endif
@@ -410,10 +486,12 @@ static void dwconv2d_s8(const int8_t* input, int8_t* output,
       }
     }
   }
+  PROF_END(dwconv2d);
 }
 
 static void add_s8(const int8_t* a, const int8_t* b, int8_t* out,
                    const QuantizedAddParams* p) {
+  PROF_START(add_s8);
   /* Two-stage requantize: lift each input by SHIFT_INT8=20 and requantize
    * to a shared fixed-point representation, sum, requantize to output scale.
    * Matches operators.py:168 quantized_add_impl bit-exactly. */
@@ -466,9 +544,11 @@ static void add_s8(const int8_t* a, const int8_t* b, int8_t* out,
     if (result > p->activation_max) result = p->activation_max;
     out[i] = (int8_t)result;
   }
+  PROF_END(add_s8);
 }
 
 static void avgpool_s8(const int8_t* input, int8_t* output, const AvgPool2dParams* p) {
+  PROF_START(avgpool);
   /* NHWC int8 in/out, count_include_pad=False (matches operators.py:1215). */
   const uint32_t in_h = p->in_h, in_w = p->in_w, channels = p->channels;
   const uint32_t out_h = p->out_h, out_w = p->out_w;
@@ -510,9 +590,11 @@ static void avgpool_s8(const int8_t* input, int8_t* output, const AvgPool2dParam
       }
     }
   }
+  PROF_END(avgpool);
 }
 
 static void gemv_s8(const int8_t* input, int8_t* output, const LinearParams* p) {
+  PROF_START(gemv);
   const uint32_t in_features = p->in_features;
   const uint32_t out_features = p->out_features;
   const int32_t filter_offset = p->filter_offset;
@@ -565,6 +647,7 @@ static void gemv_s8(const int8_t* input, int8_t* output, const LinearParams* p) 
     if (acc > act_max) acc = act_max;
     output[j] = (int8_t)acc;
   }
+  PROF_END(gemv);
 }
 
 void mobilenet_v2_inference(const float* input_float, int8_t* output_q) {
