@@ -122,11 +122,14 @@ the PMU conversion.
 | 8 | `29dbdf2dad` | First 3x3 conv (in_c=3) AOT-packed im2col path | 30,215,560 | 241,723,824 | 1.19× | 4.79× |
 | 9 | `1eaf666c67` | `always_inline` dwconv2d_s8 | 29,861,094 | 238,888,097 | 1.01× | 4.85× |
 | 10 | `d06c04b6af` | dwconv 2-pixel spatial tile (3x3 stride-2) | 29,394,384 | 235,154,411 | 1.02× | 4.92× |
-| 11 | `7df24efe95` | Inline-asm wlstp/letp inner kernel for 1x1 conv | **26,021,579** | **208,171,977** | 1.13× | **5.56×** |
+| 11 | `7df24efe95` | Inline-asm wlstp/letp inner kernel for 1x1 conv | 26,021,579 | 208,171,977 | 1.13× | 5.56× |
+| 12 | `8c97186c06` | Out-of-line conv2d_1x1 fast path, asm inlined directly | 25,133,178 | 201,064,764 | 1.04× | 5.76× |
+| 13 | `2fee56d501` | AOT-fold dwconv input_offset for interior tiles (stride-1) | 24,325,407 | 194,602,599 | 1.03× | 5.95× |
+| 14 | (same commit, stride-2) | AOT-fold dwconv input_offset for interior stride-2 tile | **24,145,665** | **193,164,664** | 1.01× | **5.99×** |
 
-Headline: **5.56× faster than the original baseline**, bit-exact output
+Headline: **5.99× faster than the original baseline**, bit-exact output
 across all 1000 logits.  cortex_m backend on the same FVP/PMU: 172M PMU
-— standalone is now **~21% short** of cortex_m latency (was 5.4× slower
+— standalone is now **~12% short** of cortex_m latency (was 5.4× slower
 before any optimization).
 
 ### What each experiment did
