@@ -684,6 +684,133 @@ static __attribute__((always_inline)) inline void dwconv2d_s8(
     return;
   }
 
+  /* 3x3 stride-2 pad-1 fast path: 2-pixel spatial tiling.
+   *
+   * Per (oh, cb=4, 2-pixel tile): adjacent output pixels at stride 2 share
+   * 1 input column (col 2*ow_base+1 = 2*(ow_base+1)-1).  Per kh row:
+   * 5 input loads + 3 weight loads + 6 (vmulq + vaddq) MAC pairs = 20 vector
+   * ops for 8 outputs (2 pixels × 4 channels) = 2.5 ops/output (vs ~3.4 for
+   * the 4-OC × 1-pixel path).  Handles 4 of 17 MV2 dw layers (stride-2
+   * downsamples). */
+  if (k_h == 3u && k_w == 3u && stride_h == 2u && stride_w == 2u &&
+      pad_h == 1 && pad_w == 1 && (out_c & 3u) == 0u && out_w >= 2u) {
+    const int32x4_t v_in_off  = vdupq_n_s32(input_offset);
+    const int32x4_t v_act_min = vdupq_n_s32(act_min);
+    const int32x4_t v_act_max = vdupq_n_s32(act_max);
+    for (uint32_t oh = 0; oh < out_h; ++oh) {
+      int kh_valid[3];
+      int32_t ih_for_kh[3];
+      for (uint32_t kh = 0; kh < 3; ++kh) {
+        int32_t ih = (int32_t)(oh * 2u) - 1 + (int32_t)kh;
+        kh_valid[kh] = (ih >= 0 && (uint32_t)ih < in_h) ? 1 : 0;
+        ih_for_kh[kh] = ih;
+      }
+
+      /* Left boundary: ow = 0 uses pad col iw=-1.  Single-pixel slow path. */
+      for (uint32_t cb = 0; cb < out_c; cb += 4) {
+        int32x4_t acc = (bias != (const int32_t*)0)
+            ? vld1q_s32(bias + cb) : vdupq_n_s32(0);
+        for (uint32_t kh = 0; kh < 3; ++kh) {
+          if (!kh_valid[kh]) continue;
+          const int8_t* w_row = weight + (size_t)kh * w_row_stride;
+          const int8_t* x_row = input + (size_t)ih_for_kh[kh] * in_row_stride;
+          for (uint32_t kw = 1; kw < 3; ++kw) {
+            int32_t iw = (int32_t)kw - 1;
+            int32x4_t x = vldrbq_s32(x_row + (size_t)iw * in_c + cb);
+            int32x4_t w = vldrbq_s32(w_row + (size_t)kw * out_c + cb);
+            x = vaddq_s32(x, v_in_off);
+            acc = vaddq_s32(acc, vmulq_s32(x, w));
+          }
+        }
+        int32x4_t mult = vld1q_s32(mults + cb);
+        int32x4_t shft = vldrbq_s32(shifts + cb);
+        acc = mve_requantize_per_channel(acc, mult, shft);
+        acc = vaddq_n_s32(acc, output_offset);
+        acc = vminq_s32(vmaxq_s32(acc, v_act_min), v_act_max);
+        vstrbq_s32(output + (size_t)oh * out_row_stride + cb, acc);
+      }
+
+      /* Interior 2-pixel tiles.  Pixel ow uses iw cols [2*ow-1, 2*ow, 2*ow+1].
+       * Pair (ow_base, ow_base+1) uses cols [2*ow_base-1 .. 2*ow_base+3] (5
+       * cols).  All in-bounds when 2*ow_base-1 >= 0 AND 2*ow_base+3 < in_w. */
+      uint32_t ow_base = 1;
+      for (; ow_base + 2 <= out_w && (int32_t)(ow_base * 2u + 3) < (int32_t)in_w;
+           ow_base += 2) {
+        for (uint32_t cb = 0; cb < out_c; cb += 4) {
+          int32x4_t bias_v = (bias != (const int32_t*)0)
+              ? vld1q_s32(bias + cb) : vdupq_n_s32(0);
+          int32x4_t acc0 = bias_v;
+          int32x4_t acc1 = bias_v;
+
+          for (uint32_t kh = 0; kh < 3; ++kh) {
+            if (!kh_valid[kh]) continue;
+            const int8_t* x_base =
+                input + (size_t)ih_for_kh[kh] * in_row_stride
+                      + (size_t)(ow_base * 2u - 1u) * in_c + cb;
+            const int8_t* w_base = weight + (size_t)kh * w_row_stride + cb;
+            int32x4_t w0 = vldrbq_s32(w_base + 0 * out_c);
+            int32x4_t w1 = vldrbq_s32(w_base + 1 * out_c);
+            int32x4_t w2 = vldrbq_s32(w_base + 2 * out_c);
+            int32x4_t x0 = vaddq_s32(vldrbq_s32(x_base + 0 * in_c), v_in_off);
+            int32x4_t x1 = vaddq_s32(vldrbq_s32(x_base + 1 * in_c), v_in_off);
+            int32x4_t x2 = vaddq_s32(vldrbq_s32(x_base + 2 * in_c), v_in_off);
+            acc0 = vaddq_s32(acc0, vmulq_s32(x0, w0));
+            acc0 = vaddq_s32(acc0, vmulq_s32(x1, w1));
+            acc0 = vaddq_s32(acc0, vmulq_s32(x2, w2));
+            int32x4_t x3 = vaddq_s32(vldrbq_s32(x_base + 3 * in_c), v_in_off);
+            int32x4_t x4 = vaddq_s32(vldrbq_s32(x_base + 4 * in_c), v_in_off);
+            acc1 = vaddq_s32(acc1, vmulq_s32(x2, w0));
+            acc1 = vaddq_s32(acc1, vmulq_s32(x3, w1));
+            acc1 = vaddq_s32(acc1, vmulq_s32(x4, w2));
+          }
+
+          int32x4_t mult = vld1q_s32(mults + cb);
+          int32x4_t shft = vldrbq_s32(shifts + cb);
+          acc0 = mve_requantize_per_channel(acc0, mult, shft);
+          acc1 = mve_requantize_per_channel(acc1, mult, shft);
+          acc0 = vaddq_n_s32(acc0, output_offset);
+          acc1 = vaddq_n_s32(acc1, output_offset);
+          acc0 = vminq_s32(vmaxq_s32(acc0, v_act_min), v_act_max);
+          acc1 = vminq_s32(vmaxq_s32(acc1, v_act_min), v_act_max);
+          int8_t* out_p = output + (size_t)oh * out_row_stride
+                                 + (size_t)ow_base * out_c + cb;
+          vstrbq_s32(out_p + 0 * out_c, acc0);
+          vstrbq_s32(out_p + 1 * out_c, acc1);
+        }
+      }
+
+      /* Right tail: ow_base..out_w-1.  Single-pixel slow path with per-kw bounds. */
+      for (uint32_t ow = ow_base; ow < out_w; ++ow) {
+        for (uint32_t cb = 0; cb < out_c; cb += 4) {
+          int32x4_t acc = (bias != (const int32_t*)0)
+              ? vld1q_s32(bias + cb) : vdupq_n_s32(0);
+          for (uint32_t kh = 0; kh < 3; ++kh) {
+            if (!kh_valid[kh]) continue;
+            const int8_t* w_row = weight + (size_t)kh * w_row_stride;
+            const int8_t* x_row = input + (size_t)ih_for_kh[kh] * in_row_stride;
+            for (uint32_t kw = 0; kw < 3; ++kw) {
+              int32_t iw = (int32_t)(ow * 2u) - 1 + (int32_t)kw;
+              if (iw < 0 || (uint32_t)iw >= in_w) continue;
+              int32x4_t x = vldrbq_s32(x_row + (size_t)iw * in_c + cb);
+              int32x4_t w = vldrbq_s32(w_row + (size_t)kw * out_c + cb);
+              x = vaddq_s32(x, v_in_off);
+              acc = vaddq_s32(acc, vmulq_s32(x, w));
+            }
+          }
+          int32x4_t mult = vld1q_s32(mults + cb);
+          int32x4_t shft = vldrbq_s32(shifts + cb);
+          acc = mve_requantize_per_channel(acc, mult, shft);
+          acc = vaddq_n_s32(acc, output_offset);
+          acc = vminq_s32(vmaxq_s32(acc, v_act_min), v_act_max);
+          vstrbq_s32(output + (size_t)oh * out_row_stride
+                       + (size_t)ow * out_c + cb, acc);
+        }
+      }
+    }
+    PROF_END(dwconv2d);
+    return;
+  }
+
   /* Generic 4-wide path: stride-2 layers, edge cases without 4-pixel tiles. */
   if ((out_c & 3u) == 0u) {
     const int32x4_t v_in_off  = vdupq_n_s32(input_offset);
