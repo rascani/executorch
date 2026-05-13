@@ -128,9 +128,9 @@ the PMU conversion.
 | 12 | `8c97186c06` | Out-of-line conv2d_1x1 fast path, asm inlined directly | 25,133,178 | 201,064,764 | 1.04× | 5.76× |
 | 13 | `2fee56d501` | AOT-fold dwconv input_offset for interior tiles (stride-1) | 24,325,407 | 194,602,599 | 1.03× | 5.95× |
 | 14 | (same commit, stride-2) | AOT-fold dwconv input_offset for interior stride-2 tile | 24,145,665 | 193,164,664 | 1.01× | 5.99× |
-| 15 | (committed) | conv1x1 reshape: 2-OC × 2-pixel asm block, shared input load | 23,583,681 | 188,669,439 | 1.024× | 6.14× |
-| 16 | (committed) | conv1x1 fast path: handle odd `out_w` via 1-pixel tail | 21,716,754 | 173,734,023 | 1.086× | 6.66× |
-| 17 | (pending) | requantize: CMSIS-NN-style fixup + `vrshlq_s32` (cuts ~10 MVE ops/call) | **19,288,873** | **154,310,972** | 1.126× | **7.50×** |
+| 15 | `9e865f3251` | conv1x1 reshape: 2-OC × 2-pixel asm block, shared input load | 23,583,681 | 188,669,439 | 1.024× | 6.14× |
+| 16 | `8884a03e37` | conv1x1 fast path: handle odd `out_w` via 1-pixel tail | 21,716,754 | 173,734,023 | 1.086× | 6.66× |
+| 17 | `3569979d4e` | requantize: CMSIS-NN-style fixup + `vrshlq_s32` (cuts ~10 MVE ops/call) | **19,288,873** | **154,310,972** | 1.126× | **7.50×** |
 
 Headline: **7.50× faster than the original baseline**, bit-exact output
 across all 1000 logits.  cortex_m backend on the same FVP/PMU: 172.2M
