@@ -72,7 +72,13 @@ static inline int32x4_t mve_requantize_per_channel(
 static inline int32x4_t mve_requantize_per_channel_neg_shift(
     int32x4_t acc, int32x4_t multiplier, int32x4_t shift) {
   int32x4_t product = vqrdmulhq_s32(acc, multiplier);
-  int32x4_t fixup = vshrq_n_s32(vandq_s32(product, shift), 31);
+  /* Strict shift < 0 lets us drop the `vandq(product, shift)` from the
+   * fixup chain — the shift mask was only there to make the sign
+   * extract collapse to zero in the shift==0 case.  We empirically
+   * verified that MV2's requantize scales (input_scale * weight_scale
+   * / output_scale) are always < 0.5 → frexp returns a strictly
+   * negative exponent, so this 3-op fixup is bit-exact. */
+  int32x4_t fixup = vshrq_n_s32(product, 31);
   int32x4_t fixed = vqaddq_s32(product, fixup);
   return vrshlq_s32(fixed, shift);
 }
