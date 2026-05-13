@@ -151,58 +151,60 @@ void mv2_conv2d_1x1_fast(const int8_t* input, int8_t* output,
         int32_t a2_0 = bias[ocb + 2];
         int32_t a3_0 = bias[ocb + 3];
         int32_t a0_1 = a0_0, a1_1 = a1_0, a2_1 = a2_0, a3_1 = a3_0;
-        const int8_t* w0 = weight + (size_t)(ocb + 0) * w_oc_stride;
-        const int8_t* w1 = weight + (size_t)(ocb + 1) * w_oc_stride;
-        const int8_t* w2 = weight + (size_t)(ocb + 2) * w_oc_stride;
-        const int8_t* w3 = weight + (size_t)(ocb + 3) * w_oc_stride;
         const int8_t* x0_p = x0;
         const int8_t* x1_p = x1;
-        const int8_t* w0_p = w0;
-        const int8_t* w1_p = w1;
-        const int8_t* w2_p = w2;
-        const int8_t* w3_p = w3;
-        /* Pixel 0: 4-OC × wlstp.8/letp asm inner. */
+        const int8_t* w0_p = weight + (size_t)(ocb + 0) * w_oc_stride;
+        const int8_t* w1_p = weight + (size_t)(ocb + 1) * w_oc_stride;
+        /* OC pair {0,1} × 2 pixels: 1 weight load is shared across
+         * 2 pixel accumulators per OC, halving the per-output load
+         * count vs. the per-pixel 4-OC asm.  Inner: 8 ops/iter for
+         * 4 outputs = 2.0 ops/output, vs. the old 9 ops/iter for
+         * 4 outputs = 2.25 ops/output. */
         __asm__ volatile (
           "wlstp.8     lr, %[n], 1f                 \n"
           "2:                                       \n"
-          "  vldrb.8     q0, [%[x]], #16            \n"
+          "  vldrb.8     q0, [%[x0]], #16           \n"
+          "  vldrb.8     q2, [%[x1]], #16           \n"
           "  vldrb.8     q1, [%[w0]], #16           \n"
-          "  vmladava.s8 %[a0], q0, q1              \n"
+          "  vmladava.s8 %[a00], q0, q1             \n"
+          "  vmladava.s8 %[a01], q2, q1             \n"
           "  vldrb.8     q1, [%[w1]], #16           \n"
-          "  vmladava.s8 %[a1], q0, q1              \n"
-          "  vldrb.8     q1, [%[w2]], #16           \n"
-          "  vmladava.s8 %[a2], q0, q1              \n"
-          "  vldrb.8     q1, [%[w3]], #16           \n"
-          "  vmladava.s8 %[a3], q0, q1              \n"
+          "  vmladava.s8 %[a10], q0, q1             \n"
+          "  vmladava.s8 %[a11], q2, q1             \n"
           "  letp        lr, 2b                     \n"
           "1:                                       \n"
-          : [x] "+r"(x0_p),
-            [w0] "+r"(w0_p), [w1] "+r"(w1_p), [w2] "+r"(w2_p), [w3] "+r"(w3_p),
-            [a0] "+Te"(a0_0), [a1] "+Te"(a1_0), [a2] "+Te"(a2_0), [a3] "+Te"(a3_0)
+          : [x0] "+r"(x0_p), [x1] "+r"(x1_p),
+            [w0] "+r"(w0_p), [w1] "+r"(w1_p),
+            [a00] "+Te"(a0_0), [a01] "+Te"(a0_1),
+            [a10] "+Te"(a1_0), [a11] "+Te"(a1_1)
           : [n] "r"(in_c)
-          : "q0", "q1", "lr", "memory"
+          : "q0", "q1", "q2", "lr", "memory"
         );
-        /* Pixel 1: reload weight pointers (they were post-incremented). */
-        w0_p = w0; w1_p = w1; w2_p = w2; w3_p = w3;
+        /* Reset input pointers for block B; weight pointers for OCs
+         * {2,3} start fresh from base. */
+        x0_p = x0;
+        x1_p = x1;
+        const int8_t* w2_p = weight + (size_t)(ocb + 2) * w_oc_stride;
+        const int8_t* w3_p = weight + (size_t)(ocb + 3) * w_oc_stride;
         __asm__ volatile (
           "wlstp.8     lr, %[n], 1f                 \n"
           "2:                                       \n"
-          "  vldrb.8     q0, [%[x]], #16            \n"
+          "  vldrb.8     q0, [%[x0]], #16           \n"
+          "  vldrb.8     q2, [%[x1]], #16           \n"
           "  vldrb.8     q1, [%[w0]], #16           \n"
-          "  vmladava.s8 %[a0], q0, q1              \n"
+          "  vmladava.s8 %[a00], q0, q1             \n"
+          "  vmladava.s8 %[a01], q2, q1             \n"
           "  vldrb.8     q1, [%[w1]], #16           \n"
-          "  vmladava.s8 %[a1], q0, q1              \n"
-          "  vldrb.8     q1, [%[w2]], #16           \n"
-          "  vmladava.s8 %[a2], q0, q1              \n"
-          "  vldrb.8     q1, [%[w3]], #16           \n"
-          "  vmladava.s8 %[a3], q0, q1              \n"
+          "  vmladava.s8 %[a10], q0, q1             \n"
+          "  vmladava.s8 %[a11], q2, q1             \n"
           "  letp        lr, 2b                     \n"
           "1:                                       \n"
-          : [x] "+r"(x1_p),
-            [w0] "+r"(w0_p), [w1] "+r"(w1_p), [w2] "+r"(w2_p), [w3] "+r"(w3_p),
-            [a0] "+Te"(a0_1), [a1] "+Te"(a1_1), [a2] "+Te"(a2_1), [a3] "+Te"(a3_1)
+          : [x0] "+r"(x0_p), [x1] "+r"(x1_p),
+            [w0] "+r"(w2_p), [w1] "+r"(w3_p),
+            [a00] "+Te"(a2_0), [a01] "+Te"(a2_1),
+            [a10] "+Te"(a3_0), [a11] "+Te"(a3_1)
           : [n] "r"(in_c)
-          : "q0", "q1", "lr", "memory"
+          : "q0", "q1", "q2", "lr", "memory"
         );
         int32x4_t mult = vld1q_s32(mults + ocb);
         int32x4_t shft = vldrbq_s32(shifts + ocb);
