@@ -54,11 +54,11 @@ this document use PMU.
 | Path | Cycles / inference | `.text` | `.rodata` | Arena |
 |---|---:|---:|---:|---:|
 | Standalone, baseline (commit `e6f5623e65`)        | ~1,158 M (extrapolated 8×) | 56,888 B | 4,283,956 B | 1,505,280 B |
-| Standalone, all 18 committed kernel improvements  | **149,244,121** | ~66 KB | ~4.2 MB | 1,505,280 B |
+| Standalone, all 20 committed kernel improvements  | **145,649,857** | ~66 KB | ~4.2 MB | 1,505,280 B |
 | cortex_m backend (CMSIS-NN), rebuilt fresh        | **172,218,932** | 478,960 B (test runner) | 35,632 B (+ DDR data) | 1,505,280 B |
 
-**Standalone is now ~14.6% faster than the cortex_m backend on this
-FVP config** (23.0M PMU cycle margin), with both producing bit-exact
+**Standalone is now ~15.4% faster than the cortex_m backend on this
+FVP config** (26.6M PMU cycle margin), with both producing bit-exact
 int8 outputs (max int8 diff = 0 across all 1000 logits).  Numbers
 above are PMU cycle counts read identically (`ARM_PMU_Get_CCNTR()`)
 in both runners.
@@ -73,10 +73,10 @@ cortex_m runner shrinks to roughly the 154 KB range — still 2-3× our
 standalone.
 
 So the standalone path now wins on **all three axes**: latency
-(149.2M vs 172.2M PMU), code size (66 KB vs ~150 KB stripped), and
+(145.6M vs 172.2M PMU), code size (66 KB vs ~150 KB stripped), and
 runtime dependencies (none — no flatbuffer parser, no kernel registry,
 no driver layer).  Earlier versions of this doc reported the cortex_m
-backend leading on latency; the 18-step optimization sequence below
+backend leading on latency; the 20-step optimization sequence below
 flipped that.
 
 ### How we got the cortex_m FVP number
@@ -131,7 +131,9 @@ the PMU conversion.
 | 15 | `9e865f3251` | conv1x1 reshape: 2-OC × 2-pixel asm block, shared input load | 23,583,681 | 188,669,439 | 1.024× | 6.14× |
 | 16 | `8884a03e37` | conv1x1 fast path: handle odd `out_w` via 1-pixel tail | 21,716,754 | 173,734,023 | 1.086× | 6.66× |
 | 17 | `3569979d4e` | requantize: CMSIS-NN-style fixup + `vrshlq_s32` (cuts ~10 MVE ops/call) | 19,288,873 | 154,310,972 | 1.126× | 7.50× |
-| 18 | `0a070072bd` | requantize: drop left-shift step (shift ≤ 0 in MV2; saves 3 ops/call) | **18,655,515** | **149,244,121** | 1.034× | **7.76×** |
+| 18 | `0a070072bd` | requantize: drop left-shift step (shift ≤ 0 in MV2; saves 3 ops/call) | 18,655,515 | 149,244,121 | 1.034× | 7.76× |
+| 19 | `cceb6afffe` | requantize: drop vandq mask in fixup (shift < 0 in MV2; saves 1 op/call) | 18,427,836 | 147,422,689 | 1.012× | 7.85× |
+| 20 | `3e19bb5ab9` | epilogue: compound-literal init `{a0,a1,a2,a3}` skips `vdupq_n_s32(0)` | **18,206,232** | **145,649,857** | 1.012× | **7.95×** |
 
 Headline: **7.50× faster than the original baseline**, bit-exact output
 across all 1000 logits.  cortex_m backend on the same FVP/PMU: 172.2M
