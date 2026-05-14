@@ -29,6 +29,7 @@ from .convert_to_cortex_m_pass import ConvertToCortexMPass
 from .decompose_hardswish_pass import DecomposeHardswishPass
 from .decompose_mean_pass import DecomposeMeanPass
 from .expand_dwconv_fusion_pass import ExpandDwconvFusionPass
+from .expand_dwconv_project_fusion_pass import ExpandDwconvProjectFusionPass
 from .quantized_clamp_activation_pass import QuantizedClampActivationPass
 from .quantized_op_fusion_pass import QuantizedOpFusionPass
 from .replace_quant_nodes_pass import ReplaceQuantNodesPass
@@ -56,6 +57,15 @@ class CortexMPassManager(PassManager):
     # codegen at examples/models/mv2_cortex_m_mve/ consumes it.
     pass_list_with_expand_dwconv_fusion: list[PassClass] = pass_list + [
         ExpandDwconvFusionPass,
+    ]
+
+    # Same opt-in path but with the additional project conv (and optional
+    # residual add) absorbed into a single fused op per inverted-residual
+    # block.  Eliminates both the dwconv output and the project output
+    # intermediates from the arena.
+    pass_list_with_inverted_residual_fusion: list[PassClass] = pass_list + [
+        ExpandDwconvFusionPass,
+        ExpandDwconvProjectFusionPass,
     ]
 
     pass_list_transform_for_annotation: list[PassClass] = [

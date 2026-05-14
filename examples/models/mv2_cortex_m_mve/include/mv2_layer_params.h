@@ -175,4 +175,63 @@ typedef struct {
   int8_t  dw_activation_max;
 } FusedConv2dDwconv2dParams;
 
+typedef struct {
+  /* Full MV2 inverted-residual block: 1x1 expand -> 3x3 dwconv -> 1x1
+   * project [-> int8 residual add].  Two intermediates (expand output
+   * and dwconv output) are streamed through small rolling buffers in
+   * mv2_fused_scratch; the project output and optional add go directly
+   * to the block output slot. */
+  uint32_t in_h, in_w, in_c;
+  uint32_t expand_out_c;            /* width of expand + dwconv */
+  uint32_t dw_out_h, dw_out_w;      /* dwconv output spatial (= project input spatial) */
+  uint32_t out_h, out_w;            /* project (and final) output spatial */
+  uint32_t project_out_c;           /* width of project + final output */
+  uint32_t kernel_h, kernel_w;      /* dwconv kernel (always 3) */
+  uint32_t stride_h, stride_w;      /* dwconv stride */
+  uint32_t pad_h, pad_w;            /* dwconv padding (always 1) */
+  /* Expand 1x1 */
+  const int8_t*  expand_weight;
+  const int32_t* expand_bias;
+  const int32_t* expand_requant_mults;
+  const int8_t*  expand_requant_shifts;
+  int32_t expand_input_offset;
+  int32_t expand_output_offset;
+  int8_t  expand_activation_min;
+  int8_t  expand_activation_max;
+  /* Dwconv 3x3 */
+  const int8_t*  dw_weight;
+  const int32_t* dw_bias;
+  const int32_t* dw_bias_with_offset_full;
+  const int32_t* dw_requant_mults;
+  const int8_t*  dw_requant_shifts;
+  int32_t dw_input_offset;
+  int32_t dw_output_offset;
+  int8_t  dw_activation_min;
+  int8_t  dw_activation_max;
+  /* Project 1x1 */
+  const int8_t*  project_weight;
+  const int32_t* project_bias;
+  const int32_t* project_requant_mults;
+  const int8_t*  project_requant_shifts;
+  int32_t project_input_offset;
+  int32_t project_output_offset;
+  int8_t  project_activation_min;
+  int8_t  project_activation_max;
+  /* Optional residual add: when residual_present != 0, the runtime adds
+   * the residual input (passed as a separate arg to the kernel) to the
+   * project output via the standard quantized_add math. */
+  uint8_t residual_present;
+  int32_t residual_self_zero_point;
+  int32_t residual_self_multiplier;
+  int32_t residual_self_shift;
+  int32_t residual_other_zero_point;
+  int32_t residual_other_multiplier;
+  int32_t residual_other_shift;
+  int32_t residual_output_zero_point;
+  int32_t residual_output_multiplier;
+  int32_t residual_output_shift;
+  int8_t  residual_activation_min;
+  int8_t  residual_activation_max;
+} FusedInvertedResidualParams;
+
 #endif

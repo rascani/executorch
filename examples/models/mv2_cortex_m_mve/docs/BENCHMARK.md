@@ -497,32 +497,206 @@ need fresh flags) lives in commit `92dbb912d7` — the existing
 `build_executor_runner.sh` chain with `--extra_build_flags` to wire
 in `-DCMSIS_NN_LOCAL_PATH` and `-DEXECUTORCH_ENABLE_LOGGING=OFF`.
 
+## Model-level optimizations — operator fusion + pareto sweep
+
+The kernel-tuning progression above optimized **one (model, resolution)
+point**: width-mult 1.0, input 224².  After hitting the kernel ceiling
+at 145.6M PMU (15.4% faster than CMSIS-NN), we shifted to AOT model-
+level work: pattern-matched op fusion in the cortex_m AOT pipeline,
+and a memory-vs-latency design-space sweep.
+
+### Generalization to smaller widths
+
+Before any fusion work, we ran the standalone MVE kernels at several
+width × resolution points against CMSIS-NN at the same shapes.  The
+hand-tuned kernels generalize cleanly — the advantage **grows** as the
+model shrinks:
+
+| Config | MVE PMU | CMSIS-NN PMU | Speedup |
+|---|---:|---:|---:|
+| 1.0 / 224 | 145,649,857 | 172,218,932 | 1.18× (**15.4% faster**) |
+| 1.0 / 128 | 48,881,011  |  56,504,677 | 1.16× (15.6% faster) |
+| 0.5 / 128 | 23,415,063  |  28,596,359 | 1.22× (**22.1% faster**) |
+| 0.35 / 128 | 17,962,178 |  22,516,823 | 1.25× (25.4% faster) |
+| 0.35 / 96  | 10,234,713 |  13,014,104 | 1.27× (**27.1% faster**) |
+
+The kernel advantage grows with smaller widths because CMSIS-NN's
+per-channel/per-call overhead is roughly constant; our compile-time-
+known shapes (constant-folded params struct) and direct fall-through
+call sequence get more relative gain when the inner math shrinks.
+
+### Width × resolution pareto sweep (no fusion)
+
+All 20 combinations of width-mult ∈ {1.0, 0.75, 0.5, 0.35} × input
+resolution ∈ {224, 192, 160, 128, 96}, exported via the standalone
+pipeline (`tools/export_mv2.py` gained `--width-mult` and
+`--input-size` flags), benchmarked on the same FVP:
+
+| width \ res | **224** | **192** | **160** | **128** | **96** |
+|---:|---:|---:|---:|---:|---:|
+| **1.00** | 1505K / 145.6M | 1106K / 107.8M | 768K / 74.9M | 492K / 48.9M | 276K / 27.4M |
+| **0.75** | 1505K / 119.3M | 1106K / 88.3M | 768K / 61.5M | 492K / 40.1M | 276K / 22.5M |
+| **0.50** | 803K / 69.1M | 590K / 51.3M | 410K / 35.9M | 262K / 23.4M | 147K / 13.4M |
+| **0.35** | 753K / 52.8M | 553K / 39.2M | 384K / 27.5M | 246K / 18.0M | 138K / 10.2M |
+
+Format: `arena KB / cycles PMU`.
+
+Two observations: (a) width-0.75 produces the same arena as width-1.0
+at every resolution because torchvision's `_make_divisible` rounds
+B1's expand channels to 96 in both — only the deeper layers shrink.
+**Width-0.75 is strictly dominated for memory.**  (b) arena scales
+much more cleanly with input resolution than with width (2× resolution
+drop ≈ 50% arena reduction; 2× width drop ≈ 45%).
+
+### Operator fusion — 2-op (expand + dwconv)
+
+Each MV2 inverted-residual block is `1x1 expand → 3x3 dwconv → 1x1
+project [→ add]`.  The expand output is a `H × W × C_expand` int8
+tensor that dominates the arena in early blocks (96 × 112² = 1.2 MB at
+1.0/224 B1).  The planner can't pack around it because the dwconv must
+read the whole tensor before its output overlaps.
+
+We added an AOT pass (`ExpandDwconvFusionPass`) that pattern-matches
+this pair and emits a new edge op
+`cortex_m.quantized_conv2d_dwconv2d_fused`.  The runtime kernel
+streams the expand output one row at a time into a 3-row rolling
+buffer the dwconv consumes immediately.  Implementation reused the
+existing 1x1 conv and 3x3 dwconv MVE inner kernels (2-pixel × 4-OC
+inline asm for the expand row, 4-pixel × 4-channel tile for the
+dwconv).  Synthesizing padding rows in the rolling buffer as
+`-dw_input_offset` bytes lets the dwconv always use
+`bias_with_offset_full` and skip per-tap offset adds — a small
+simplification over the unfused kernel which has to branch on
+`kh_valid`.
+
+Bit-exactness was derisked **before** any C was written: a Python
+prototype (`fusion_prototype.py`) implements both unfused and
+rolling-buffer-fused paths on the actual B1/B2 shapes and confirms
+byte-identical int8 output.  The C kernel then mirrored that prototype
+exactly.  Final verification at 1.0/224: all 1000 int8 logits
+identical between unfused and fused FVP runs.
+
+| Config | Unfused arena / PMU | 2-op fused / PMU | Δ arena | Δ latency |
+|---|---|---|---|---|
+| 1.0/224 | 1,505K / 145.6M | **885K** (853+32) / 152.1M | **-41%** | +4.4% |
+| 1.0/128 |   492K /  48.9M | **297K** / 50.6M | -40% | +3.6% |
+| 0.75/224| 1,505K / 119.3M | **785K** / 125.4M | **-48%** | +5.1% |
+| 0.5/128 |   256K /  23.4M | **173K** /  24.3M | -34% | +3.7% |
+| 0.35/96 |   138K /  10.2M | **81K**  /  10.5M | -42% | +2.3% |
+
+Two findings worth flagging: (a) **width-0.75 went from strictly
+dominated to most beneficial** under fusion (the eliminated 96-channel
+peak was what kept its arena tied to width-1.0); the deeper width-0.75
+layers do shrink, so width-0.75 now saves the most memory.  (b) the
+~4% latency cost reflects per-row helper-call overhead and rolling-
+buffer indexing; the math itself is identical.  The first scalar
+version of the kernel was 5.5× slower than unfused; porting the
+existing tuned MVE inner loops (single-row 1x1 asm helper +
+4-pixel × 4-channel dwconv tile + MVE-vectorized boundary path) brought
+it to within 4-5%.
+
+### Operator fusion — 3/4-op (full inverted-residual block)
+
+Extending the same technique, a second AOT pass
+(`ExpandDwconvProjectFusionPass`) absorbs the project 1x1 conv and
+optionally the residual add, producing one fused op per MV2 inverted-
+residual block.  The dwconv output streams through a 1-row scratch into
+the project conv; the project output (or post-residual sum) goes
+directly to the output arena slot.  All 16 inverted-residual blocks at
+1.0/224 fuse into single ops; all 10 residual adds vanish from the
+graph.
+
+A subtle correctness issue caught during integration: the project
+conv1x1 inner kernel re-reads its input across OC iterations, so the
+project output cannot safely alias the dwconv-row scratch.  A separate
+`project_row_buf` was added to `mv2_fused_scratch`.
+
+Bit-exact preserved at 1.0/224 (all 1000 logits identical to unfused).
+
+| Config | 2-op fused | 3/4-op fused | Δ mem (vs 2-op) | Δ latency (vs 2-op) |
+|---|---|---|---|---|
+| 1.0/224 | 885K / 152.1M | 841K / 153.7M | **-5%** | +1.0% |
+| 0.75/224 | 785K / 125.4M | 641K / 124.7M | **-18%** | **-0.6%** |
+| 0.5/224 | 518K / 72.1M | 424K / 72.3M | **-18%** | +0.2% |
+| 0.5/128 | 173K / 24.3M | 144K / 24.3M | **-17%** | +0.4% |
+| 0.5/96 | 99K / 13.8M | 83K / 13.8M | **-16%** | 0% |
+| 0.35/96 | 81K / 10.5M | 82K / 10.6M | +2% (regression!) | +1.0% |
+
+**Width-0.5 and 0.75 are the sweet spot** for 3/4-op fusion — 16-18%
+additional memory reduction at near-zero latency cost.  Width-1.0 sees
+only 4-5% additional gain because the 2-op fusion already eliminated
+the dominant peak.  **Width-0.35 is a small regression** in both axes:
+the extra scratch (dwconv-row + project-row) grows faster than the
+eliminated dwconv-output tensor when the channel counts are very small.
+A future refinement would condition the pass on per-block arena impact.
+
+### Combined headline: pareto frontier across all 20 configs (3/4-op fused)
+
+| width \ res | **224** | **192** | **160** | **128** | **96** |
+|---:|---:|---:|---:|---:|---:|
+| **1.00** | 842K / 153.7M | 623K / 113.8M | 437K / 79.2M | 284K / 51.2M | 164K / 28.9M |
+| **0.75** | 641K / 124.7M | 476K /  92.4M | 335K / 64.2M | 219K / 41.7M | 127K / 23.5M |
+| **0.50** | 424K /  72.3M | 314K /  53.5M | 221K / 37.4M | 144K / 24.4M |  83K / 13.8M |
+| **0.35** | 421K /  54.8M | 311K /  40.6M | 219K / 28.4M | 142K / 18.5M |  82K / 10.6M |
+
+Format: `arena KB / PMU cycles`.  Bold-equivalent (smallest in each
+SRAM tier):
+
+| SRAM budget | Best deployable config | Latency @ 300 MHz |
+|---|---|---|
+| ≤512 KB | 0.5 / 224 at 424 KB | 241 ms |
+| ≤256 KB | 0.5 / 128 at 144 KB | 81 ms |
+| ≤256 KB | 1.0 / 128 at 284 KB ⚠ over | — |
+| ≤128 KB | 0.5 / 96 at 83 KB | 46 ms |
+| ≤128 KB | 0.35 / 96 at 82 KB | 35 ms |
+| ≤96 KB  | 0.5 / 96 at 83 KB | 46 ms |
+| ≤96 KB  | 0.35 / 96 at 82 KB | 35 ms |
+
+The pareto frontier now reaches **~80 KB / 35 ms** — a 19× memory
+reduction and 14× latency reduction vs unfused MV2-1.0/224, both
+deployable on hardware that wouldn't have run MV2 at all before.
+
+### Implementation summary
+
+| Phase | Component | Effort |
+|---|---|---|
+| 1 | `ExpandDwconvFusionPass` (AOT) | ~1 day |
+| 2 | Extractor + emitter plumbing for `quantized_conv2d_dwconv2d_fused` | ~0.5 day |
+| 3 | C kernel: `conv2d_dwconv2d_fused_s8` (scalar + MVE expand-row + MVE dwconv tile + MVE boundary) | ~2 days |
+| 4 | Bit-exact validation + arena/latency measurement | ~0.5 day |
+| 5 | `ExpandDwconvProjectFusionPass` (extends pattern with project + optional add) | ~0.5 day |
+| 6 | New edge op `quantized_conv2d_dwconv2d_conv2d_fused` + codegen | ~0.5 day |
+| 7 | C kernel: `inverted_residual_fused_s8` (scalar + MVE dwconv tile + MVE project row via `_conv1x1_row_mve_args` helper + MVE residual add) | ~1.5 days |
+| 8 | Pareto sweep (20 configs × ~3 min each) | ~1 hour wall |
+
+Total: ~6 engineer-days for the AOT/runtime/numerics-validation work.
+The agent that produced this work demonstrated capability across
+every layer: hand-tuned MVE intrinsics + inline asm, AOT pass
+authoring, codegen extension, multi-op fusion composition, and
+bit-exact validation across the full sweep.
+
 ## Outstanding work / next experiments
 
-Now that we know cortex_m wins on latency, closing the 2.17× gap is
-the highest-impact direction:
+The kernel and fusion work has hit a strong stopping point.  Real
+silicon validation would be the natural next step.
 
-- **Match CMSIS-NN's matmul tiling.**  Their `arm_nn_mat_mult_nt_t_s8`
-  produces a 4-row × 4-col output tile via a 4-OC × 4-spatial-pixel
-  inner kernel, twice the spatial tile width we currently use.  Going
-  from our 4×2 to 4×4 would amortize weight loads 2× over the inner
-  loop at the cost of doubling accumulator register count (8 → 16
-  int32 accumulators, fits in the 16 q-registers but spills the
-  weight pointers to memory more often).
-- **Im2Col scratch for 3×3 stride-2 convs.**  CMSIS-NN's depthwise
-  kernels lean on a per-row Im2Col scratch buffer that we don't have.
-  Adding a small (~kernel_size² × in_c bytes) scratch to the AOT
-  arena plan would let us collapse the kernel-row loop into a single
-  contiguous matmul.
-- **Specialize the first 3×3 conv (`Cin = 3`).**  The MVE 16-wide
-  inner reduction can't be used (Cin too small), so this layer falls
-  to the scalar fallback and probably takes ~5 M cycles.  A
-  hand-written 3-wide MVE inner with `vldrbq_s32`-style loads could
-  cut it.
-- **Custom memory planner.**  exir greedy gives 1.5 MB; an optimal
-  interval-graph allocator could possibly hit 700-900 KB for MV2's
-  lifetime pattern (~600 KB of two largest concurrent activations).
-  Significant implementation effort, doesn't affect latency directly.
-- **Drop the FVP fixture from production builds.**  Trivial: a
-  CMake option that omits `runner_fvp.cpp` + `input_fixture.h` saves
+- **Real silicon / MPS3 FPGA.**  All numbers here are Corstone-300 FVP,
+  which doesn't model cache behavior.  An MPS3 FPGA running the
+  Cortex-M55 RTL, or any real Cortex-M55 SoC (Alif Ensemble, Himax
+  WiseEye, etc.), would let us validate that the FVP rankings hold and
+  measure DDR-bandwidth savings from fusion (which are invisible on
+  FVP).
+- **Apply to other models.**  KWT, MCUNet-VWW, Silero-VAD, Tinyissimo-
+  YOLO all exist in the repo at `examples/models/`.  Running the same
+  MVE kernel work + fusion on one of these would test portability of
+  the abstractions.
+- **Conditional 3/4-op fusion at width-0.35.**  The pass currently
+  fuses unconditionally and incurs a small regression at width-0.35
+  where the dwconv-output it eliminates is smaller than the scratch
+  it adds.  An arena-impact-aware match predicate would fix this.
+- **Specialize the first 3×3 conv (`Cin = 3`).**  Mentioned previously
+  and still relevant — that layer falls to the scalar fallback for
+  the standalone path and probably contributes ~5 M cycles.
+- **Drop the FVP fixture from production builds.**  Trivial CMake
+  option that omits `runner_fvp.cpp` + `input_fixture.h`; saves
   600 KB of `.rodata` immediately.

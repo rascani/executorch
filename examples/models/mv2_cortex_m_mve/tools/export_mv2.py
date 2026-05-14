@@ -71,6 +71,14 @@ def main() -> None:
              "op that the runtime kernel streams via a 3-row rolling buffer, "
              "eliminating the full HxWxC_expand intermediate.",
     )
+    parser.add_argument(
+        "--fuse-inverted-residual", action="store_true",
+        help="Extend --fuse-expand-dwconv to also absorb the project 1x1 "
+             "conv and the optional residual add into one fused op per MV2 "
+             "inverted-residual block. Eliminates both the dwconv-output and "
+             "project-output intermediates from the arena. Implies "
+             "--fuse-expand-dwconv.",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -108,11 +116,12 @@ def main() -> None:
             _check_ir_validity=False,
         ),
     )
-    pass_list = (
-        CortexMPassManager.pass_list_with_expand_dwconv_fusion
-        if args.fuse_expand_dwconv
-        else CortexMPassManager.pass_list
-    )
+    if args.fuse_inverted_residual:
+        pass_list = CortexMPassManager.pass_list_with_inverted_residual_fusion
+    elif args.fuse_expand_dwconv:
+        pass_list = CortexMPassManager.pass_list_with_expand_dwconv_fusion
+    else:
+        pass_list = CortexMPassManager.pass_list
     program = CortexMPassManager(
         edge.exported_program(), pass_list
     ).transform()

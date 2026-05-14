@@ -1110,6 +1110,208 @@ def quantized_conv2d_dwconv2d_fused_impl(
 
 
 # ===================================================================
+# FUSED INVERTED-RESIDUAL: expand 1x1 + dwconv 3x3 + project 1x1 [+ residual add]
+# ===================================================================
+#
+# Extends the 2-op fusion to also absorb the project 1x1 conv that follows
+# the dwconv in every MV2 inverted-residual block, and optionally the
+# residual add that follows the project (when input_c == output_c and
+# stride == 1).  Eliminates both the H*W*C_expand dwconv output and the
+# H*W*C_project intermediate from the activation arena.  When residual is
+# present the block input is read twice (by the expand and by the add)
+# but lives in the same arena slot throughout.
+
+lib.define(
+    "quantized_conv2d_dwconv2d_conv2d_fused("
+    "Tensor input, "
+    "Tensor expand_weight, Tensor? expand_bias, "
+    "int expand_input_offset, int expand_output_offset, "
+    "Tensor expand_requantize_multipliers, Tensor expand_requantize_shifts, "
+    "int expand_activation_min, int expand_activation_max, "
+    "Tensor dw_weight, Tensor? dw_bias, "
+    "int[] dw_stride, int[] dw_padding, "
+    "int dw_input_offset, int dw_output_offset, "
+    "Tensor dw_requantize_multipliers, Tensor dw_requantize_shifts, "
+    "int dw_activation_min, int dw_activation_max, "
+    "Tensor project_weight, Tensor? project_bias, "
+    "int project_input_offset, int project_output_offset, "
+    "Tensor project_requantize_multipliers, Tensor project_requantize_shifts, "
+    "int project_activation_min, int project_activation_max, "
+    "Tensor? residual_input, "
+    "int residual_self_zero_point, int residual_self_multiplier, int residual_self_shift, "
+    "int residual_other_zero_point, int residual_other_multiplier, int residual_other_shift, "
+    "int residual_output_zero_point, int residual_output_multiplier, int residual_output_shift, "
+    "int residual_activation_min, int residual_activation_max"
+    ") -> Tensor"
+)
+
+
+lib.define(
+    "quantized_conv2d_dwconv2d_conv2d_fused.out("
+    "Tensor input, "
+    "Tensor expand_weight, Tensor? expand_bias, "
+    "int expand_input_offset, int expand_output_offset, "
+    "Tensor expand_requantize_multipliers, Tensor expand_requantize_shifts, "
+    "int expand_activation_min, int expand_activation_max, "
+    "Tensor dw_weight, Tensor? dw_bias, "
+    "int[] dw_stride, int[] dw_padding, "
+    "int dw_input_offset, int dw_output_offset, "
+    "Tensor dw_requantize_multipliers, Tensor dw_requantize_shifts, "
+    "int dw_activation_min, int dw_activation_max, "
+    "Tensor project_weight, Tensor? project_bias, "
+    "int project_input_offset, int project_output_offset, "
+    "Tensor project_requantize_multipliers, Tensor project_requantize_shifts, "
+    "int project_activation_min, int project_activation_max, "
+    "Tensor? residual_input, "
+    "int residual_self_zero_point, int residual_self_multiplier, int residual_self_shift, "
+    "int residual_other_zero_point, int residual_other_multiplier, int residual_other_shift, "
+    "int residual_output_zero_point, int residual_output_multiplier, int residual_output_shift, "
+    "int residual_activation_min, int residual_activation_max, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+
+
+@register_fake("cortex_m::quantized_conv2d_dwconv2d_conv2d_fused")  # type: ignore[misc]
+def quantized_conv2d_dwconv2d_conv2d_fused_meta(
+    input: torch.Tensor,
+    expand_weight: torch.Tensor,
+    expand_bias: torch.Tensor | None,
+    expand_input_offset: int,
+    expand_output_offset: int,
+    expand_requantize_multipliers: torch.Tensor,
+    expand_requantize_shifts: torch.Tensor,
+    expand_activation_min: int,
+    expand_activation_max: int,
+    dw_weight: torch.Tensor,
+    dw_bias: torch.Tensor | None,
+    dw_stride: Sequence[int],
+    dw_padding: Sequence[int],
+    dw_input_offset: int,
+    dw_output_offset: int,
+    dw_requantize_multipliers: torch.Tensor,
+    dw_requantize_shifts: torch.Tensor,
+    dw_activation_min: int,
+    dw_activation_max: int,
+    project_weight: torch.Tensor,
+    project_bias: torch.Tensor | None,
+    project_input_offset: int,
+    project_output_offset: int,
+    project_requantize_multipliers: torch.Tensor,
+    project_requantize_shifts: torch.Tensor,
+    project_activation_min: int,
+    project_activation_max: int,
+    residual_input: torch.Tensor | None,
+    residual_self_zero_point: int,
+    residual_self_multiplier: int,
+    residual_self_shift: int,
+    residual_other_zero_point: int,
+    residual_other_multiplier: int,
+    residual_other_shift: int,
+    residual_output_zero_point: int,
+    residual_output_multiplier: int,
+    residual_output_shift: int,
+    residual_activation_min: int,
+    residual_activation_max: int,
+) -> torch.Tensor:
+    expand_shape = _compute_conv2d_output_shape(
+        input.shape, expand_weight.shape, (1, 1), (0, 0), (1, 1)
+    )
+    dw_shape = _compute_depthwise_conv2d_output_shape(
+        expand_shape, dw_weight.shape, list(dw_stride), list(dw_padding), [1, 1]
+    )
+    output_shape = _compute_conv2d_output_shape(
+        dw_shape, project_weight.shape, (1, 1), (0, 0), (1, 1)
+    )
+    return torch.empty(
+        output_shape,
+        dtype=torch.int8,
+        device=input.device,
+        memory_format=torch.channels_last,
+    )
+
+
+@impl(lib, "quantized_conv2d_dwconv2d_conv2d_fused", "CompositeExplicitAutograd")  # type: ignore[misc]
+def quantized_conv2d_dwconv2d_conv2d_fused_impl(
+    input: torch.Tensor,
+    expand_weight: torch.Tensor,
+    expand_bias: torch.Tensor | None,
+    expand_input_offset: int,
+    expand_output_offset: int,
+    expand_requantize_multipliers: torch.Tensor,
+    expand_requantize_shifts: torch.Tensor,
+    expand_activation_min: int,
+    expand_activation_max: int,
+    dw_weight: torch.Tensor,
+    dw_bias: torch.Tensor | None,
+    dw_stride: Sequence[int],
+    dw_padding: Sequence[int],
+    dw_input_offset: int,
+    dw_output_offset: int,
+    dw_requantize_multipliers: torch.Tensor,
+    dw_requantize_shifts: torch.Tensor,
+    dw_activation_min: int,
+    dw_activation_max: int,
+    project_weight: torch.Tensor,
+    project_bias: torch.Tensor | None,
+    project_input_offset: int,
+    project_output_offset: int,
+    project_requantize_multipliers: torch.Tensor,
+    project_requantize_shifts: torch.Tensor,
+    project_activation_min: int,
+    project_activation_max: int,
+    residual_input: torch.Tensor | None,
+    residual_self_zero_point: int,
+    residual_self_multiplier: int,
+    residual_self_shift: int,
+    residual_other_zero_point: int,
+    residual_other_multiplier: int,
+    residual_other_shift: int,
+    residual_output_zero_point: int,
+    residual_output_multiplier: int,
+    residual_output_shift: int,
+    residual_activation_min: int,
+    residual_activation_max: int,
+) -> torch.Tensor:
+    # Reference Python impl: compose the unfused ops.  Runtime kernel
+    # streams these through row-major rolling buffers.
+    expand_out = quantized_conv2d_impl(
+        input,
+        expand_weight, expand_bias,
+        (1, 1), (0, 0), (1, 1),
+        expand_input_offset, expand_output_offset,
+        expand_requantize_multipliers, expand_requantize_shifts,
+        expand_activation_min, expand_activation_max,
+    )
+    dw_out = quantized_depthwise_conv2d_impl(
+        expand_out,
+        dw_weight, dw_bias,
+        dw_stride, dw_padding, (1, 1), 1,
+        dw_input_offset, dw_output_offset,
+        dw_requantize_multipliers, dw_requantize_shifts,
+        dw_activation_min, dw_activation_max,
+    )
+    project_out = quantized_conv2d_impl(
+        dw_out,
+        project_weight, project_bias,
+        (1, 1), (0, 0), (1, 1),
+        project_input_offset, project_output_offset,
+        project_requantize_multipliers, project_requantize_shifts,
+        project_activation_min, project_activation_max,
+    )
+    if residual_input is None:
+        return project_out
+    return quantized_add_impl(
+        project_out,
+        residual_self_zero_point, residual_self_multiplier, residual_self_shift,
+        residual_input,
+        residual_other_zero_point, residual_other_multiplier, residual_other_shift,
+        residual_output_zero_point, residual_output_multiplier, residual_output_shift,
+        residual_activation_min, residual_activation_max,
+    )
+
+
+# ===================================================================
 # QUANTIZED TRANSPOSE_CONV2D OPERATION DEFINITION
 # ===================================================================
 
