@@ -25,6 +25,7 @@ from .extractors import (
     Conv2dLayer,
     DepthwiseConv2dLayer,
     DequantOutputLayer,
+    FusedConv2dDwconv2dLayer,
     LinearLayer,
     MemcpyLayer,
     ProgramSchedule,
@@ -116,6 +117,31 @@ def emit_weights(out_dir: Path, layers: Iterable, header_guard: str = "MV2_WEIGH
             defns.append(_emit_int8_array(f"{stem}_requant_shifts", layer.requantize_shifts))
             decls.append(f"extern const int32_t {stem}_requant_mults[];")
             decls.append(f"extern const int8_t  {stem}_requant_shifts[];")
+        elif isinstance(layer, FusedConv2dDwconv2dLayer):
+            stem = f"L{i}_fused"
+            # Expand 1x1 weight + bias (offset-folded) + requant
+            defns.append(_emit_int8_array(f"{stem}_expand_weight", layer.expand_weight))
+            decls.append(f"extern const int8_t {stem}_expand_weight[];")
+            if layer.expand_bias is not None:
+                defns.append(_emit_int32_array(f"{stem}_expand_bias", layer.expand_bias))
+                decls.append(f"extern const int32_t {stem}_expand_bias[];")
+            defns.append(_emit_int32_array(f"{stem}_expand_requant_mults", layer.expand_requantize_multipliers))
+            defns.append(_emit_int8_array(f"{stem}_expand_requant_shifts", layer.expand_requantize_shifts))
+            decls.append(f"extern const int32_t {stem}_expand_requant_mults[];")
+            decls.append(f"extern const int8_t  {stem}_expand_requant_shifts[];")
+            # Dwconv 3x3 weight + bias + bias_off + requant
+            defns.append(_emit_int8_array(f"{stem}_dw_weight", layer.dw_weight))
+            decls.append(f"extern const int8_t {stem}_dw_weight[];")
+            if layer.dw_bias is not None:
+                defns.append(_emit_int32_array(f"{stem}_dw_bias", layer.dw_bias))
+                decls.append(f"extern const int32_t {stem}_dw_bias[];")
+            if layer.dw_bias_with_offset_full is not None:
+                defns.append(_emit_int32_array(f"{stem}_dw_bias_off", layer.dw_bias_with_offset_full))
+                decls.append(f"extern const int32_t {stem}_dw_bias_off[];")
+            defns.append(_emit_int32_array(f"{stem}_dw_requant_mults", layer.dw_requantize_multipliers))
+            defns.append(_emit_int8_array(f"{stem}_dw_requant_shifts", layer.dw_requantize_shifts))
+            decls.append(f"extern const int32_t {stem}_dw_requant_mults[];")
+            decls.append(f"extern const int8_t  {stem}_dw_requant_shifts[];")
 
     header = (
         f"#ifndef {header_guard}\n"
@@ -132,6 +158,30 @@ def emit_weights(out_dir: Path, layers: Iterable, header_guard: str = "MV2_WEIGH
         + "\n".join(defns)
     )
     (out_dir / "mv2_weights.c").write_text(source)
+
+
+def _compute_fused_scratch_bytes(schedule: ProgramSchedule) -> int:
+    """Size of the rolling-buffer scratch needed by every fused expand+dwconv
+    in this schedule.  Three rows of the expand output at the layer's input
+    spatial resolution: 3 * in_w * expand_out_c bytes.  Returns the max
+    across all fused layers; zero when the model has no fused layers."""
+    best = 0
+    for layer in schedule.layers:
+        if isinstance(layer, FusedConv2dDwconv2dLayer):
+            # input shape is (N, C, H, W) per channels-last meta — but for
+            # the scratch we need (in_w, expand_out_c).
+            _, _, in_w, _ = _spatial_dims_full(layer.input.shape)
+            expand_out_c = int(layer.expand_weight.shape[0])
+            best = max(best, 3 * in_w * expand_out_c)
+    return best
+
+
+def _spatial_dims_full(shape):
+    """Return (in_h, in_c_full=channels, in_w, dummy) compatible with the
+    existing _spatial_dims output ordering: (H, W, C).  Wrapper that yields
+    a 4-tuple to keep the caller readable."""
+    h, w, c = _spatial_dims(shape)
+    return (h, c, w, c)
 
 
 def emit_arena(out_dir: Path, schedule: ProgramSchedule) -> None:
@@ -152,6 +202,7 @@ def emit_arena(out_dir: Path, schedule: ProgramSchedule) -> None:
         f"#define MV2_OUTPUT_NUM_ELEMENTS {1 if schedule.output_slot is None else _prod(schedule.output_slot.shape)}u",
         f"#define MV2_OUTPUT_SCALE {schedule.output_scale:.9g}f",
         f"#define MV2_OUTPUT_ZERO_POINT {schedule.output_zero_point}",
+        f"#define MV2_FUSED_SCRATCH_BYTES {_compute_fused_scratch_bytes(schedule)}u",
         "",
     ]
     seen: set[str] = set()
@@ -160,6 +211,7 @@ def emit_arena(out_dir: Path, schedule: ProgramSchedule) -> None:
         if isinstance(layer, QuantInputLayer):
             slots = [layer.output]
         elif isinstance(layer, (LinearLayer, Conv2dLayer, DepthwiseConv2dLayer,
+                                FusedConv2dDwconv2dLayer,
                                 AvgPool2dLayer, MemcpyLayer)):
             slots = [layer.input, layer.output]
         elif isinstance(layer, QuantizedAddLayer):
@@ -277,6 +329,48 @@ def emit_params(
                 f"  .bias_with_offset_full = {bias_off_ref},\n"
                 "};"
             )
+        elif isinstance(layer, FusedConv2dDwconv2dLayer):
+            in_h, in_w, in_c = _spatial_dims(layer.input.shape)
+            # Output is at the dwconv's output spatial — derive from output slot.
+            out_h, out_w, _ = _spatial_dims(layer.output.shape)
+            # Expand weight: OHWI [expand_out_c, 1, 1, in_c]
+            expand_out_c = layer.expand_weight.shape[0]
+            # Dwconv weight: IHWO [1, kH, kW, expand_out_c]
+            _, k_h, k_w, _ = layer.dw_weight.shape
+            stem = f"L{i}_fused"
+            e_bias_ref = f"{stem}_expand_bias" if layer.expand_bias is not None else "(const int32_t*)0"
+            d_bias_ref = f"{stem}_dw_bias" if layer.dw_bias is not None else "(const int32_t*)0"
+            d_bias_off_ref = (
+                f"{stem}_dw_bias_off"
+                if layer.dw_bias_with_offset_full is not None else "(const int32_t*)0"
+            )
+            lines.append(
+                f"static const FusedConv2dDwconv2dParams P_L{i}_fused = {{\n"
+                f"  .in_h = {in_h}u, .in_w = {in_w}u, .in_c = {in_c}u,\n"
+                f"  .expand_out_c = {expand_out_c}u,\n"
+                f"  .out_h = {out_h}u, .out_w = {out_w}u,\n"
+                f"  .kernel_h = {k_h}u, .kernel_w = {k_w}u,\n"
+                f"  .stride_h = {layer.dw_stride[0]}u, .stride_w = {layer.dw_stride[1]}u,\n"
+                f"  .pad_h = {layer.dw_padding[0]}u, .pad_w = {layer.dw_padding[1]}u,\n"
+                f"  .expand_weight = {stem}_expand_weight,\n"
+                f"  .expand_bias = {e_bias_ref},\n"
+                f"  .expand_requant_mults = {stem}_expand_requant_mults,\n"
+                f"  .expand_requant_shifts = {stem}_expand_requant_shifts,\n"
+                f"  .expand_input_offset = {layer.expand_input_offset},\n"
+                f"  .expand_output_offset = {layer.expand_output_offset},\n"
+                f"  .expand_activation_min = {layer.expand_activation_min},\n"
+                f"  .expand_activation_max = {layer.expand_activation_max},\n"
+                f"  .dw_weight = {stem}_dw_weight,\n"
+                f"  .dw_bias = {d_bias_ref},\n"
+                f"  .dw_bias_with_offset_full = {d_bias_off_ref},\n"
+                f"  .dw_requant_mults = {stem}_dw_requant_mults,\n"
+                f"  .dw_requant_shifts = {stem}_dw_requant_shifts,\n"
+                f"  .dw_input_offset = {layer.dw_input_offset},\n"
+                f"  .dw_output_offset = {layer.dw_output_offset},\n"
+                f"  .dw_activation_min = {layer.dw_activation_min},\n"
+                f"  .dw_activation_max = {layer.dw_activation_max},\n"
+                "};"
+            )
         elif isinstance(layer, QuantizedAddLayer):
             num = _prod(layer.output.shape)
             lines.append(
@@ -336,6 +430,7 @@ def emit_inference_body(out_dir: Path, schedule: ProgramSchedule) -> None:
     last_q_layer = None
     for layer in schedule.layers:
         if isinstance(layer, (LinearLayer, Conv2dLayer, DepthwiseConv2dLayer,
+                              FusedConv2dDwconv2dLayer,
                               AvgPool2dLayer, QuantizedAddLayer)):
             last_q_layer = layer
     if last_q_layer is not None:
@@ -369,6 +464,16 @@ def emit_inference_body(out_dir: Path, schedule: ProgramSchedule) -> None:
             )
             lines.append(
                 f"  dwconv2d_s8((const int8_t*)(mv2_arena + ACT_OFFSET_{layer.input.name}), {out_buf}, &P_L{i}_dwconv2d);"
+            )
+        elif isinstance(layer, FusedConv2dDwconv2dLayer):
+            out_buf = (
+                "output_q" if layer.output.name == output_int8_slot
+                else f"(int8_t*)(mv2_arena + ACT_OFFSET_{layer.output.name})"
+            )
+            lines.append(
+                f"  conv2d_dwconv2d_fused_s8("
+                f"(const int8_t*)(mv2_arena + ACT_OFFSET_{layer.input.name}), "
+                f"{out_buf}, &P_L{i}_fused);"
             )
         elif isinstance(layer, QuantizedAddLayer):
             out_buf = (

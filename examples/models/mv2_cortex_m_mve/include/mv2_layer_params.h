@@ -136,4 +136,43 @@ typedef struct {
   int32_t shift;
 } AvgPool2dParams;
 
+typedef struct {
+  /* Fused MV2 expand+dwconv: 1x1 conv -> 3x3 depthwise conv, no
+   * materialized expand intermediate.  Spatial dims describe the input
+   * to the 1x1 expand and the output of the 3x3 dwconv; the runtime
+   * computes expand rows on-demand into a 3-row rolling buffer that the
+   * dwconv consumes immediately. */
+  uint32_t in_h;
+  uint32_t in_w;
+  uint32_t in_c;
+  uint32_t expand_out_c;           /* shared channel count for expand output and dwconv */
+  uint32_t out_h;
+  uint32_t out_w;
+  uint32_t kernel_h;               /* dwconv kernel height (always 3) */
+  uint32_t kernel_w;               /* dwconv kernel width (always 3) */
+  uint32_t stride_h;               /* dwconv stride */
+  uint32_t stride_w;
+  uint32_t pad_h;                  /* dwconv padding (always 1) */
+  uint32_t pad_w;
+  /* Expand 1x1 weight + bias + requantize (offset folded into bias). */
+  const int8_t*  expand_weight;            /* [expand_out_c, 1, 1, in_c] OHWI */
+  const int32_t* expand_bias;              /* [expand_out_c]; nullable */
+  const int32_t* expand_requant_mults;
+  const int8_t*  expand_requant_shifts;
+  int32_t expand_input_offset;             /* typically 0 (folded into bias) */
+  int32_t expand_output_offset;
+  int8_t  expand_activation_min;
+  int8_t  expand_activation_max;
+  /* Dwconv 3x3 weight + bias + requantize. */
+  const int8_t*  dw_weight;                /* [1, kH, kW, expand_out_c] IHWO */
+  const int32_t* dw_bias;                  /* [expand_out_c]; nullable */
+  const int32_t* dw_bias_with_offset_full; /* optional, like DepthwiseConv2dParams */
+  const int32_t* dw_requant_mults;
+  const int8_t*  dw_requant_shifts;
+  int32_t dw_input_offset;
+  int32_t dw_output_offset;
+  int8_t  dw_activation_min;
+  int8_t  dw_activation_max;
+} FusedConv2dDwconv2dParams;
+
 #endif

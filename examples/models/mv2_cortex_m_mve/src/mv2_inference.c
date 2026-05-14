@@ -580,6 +580,546 @@ static __attribute__((always_inline)) inline void conv2d_s8(const int8_t* input,
 #endif
 }
 
+/* ===========================================================================
+ * conv2d_dwconv2d_fused_s8 — fused MV2 expand+dwconv kernel.
+ *
+ * Computes a 1x1 expand conv followed by a 3x3 depthwise conv without
+ * materializing the full HxWxC_expand intermediate tensor.  The expand
+ * output is produced one row at a time into a 3-row rolling buffer
+ * (mv2_fused_scratch, sized by AOT) that the dwconv consumes immediately.
+ * After dwconv row r is produced, expand row r*stride-1 can be evicted
+ * and the buffer reused for row r*stride+1.
+ *
+ * Bit-exact correspondence: every int8 expand pixel is computed with the
+ * same scalar_requantize/clamp/cast sequence as the unfused conv1x1, so
+ * the rolling buffer contents are byte-identical to the corresponding
+ * rows of what an unfused dwconv input would see.  See the Python derisk
+ * prototype at examples/models/mv2_cortex_m_mve/docs (and the proof
+ * across B1/B2 shapes) for the validation that this schedule preserves
+ * outputs at max_diff=0.
+ *
+ * This is a scalar reference implementation — MVE optimization can layer
+ * on top once correctness is established.  The primary win is the arena
+ * reduction (e.g. B1 at 0.5/128 drops 196 KB peak to a 9 KB rolling
+ * buffer), not raw throughput.
+ * ===========================================================================
+ */
+extern int8_t mv2_fused_scratch[];
+
+/* Scalar reference: bit-exact mirror of the unfused 1x1 conv+requantize chain.
+ * Used as the fallback for host builds (where MVE intrinsics are unavailable)
+ * and as the correctness oracle for the MVE fast path below. */
+static void _fused_expand_row_scalar(
+    const int8_t* in_row,
+    int8_t* dst,
+    const FusedConv2dDwconv2dParams* p) {
+  const uint32_t in_w = p->in_w;
+  const uint32_t in_c = p->in_c;
+  const uint32_t expand_out_c = p->expand_out_c;
+  const int32_t e_in_off = p->expand_input_offset;
+  const int32_t e_out_off = p->expand_output_offset;
+  const int32_t e_amin = p->expand_activation_min;
+  const int32_t e_amax = p->expand_activation_max;
+  for (uint32_t ow = 0; ow < in_w; ++ow) {
+    const int8_t* x_pos = in_row + (size_t)ow * in_c;
+    int8_t* dst_pos = dst + (size_t)ow * expand_out_c;
+    for (uint32_t oc = 0; oc < expand_out_c; ++oc) {
+      int32_t acc = (p->expand_bias != (const int32_t*)0) ? p->expand_bias[oc] : 0;
+      const int8_t* w_oc = p->expand_weight + (size_t)oc * in_c;
+      for (uint32_t ic = 0; ic < in_c; ++ic) {
+        acc += ((int32_t)x_pos[ic] + e_in_off) * (int32_t)w_oc[ic];
+      }
+      acc = scalar_requantize(acc, p->expand_requant_mults[oc],
+                              p->expand_requant_shifts[oc]);
+      acc += e_out_off;
+      if (acc < e_amin) acc = e_amin;
+      if (acc > e_amax) acc = e_amax;
+      dst_pos[oc] = (int8_t)acc;
+    }
+  }
+}
+
+#if MV2_USE_MVE
+/* MVE fast path: 1x1 conv applied to a single input row.  Same 2-pixel x 4-OC
+ * inline-asm tile as mv2_conv2d_1x1_fast above, with the outer oh loop removed
+ * and Conv2dParams replaced by FusedConv2dDwconv2dParams's expand_* fields.
+ * Noinline for the same reason as mv2_conv2d_1x1_fast: the asm constraint
+ * solver fails when there's significant live state in the surrounding scope
+ * (and the fused kernel's outer loop has plenty). */
+static __attribute__((noinline))
+void _fused_expand_row_mve(
+    const int8_t* in_row,
+    int8_t* dst,
+    const FusedConv2dDwconv2dParams* p) {
+  const uint32_t in_w = p->in_w;
+  const uint32_t in_c = p->in_c;
+  const uint32_t out_c = p->expand_out_c;
+  const int32_t  output_offset = p->expand_output_offset;
+  const int32_t  act_min = p->expand_activation_min;
+  const int32_t  act_max = p->expand_activation_max;
+  const int8_t*  weight  = p->expand_weight;
+  const int32_t* bias    = p->expand_bias;
+  const int32_t* mults   = p->expand_requant_mults;
+  const int8_t*  shifts  = p->expand_requant_shifts;
+  const size_t w_oc_stride = (size_t)in_c;
+  const int32x4_t v_act_min = vdupq_n_s32(act_min);
+  const int32x4_t v_act_max = vdupq_n_s32(act_max);
+
+  uint32_t ow = 0;
+  for (; ow + 1 < in_w; ow += 2) {
+    const int8_t* x0 = in_row + (size_t)(ow + 0) * in_c;
+    const int8_t* x1 = in_row + (size_t)(ow + 1) * in_c;
+    for (uint32_t ocb = 0; ocb < out_c; ocb += 4) {
+      int32_t a0_0 = bias[ocb + 0];
+      int32_t a1_0 = bias[ocb + 1];
+      int32_t a2_0 = bias[ocb + 2];
+      int32_t a3_0 = bias[ocb + 3];
+      int32_t a0_1 = a0_0, a1_1 = a1_0, a2_1 = a2_0, a3_1 = a3_0;
+      const int8_t* x0_p = x0;
+      const int8_t* x1_p = x1;
+      const int8_t* w0_p = weight + (size_t)(ocb + 0) * w_oc_stride;
+      const int8_t* w1_p = weight + (size_t)(ocb + 1) * w_oc_stride;
+      __asm__ volatile (
+        "wlstp.8     lr, %[n], 1f                 \n"
+        "2:                                       \n"
+        "  vldrb.8     q0, [%[x0]], #16           \n"
+        "  vldrb.8     q2, [%[x1]], #16           \n"
+        "  vldrb.8     q1, [%[w0]], #16           \n"
+        "  vmladava.s8 %[a00], q0, q1             \n"
+        "  vmladava.s8 %[a01], q2, q1             \n"
+        "  vldrb.8     q1, [%[w1]], #16           \n"
+        "  vmladava.s8 %[a10], q0, q1             \n"
+        "  vmladava.s8 %[a11], q2, q1             \n"
+        "  letp        lr, 2b                     \n"
+        "1:                                       \n"
+        : [x0] "+r"(x0_p), [x1] "+r"(x1_p),
+          [w0] "+r"(w0_p), [w1] "+r"(w1_p),
+          [a00] "+Te"(a0_0), [a01] "+Te"(a0_1),
+          [a10] "+Te"(a1_0), [a11] "+Te"(a1_1)
+        : [n] "r"(in_c)
+        : "q0", "q1", "q2", "lr", "memory"
+      );
+      x0_p = x0;
+      x1_p = x1;
+      const int8_t* w2_p = weight + (size_t)(ocb + 2) * w_oc_stride;
+      const int8_t* w3_p = weight + (size_t)(ocb + 3) * w_oc_stride;
+      __asm__ volatile (
+        "wlstp.8     lr, %[n], 1f                 \n"
+        "2:                                       \n"
+        "  vldrb.8     q0, [%[x0]], #16           \n"
+        "  vldrb.8     q2, [%[x1]], #16           \n"
+        "  vldrb.8     q1, [%[w0]], #16           \n"
+        "  vmladava.s8 %[a00], q0, q1             \n"
+        "  vmladava.s8 %[a01], q2, q1             \n"
+        "  vldrb.8     q1, [%[w1]], #16           \n"
+        "  vmladava.s8 %[a10], q0, q1             \n"
+        "  vmladava.s8 %[a11], q2, q1             \n"
+        "  letp        lr, 2b                     \n"
+        "1:                                       \n"
+        : [x0] "+r"(x0_p), [x1] "+r"(x1_p),
+          [w0] "+r"(w2_p), [w1] "+r"(w3_p),
+          [a00] "+Te"(a2_0), [a01] "+Te"(a2_1),
+          [a10] "+Te"(a3_0), [a11] "+Te"(a3_1)
+        : [n] "r"(in_c)
+        : "q0", "q1", "q2", "lr", "memory"
+      );
+      int32x4_t mult = vld1q_s32(mults + ocb);
+      int32x4_t shft = vldrbq_s32(shifts + ocb);
+      int32x4_t accv0 = {a0_0, a1_0, a2_0, a3_0};
+      int32x4_t accv1 = {a0_1, a1_1, a2_1, a3_1};
+      accv0 = mve_requantize_per_channel_neg_shift(accv0, mult, shft);
+      accv0 = vaddq_n_s32(accv0, output_offset);
+      accv0 = vminq_s32(vmaxq_s32(accv0, v_act_min), v_act_max);
+      vstrbq_s32(dst + (size_t)(ow + 0) * out_c + ocb, accv0);
+      accv1 = mve_requantize_per_channel_neg_shift(accv1, mult, shft);
+      accv1 = vaddq_n_s32(accv1, output_offset);
+      accv1 = vminq_s32(vmaxq_s32(accv1, v_act_min), v_act_max);
+      vstrbq_s32(dst + (size_t)(ow + 1) * out_c + ocb, accv1);
+    }
+  }
+  /* Odd-in_w tail: 1-pixel 4-OC asm block. */
+  if (ow < in_w) {
+    const int8_t* x0 = in_row + (size_t)ow * in_c;
+    for (uint32_t ocb = 0; ocb < out_c; ocb += 4) {
+      int32_t a0 = bias[ocb + 0];
+      int32_t a1 = bias[ocb + 1];
+      int32_t a2 = bias[ocb + 2];
+      int32_t a3 = bias[ocb + 3];
+      const int8_t* x_p  = x0;
+      const int8_t* w0_p = weight + (size_t)(ocb + 0) * w_oc_stride;
+      const int8_t* w1_p = weight + (size_t)(ocb + 1) * w_oc_stride;
+      const int8_t* w2_p = weight + (size_t)(ocb + 2) * w_oc_stride;
+      const int8_t* w3_p = weight + (size_t)(ocb + 3) * w_oc_stride;
+      __asm__ volatile (
+        "wlstp.8     lr, %[n], 1f                 \n"
+        "2:                                       \n"
+        "  vldrb.8     q0, [%[x]], #16            \n"
+        "  vldrb.8     q1, [%[w0]], #16           \n"
+        "  vmladava.s8 %[a0], q0, q1              \n"
+        "  vldrb.8     q1, [%[w1]], #16           \n"
+        "  vmladava.s8 %[a1], q0, q1              \n"
+        "  vldrb.8     q1, [%[w2]], #16           \n"
+        "  vmladava.s8 %[a2], q0, q1              \n"
+        "  vldrb.8     q1, [%[w3]], #16           \n"
+        "  vmladava.s8 %[a3], q0, q1              \n"
+        "  letp        lr, 2b                     \n"
+        "1:                                       \n"
+        : [x] "+r"(x_p),
+          [w0] "+r"(w0_p), [w1] "+r"(w1_p), [w2] "+r"(w2_p), [w3] "+r"(w3_p),
+          [a0] "+Te"(a0), [a1] "+Te"(a1), [a2] "+Te"(a2), [a3] "+Te"(a3)
+        : [n] "r"(in_c)
+        : "q0", "q1", "lr", "memory"
+      );
+      int32x4_t mult = vld1q_s32(mults + ocb);
+      int32x4_t shft = vldrbq_s32(shifts + ocb);
+      int32x4_t accv = {a0, a1, a2, a3};
+      accv = mve_requantize_per_channel_neg_shift(accv, mult, shft);
+      accv = vaddq_n_s32(accv, output_offset);
+      accv = vminq_s32(vmaxq_s32(accv, v_act_min), v_act_max);
+      vstrbq_s32(dst + (size_t)ow * out_c + ocb, accv);
+    }
+  }
+}
+#endif
+
+static int8_t* _fused_expand_row(
+    const int8_t* input,
+    int32_t row_idx,
+    int8_t* dst,
+    const FusedConv2dDwconv2dParams* p) {
+  /* Compute one row of the expand 1x1 conv output at row_idx of the input.
+   * If row_idx is out of bounds (top/bottom pad), fill with -dw_input_offset
+   * so the dwconv's (pixel + dw_input_offset) yields 0 for the pad pixels. */
+  if (row_idx < 0 || (uint32_t)row_idx >= p->in_h) {
+    int8_t fill = (int8_t)(-p->dw_input_offset);
+    const uint32_t row_bytes = p->in_w * p->expand_out_c;
+    for (uint32_t i = 0; i < row_bytes; ++i) dst[i] = fill;
+    return dst;
+  }
+  const int8_t* in_row = input + (size_t)row_idx * (size_t)p->in_w * p->in_c;
+#if MV2_USE_MVE
+  /* Fast path: expand_out_c is a multiple of 4 and expand_input_offset
+   * is 0 (folded into expand_bias by the extractor).  Both invariants hold
+   * for every MV2 fusion candidate by construction. */
+  if ((p->expand_out_c & 3u) == 0u && p->expand_input_offset == 0
+      && p->expand_bias != (const int32_t*)0) {
+    _fused_expand_row_mve(in_row, dst, p);
+    return dst;
+  }
+#endif
+  _fused_expand_row_scalar(in_row, dst, p);
+  return dst;
+}
+
+static __attribute__((always_inline)) inline void conv2d_dwconv2d_fused_s8(
+    const int8_t* input, int8_t* output,
+    const FusedConv2dDwconv2dParams* p) {
+  const uint32_t in_h = p->in_h;
+  const uint32_t in_w = p->in_w;
+  const uint32_t expand_out_c = p->expand_out_c;
+  const uint32_t out_h = p->out_h;
+  const uint32_t out_w = p->out_w;
+  const uint32_t stride_h = p->stride_h;
+  const uint32_t stride_w = p->stride_w;
+  const int32_t pad_h = (int32_t)p->pad_h;
+  const int32_t pad_w = (int32_t)p->pad_w;
+  const int32_t d_in_off = p->dw_input_offset;
+  const int32_t d_out_off = p->dw_output_offset;
+  const int32_t d_amin = p->dw_activation_min;
+  const int32_t d_amax = p->dw_activation_max;
+
+  const uint32_t row_bytes = in_w * expand_out_c;
+  int8_t* rolling[3] = {
+    mv2_fused_scratch + 0 * row_bytes,
+    mv2_fused_scratch + 1 * row_bytes,
+    mv2_fused_scratch + 2 * row_bytes,
+  };
+  /* Sentinel = -2 means "slot is uninitialized".  -1 is a real expand
+   * row index (the synthesized top-pad row), so we can't reuse it. */
+  int32_t cached_row[3] = {-2, -2, -2};
+  int next_slot = 0;
+
+  for (uint32_t oh = 0; oh < out_h; ++oh) {
+    /* dwconv at row oh reads expand rows ih_base-1, ih_base, ih_base+1
+     * where ih_base = oh * stride_h.  pad_h=1 makes ih_base-1 == -1 a
+     * synthesized zero-row at the first output row when stride_h=1, or
+     * 2*oh-1 in general; same logic for the bottom edge. */
+    const int32_t ih_base = (int32_t)(oh * stride_h);
+    for (int dr = -1; dr <= 1; ++dr) {
+      int32_t want = ih_base + dr - pad_h + 1;  /* effective expand row index = ih_base + dr */
+      /* Map dr to the actual expand row: oh*stride_h + dr - (pad_h - 1).
+       * For pad_h=1 this is just ih_base + dr - 0 = ih_base + dr;
+       * we treat indices outside [0, in_h) as padding. */
+      (void)want;
+      int32_t row_idx = ih_base + dr;
+      int found = 0;
+      for (int i = 0; i < 3; ++i) {
+        if (cached_row[i] == row_idx) {
+          found = 1;
+          break;
+        }
+      }
+      if (!found) {
+        cached_row[next_slot] = row_idx;
+        _fused_expand_row(input, row_idx, rolling[next_slot], p);
+        next_slot = (next_slot + 1) % 3;
+      }
+    }
+    /* Look up the three rows in cache order. */
+    int8_t* row_at[3] = {0, 0, 0};
+    for (int dr = -1; dr <= 1; ++dr) {
+      int32_t row_idx = ih_base + dr;
+      for (int i = 0; i < 3; ++i) {
+        if (cached_row[i] == row_idx) {
+          row_at[dr + 1] = rolling[i];
+          break;
+        }
+      }
+    }
+
+    int8_t* out_row = output + (size_t)oh * (size_t)out_w * expand_out_c;
+
+#if MV2_USE_MVE
+    /* MVE fast path mirrors the dwconv2d_s8 3x3 inner tiles, with the
+     * critical simplification that the rolling buffer's synthesized pad
+     * rows (-dw_input_offset bytes) let us *always* use
+     * dw_bias_with_offset_full and skip the per-tap offset add — even at
+     * top/bottom output rows where the unfused kernel has to fall back
+     * to per-tap accumulation.  Math: pad pixel contribution =
+     * (-dw_input_offset) * weight, which cancels the "extra" tap in
+     * dw_bias_with_offset_full's pre-fold = bias + dw_input_offset *
+     * sum_all_9_taps.  See derivation in docs/DESIGN.md if added.
+     *
+     * Horizontal boundary (ow=0 and the right tail) still uses scalar
+     * per-pixel because the rolling buffer doesn't have horizontal pad
+     * columns synthesized. */
+    const int can_mve = (expand_out_c & 3u) == 0u
+        && p->dw_bias_with_offset_full != (const int32_t*)0
+        && p->kernel_h == 3u && p->kernel_w == 3u
+        && (uint32_t)pad_h == 1u && (uint32_t)pad_w == 1u
+        && (stride_w == 1u || stride_w == 2u);
+    if (can_mve) {
+      const int32x4_t v_act_min = vdupq_n_s32(d_amin);
+      const int32x4_t v_act_max = vdupq_n_s32(d_amax);
+      const size_t dw_w_row_stride = (size_t)3 * expand_out_c;  /* IHWO kw=3 */
+      const int8_t* dw_w = p->dw_weight;
+      const int32_t* d_bias_off = p->dw_bias_with_offset_full;
+
+      uint32_t ow_mve_start, ow_mve_end;
+      if (stride_w == 1u) {
+        ow_mve_start = 1u;
+        /* 4-pixel tile needs cols [ow_base-1 .. ow_base+4]; require ow_base+5 <= out_w */
+        ow_mve_end = (out_w >= 5u) ? (out_w - 4u) : 1u;
+      } else {
+        ow_mve_start = 1u;
+        /* 2-pixel tile at s2 needs cols [2*ow_base-1 .. 2*ow_base+3]; require 2*ow_base+3 < in_w */
+        ow_mve_end = (in_w >= 4u) ? ((in_w - 3u) / 2u) : 1u;
+        if (ow_mve_end > out_w) ow_mve_end = out_w;
+        /* round to even step since we tile pairs of pixels */
+        ow_mve_end = ow_mve_start + ((ow_mve_end - ow_mve_start) & ~1u);
+      }
+      if (ow_mve_end <= ow_mve_start) {
+        ow_mve_end = ow_mve_start;
+      }
+
+      /* Boundary helper: MVE per-pixel, channel-vectorized.  Per cb=4,
+       * per-tap pixel + dw_input_offset gets multiplied by weight, accumulated
+       * across the (up to 9) in-bounds taps of the 3x3 window.  Mirrors the
+       * boundary path in dwconv2d_s8 — the rolling buffer's synthesized pad
+       * rows mean we don't need a kh_valid branch here either. */
+      const int32x4_t v_in_off = vdupq_n_s32(d_in_off);
+      #define _FUSED_BOUNDARY_PIXEL_MVE(ow_val) \
+      do { \
+        const uint32_t _ow = (ow_val); \
+        const int32_t _iw_base = (int32_t)(_ow * stride_w); \
+        for (uint32_t cb = 0; cb < expand_out_c; cb += 4) { \
+          int32x4_t acc = (p->dw_bias != (const int32_t*)0) \
+              ? vld1q_s32(p->dw_bias + cb) : vdupq_n_s32(0); \
+          for (int dr = 0; dr < 3; ++dr) { \
+            const int32_t sr = ih_base + dr - pad_h; \
+            if (sr < 0 || (uint32_t)sr >= in_h) continue; \
+            const int8_t* row = row_at[dr]; \
+            const int8_t* w_row = dw_w + (size_t)dr * dw_w_row_stride + cb; \
+            for (int dc = 0; dc < 3; ++dc) { \
+              const int32_t sc = _iw_base + dc - pad_w; \
+              if (sc < 0 || (uint32_t)sc >= in_w) continue; \
+              int32x4_t x = vldrbq_s32(row + (size_t)sc * expand_out_c + cb); \
+              int32x4_t w = vldrbq_s32(w_row + (size_t)dc * expand_out_c); \
+              x = vaddq_s32(x, v_in_off); \
+              acc = vaddq_s32(acc, vmulq_s32(x, w)); \
+            } \
+          } \
+          int32x4_t mult = vld1q_s32(p->dw_requant_mults + cb); \
+          int32x4_t shft = vldrbq_s32(p->dw_requant_shifts + cb); \
+          acc = mve_requantize_per_channel_neg_shift(acc, mult, shft); \
+          acc = vaddq_n_s32(acc, d_out_off); \
+          acc = vminq_s32(vmaxq_s32(acc, v_act_min), v_act_max); \
+          vstrbq_s32(out_row + (size_t)_ow * expand_out_c + cb, acc); \
+        } \
+      } while (0)
+
+      /* Left boundary: ow=0 */
+      for (uint32_t ow = 0; ow < ow_mve_start && ow < out_w; ++ow) {
+        _FUSED_BOUNDARY_PIXEL_MVE(ow);
+      }
+
+      /* Interior MVE tiles */
+      if (stride_w == 1u) {
+        /* 4-pixel tile: pixel ow uses iw cols [ow-1, ow, ow+1].  Pair of 4
+         * pixels ow_base..ow_base+3 uses cols [ow_base-1 .. ow_base+4] = 6
+         * contiguous in-bounds input columns. */
+        for (uint32_t ow_base = ow_mve_start; ow_base + 3 < ow_mve_end + 3 && ow_base + 4 <= out_w; ow_base += 4) {
+          if (ow_base + 4 > ow_mve_end + 3) break;
+          for (uint32_t cb = 0; cb < expand_out_c; cb += 4) {
+            int32x4_t bias_v = vld1q_s32(d_bias_off + cb);
+            int32x4_t acc0 = bias_v;
+            int32x4_t acc1 = bias_v;
+            int32x4_t acc2 = bias_v;
+            int32x4_t acc3 = bias_v;
+            for (int dr = 0; dr < 3; ++dr) {
+              const int8_t* x_base = row_at[dr]
+                  + (size_t)(ow_base - 1) * expand_out_c + cb;
+              const int8_t* w_base = dw_w + (size_t)dr * dw_w_row_stride + cb;
+              int32x4_t w0 = vldrbq_s32(w_base + 0 * expand_out_c);
+              int32x4_t w1 = vldrbq_s32(w_base + 1 * expand_out_c);
+              int32x4_t w2 = vldrbq_s32(w_base + 2 * expand_out_c);
+              int32x4_t x0 = vldrbq_s32(x_base + 0 * expand_out_c);
+              int32x4_t x1 = vldrbq_s32(x_base + 1 * expand_out_c);
+              int32x4_t x2 = vldrbq_s32(x_base + 2 * expand_out_c);
+              int32x4_t x3 = vldrbq_s32(x_base + 3 * expand_out_c);
+              int32x4_t x4 = vldrbq_s32(x_base + 4 * expand_out_c);
+              int32x4_t x5 = vldrbq_s32(x_base + 5 * expand_out_c);
+              acc0 = vaddq_s32(acc0, vmulq_s32(x0, w0));
+              acc0 = vaddq_s32(acc0, vmulq_s32(x1, w1));
+              acc0 = vaddq_s32(acc0, vmulq_s32(x2, w2));
+              acc1 = vaddq_s32(acc1, vmulq_s32(x1, w0));
+              acc1 = vaddq_s32(acc1, vmulq_s32(x2, w1));
+              acc1 = vaddq_s32(acc1, vmulq_s32(x3, w2));
+              acc2 = vaddq_s32(acc2, vmulq_s32(x2, w0));
+              acc2 = vaddq_s32(acc2, vmulq_s32(x3, w1));
+              acc2 = vaddq_s32(acc2, vmulq_s32(x4, w2));
+              acc3 = vaddq_s32(acc3, vmulq_s32(x3, w0));
+              acc3 = vaddq_s32(acc3, vmulq_s32(x4, w1));
+              acc3 = vaddq_s32(acc3, vmulq_s32(x5, w2));
+            }
+            int32x4_t mult = vld1q_s32(p->dw_requant_mults + cb);
+            int32x4_t shft = vldrbq_s32(p->dw_requant_shifts + cb);
+            acc0 = mve_requantize_per_channel_neg_shift(acc0, mult, shft);
+            acc1 = mve_requantize_per_channel_neg_shift(acc1, mult, shft);
+            acc2 = mve_requantize_per_channel_neg_shift(acc2, mult, shft);
+            acc3 = mve_requantize_per_channel_neg_shift(acc3, mult, shft);
+            acc0 = vaddq_n_s32(acc0, d_out_off);
+            acc1 = vaddq_n_s32(acc1, d_out_off);
+            acc2 = vaddq_n_s32(acc2, d_out_off);
+            acc3 = vaddq_n_s32(acc3, d_out_off);
+            acc0 = vminq_s32(vmaxq_s32(acc0, v_act_min), v_act_max);
+            acc1 = vminq_s32(vmaxq_s32(acc1, v_act_min), v_act_max);
+            acc2 = vminq_s32(vmaxq_s32(acc2, v_act_min), v_act_max);
+            acc3 = vminq_s32(vmaxq_s32(acc3, v_act_min), v_act_max);
+            int8_t* out_p = out_row + (size_t)ow_base * expand_out_c + cb;
+            vstrbq_s32(out_p + 0 * expand_out_c, acc0);
+            vstrbq_s32(out_p + 1 * expand_out_c, acc1);
+            vstrbq_s32(out_p + 2 * expand_out_c, acc2);
+            vstrbq_s32(out_p + 3 * expand_out_c, acc3);
+          }
+        }
+      } else { /* stride_w == 2 */
+        /* 2-pixel tile: pixel ow uses iw cols [2*ow-1, 2*ow, 2*ow+1].
+         * Pair (ow_base, ow_base+1) uses 5 cols [2*ow_base-1 .. 2*ow_base+3]. */
+        for (uint32_t ow_base = ow_mve_start; ow_base + 1 < ow_mve_end + 1 && ow_base + 2 <= out_w; ow_base += 2) {
+          if (ow_base + 2 > ow_mve_end + 1) break;
+          if ((int32_t)(ow_base * 2u + 3u) >= (int32_t)in_w) break;
+          for (uint32_t cb = 0; cb < expand_out_c; cb += 4) {
+            int32x4_t bias_v = vld1q_s32(d_bias_off + cb);
+            int32x4_t acc0 = bias_v;
+            int32x4_t acc1 = bias_v;
+            for (int dr = 0; dr < 3; ++dr) {
+              const int8_t* x_base = row_at[dr]
+                  + (size_t)(ow_base * 2u - 1u) * expand_out_c + cb;
+              const int8_t* w_base = dw_w + (size_t)dr * dw_w_row_stride + cb;
+              int32x4_t w0 = vldrbq_s32(w_base + 0 * expand_out_c);
+              int32x4_t w1 = vldrbq_s32(w_base + 1 * expand_out_c);
+              int32x4_t w2 = vldrbq_s32(w_base + 2 * expand_out_c);
+              int32x4_t x0 = vldrbq_s32(x_base + 0 * expand_out_c);
+              int32x4_t x1 = vldrbq_s32(x_base + 1 * expand_out_c);
+              int32x4_t x2 = vldrbq_s32(x_base + 2 * expand_out_c);
+              int32x4_t x3 = vldrbq_s32(x_base + 3 * expand_out_c);
+              int32x4_t x4 = vldrbq_s32(x_base + 4 * expand_out_c);
+              acc0 = vaddq_s32(acc0, vmulq_s32(x0, w0));
+              acc0 = vaddq_s32(acc0, vmulq_s32(x1, w1));
+              acc0 = vaddq_s32(acc0, vmulq_s32(x2, w2));
+              acc1 = vaddq_s32(acc1, vmulq_s32(x2, w0));
+              acc1 = vaddq_s32(acc1, vmulq_s32(x3, w1));
+              acc1 = vaddq_s32(acc1, vmulq_s32(x4, w2));
+            }
+            int32x4_t mult = vld1q_s32(p->dw_requant_mults + cb);
+            int32x4_t shft = vldrbq_s32(p->dw_requant_shifts + cb);
+            acc0 = mve_requantize_per_channel_neg_shift(acc0, mult, shft);
+            acc1 = mve_requantize_per_channel_neg_shift(acc1, mult, shft);
+            acc0 = vaddq_n_s32(acc0, d_out_off);
+            acc1 = vaddq_n_s32(acc1, d_out_off);
+            acc0 = vminq_s32(vmaxq_s32(acc0, v_act_min), v_act_max);
+            acc1 = vminq_s32(vmaxq_s32(acc1, v_act_min), v_act_max);
+            int8_t* out_p = out_row + (size_t)ow_base * expand_out_c + cb;
+            vstrbq_s32(out_p + 0 * expand_out_c, acc0);
+            vstrbq_s32(out_p + 1 * expand_out_c, acc1);
+          }
+        }
+      }
+
+      /* Right tail: ow values past the MVE-tile region.  Scalar. */
+      uint32_t ow_tail_start;
+      if (stride_w == 1u) {
+        ow_tail_start = ow_mve_start + ((ow_mve_end > ow_mve_start)
+            ? ((ow_mve_end - ow_mve_start - 1) / 4 + 1) * 4 : 0);
+        if (ow_tail_start > out_w) ow_tail_start = out_w;
+      } else {
+        ow_tail_start = ow_mve_start + ((ow_mve_end > ow_mve_start)
+            ? ((ow_mve_end - ow_mve_start - 1) / 2 + 1) * 2 : 0);
+        if (ow_tail_start > out_w) ow_tail_start = out_w;
+      }
+      for (uint32_t ow = ow_tail_start; ow < out_w; ++ow) {
+        _FUSED_BOUNDARY_PIXEL_MVE(ow);
+      }
+      #undef _FUSED_BOUNDARY_PIXEL_MVE
+      continue;  /* skip the scalar fallback below — we handled this oh fully */
+    }
+#endif
+
+    /* Scalar fallback: every output pixel via the original 9-tap inner. */
+    for (uint32_t ow = 0; ow < out_w; ++ow) {
+      const int32_t iw_base = (int32_t)(ow * stride_w);
+      for (uint32_t c = 0; c < expand_out_c; ++c) {
+        int32_t acc;
+        if (p->dw_bias != (const int32_t*)0) {
+          acc = p->dw_bias[c];
+        } else {
+          acc = 0;
+        }
+        for (int dr = 0; dr < 3; ++dr) {
+          const int32_t sr = ih_base + dr - pad_h;
+          if (sr < 0 || (uint32_t)sr >= in_h) continue;
+          const int8_t* row = row_at[dr];
+          for (int dc = 0; dc < 3; ++dc) {
+            const int32_t sc = iw_base + dc - pad_w;
+            if (sc < 0 || (uint32_t)sc >= in_w) continue;
+            const int32_t x = (int32_t)row[(size_t)sc * expand_out_c + c] + d_in_off;
+            const int32_t w =
+                (int32_t)p->dw_weight[((size_t)dr * 3 + dc) * expand_out_c + c];
+            acc += x * w;
+          }
+        }
+        acc = scalar_requantize(acc, p->dw_requant_mults[c], p->dw_requant_shifts[c]);
+        acc += d_out_off;
+        if (acc < d_amin) acc = d_amin;
+        if (acc > d_amax) acc = d_amax;
+        out_row[(size_t)ow * expand_out_c + c] = (int8_t)acc;
+      }
+    }
+  }
+}
+
+
 static __attribute__((always_inline)) inline void dwconv2d_s8(
     const int8_t* input, int8_t* output, const DepthwiseConv2dParams* p) {
   PROF_START(dwconv2d);

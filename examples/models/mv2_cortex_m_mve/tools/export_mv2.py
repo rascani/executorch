@@ -54,17 +54,36 @@ def main() -> None:
              " test's calibration count for parity.",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--width-mult", type=float, default=1.0,
+        help="MobileNetV2 width multiplier (channel scaling). Non-1.0 widths "
+             "have no torchvision pretrained weights, so --random-weights is "
+             "implied when width != 1.0.",
+    )
+    parser.add_argument(
+        "--input-size", type=int, default=224,
+        help="Input spatial resolution (square). Default 224.",
+    )
+    parser.add_argument(
+        "--fuse-expand-dwconv", action="store_true",
+        help="Enable the MV2 expand+dwconv fusion AOT pass. Replaces every "
+             "1x1 expand conv -> 3x3 depthwise conv pair with a single fused "
+             "op that the runtime kernel streams via a 3-row rolling buffer, "
+             "eliminating the full HxWxC_expand intermediate.",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
 
-    if args.random_weights:
-        model = models.mobilenet_v2(weights=None).eval()
+    use_random = args.random_weights or args.width_mult != 1.0
+    if use_random:
+        model = models.mobilenet_v2(width_mult=args.width_mult, weights=None).eval()
     else:
         model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT).eval()
 
+    R = args.input_size
     example_input = _imagenet_normalize(
-        torch.rand(1, 3, 224, 224)
+        torch.rand(1, 3, R, R)
     ).to(memory_format=torch.channels_last)
 
     captured = export(model, (example_input,)).module()
@@ -75,7 +94,7 @@ def main() -> None:
     print(f"Calibrating with {args.num_calibration} samples...")
     for i in range(args.num_calibration):
         cal_input = _imagenet_normalize(
-            torch.rand(1, 3, 224, 224)
+            torch.rand(1, 3, R, R)
         ).to(memory_format=torch.channels_last)
         prepared(cal_input)
 
@@ -89,8 +108,13 @@ def main() -> None:
             _check_ir_validity=False,
         ),
     )
+    pass_list = (
+        CortexMPassManager.pass_list_with_expand_dwconv_fusion
+        if args.fuse_expand_dwconv
+        else CortexMPassManager.pass_list
+    )
     program = CortexMPassManager(
-        edge.exported_program(), CortexMPassManager.pass_list
+        edge.exported_program(), pass_list
     ).transform()
 
     fixture = example_input.permute(0, 2, 3, 1).contiguous().reshape(1, 1, -1)

@@ -106,6 +106,42 @@ class DepthwiseConv2dLayer:
 
 
 @dataclass
+class FusedConv2dDwconv2dLayer:
+    """MV2 expand+dwconv fusion: a 1x1 conv feeding a 3x3 depthwise conv.
+
+    Both layers' params travel together in a single Layer record so the
+    emitter produces one FusedConv2dDwconv2dParams struct and one
+    mv2_conv2d_dwconv2d_fused_s8 call.  The runtime kernel streams the
+    expand output through a 3-row rolling buffer that the dwconv consumes
+    immediately, avoiding materialization of the full HxWxC_expand tensor.
+    """
+    kernel: str = "conv2d_dwconv2d_fused_s8"
+    input: TensorSlot = None
+    output: TensorSlot = None
+    # Expand conv1x1 (OHWI [expand_out_c, 1, 1, in_c])
+    expand_weight: torch.Tensor = None
+    expand_bias: Optional[torch.Tensor] = None  # int32 [expand_out_c], offset-folded
+    expand_requantize_multipliers: torch.Tensor = None
+    expand_requantize_shifts: torch.Tensor = None
+    expand_input_offset: int = 0   # typically 0 (folded into expand_bias)
+    expand_output_offset: int = 0
+    expand_activation_min: int = -128
+    expand_activation_max: int = 127
+    # Dwconv 3x3 (IHWO [1, kH, kW, expand_out_c])
+    dw_weight: torch.Tensor = None
+    dw_bias: Optional[torch.Tensor] = None  # int32 [expand_out_c]
+    dw_bias_with_offset_full: Optional[torch.Tensor] = None  # int32 [expand_out_c]
+    dw_requantize_multipliers: torch.Tensor = None
+    dw_requantize_shifts: torch.Tensor = None
+    dw_stride: tuple = (1, 1)
+    dw_padding: tuple = (1, 1)
+    dw_input_offset: int = 0
+    dw_output_offset: int = 0
+    dw_activation_min: int = -128
+    dw_activation_max: int = 127
+
+
+@dataclass
 class QuantizedAddLayer:
     kernel: str = "add_s8"
     self_in: TensorSlot = None
@@ -416,6 +452,88 @@ def extract_quantized_depthwise_conv2d(node: Node, program: ExportedProgram, off
     )
 
 
+def extract_quantized_conv2d_dwconv2d_fused(
+    node: Node, program: ExportedProgram, offsets, sizes
+) -> FusedConv2dDwconv2dLayer:
+    a = _node_args_map(node, [
+        "input",
+        "expand_weight", "expand_bias",
+        "expand_input_offset", "expand_output_offset",
+        "expand_requantize_multipliers", "expand_requantize_shifts",
+        "expand_activation_min", "expand_activation_max",
+        "dw_weight", "dw_bias",
+        "dw_stride", "dw_padding",
+        "dw_input_offset", "dw_output_offset",
+        "dw_requantize_multipliers", "dw_requantize_shifts",
+        "dw_activation_min", "dw_activation_max",
+    ])
+
+    # ---- Expand: 1x1 conv with offset-fold (same logic as conv2d extractor). ----
+    e_w_t = _resolve_tensor(program, a["expand_weight"])
+    e_b_t = (
+        _resolve_tensor(program, a["expand_bias"])
+        if a["expand_bias"] is not None else None
+    )
+    e_w_int32 = e_w_t.detach().to(torch.int32).contiguous()
+    # OHWI [out_c, 1, 1, in_c] — sum over the kH=kW=1=in_c axes gives the
+    # per-OC weight sum that the offset-fold needs.
+    sum_w_per_oc = e_w_int32.flatten(1).sum(dim=1)
+    offset_term = sum_w_per_oc * int(a["expand_input_offset"])
+    if e_b_t is not None:
+        e_bias_folded = (
+            e_b_t.detach().to(torch.int32).flatten() + offset_term
+        ).to(torch.int32).contiguous()
+    else:
+        e_bias_folded = offset_term.to(torch.int32).contiguous()
+    e_mults = _resolve_tensor(program, a["expand_requantize_multipliers"]).detach().to(torch.int32).flatten().contiguous()
+    e_shifts = _resolve_tensor(program, a["expand_requantize_shifts"]).detach().to(torch.int8).flatten().contiguous()
+
+    # ---- Dwconv: bias_with_offset_full computation. ----
+    d_w_t = _resolve_tensor(program, a["dw_weight"])
+    d_b_t = (
+        _resolve_tensor(program, a["dw_bias"])
+        if a["dw_bias"] is not None else None
+    )
+    dw_bias_with_offset_full = None
+    if d_b_t is not None and int(a["dw_input_offset"]) != 0:
+        d_w_int32 = d_w_t.detach().to(torch.int32)
+        sum_dw_per_c = d_w_int32.sum(dim=(0, 1, 2))  # IHWO -> [C]
+        dw_offset_term = sum_dw_per_c * int(a["dw_input_offset"])
+        dw_bias_with_offset_full = (
+            d_b_t.detach().to(torch.int32).flatten() + dw_offset_term
+        ).to(torch.int32).contiguous()
+    d_mults = _resolve_tensor(program, a["dw_requantize_multipliers"]).detach().to(torch.int32).flatten().contiguous()
+    d_shifts = _resolve_tensor(program, a["dw_requantize_shifts"]).detach().to(torch.int8).flatten().contiguous()
+
+    return FusedConv2dDwconv2dLayer(
+        input=_slot_from_node(a["input"], offsets, sizes),
+        output=_slot_from_node(node, offsets, sizes),
+        expand_weight=e_w_t.detach().to(torch.int8).contiguous(),
+        expand_bias=e_bias_folded,
+        expand_requantize_multipliers=e_mults,
+        expand_requantize_shifts=e_shifts,
+        # Folded into bias; runtime treats input_offset as 0.
+        expand_input_offset=0,
+        expand_output_offset=int(a["expand_output_offset"]),
+        expand_activation_min=int(a["expand_activation_min"]),
+        expand_activation_max=int(a["expand_activation_max"]),
+        dw_weight=d_w_t.detach().to(torch.int8).contiguous(),
+        dw_bias=(
+            d_b_t.detach().to(torch.int32).flatten().contiguous()
+            if d_b_t is not None else None
+        ),
+        dw_bias_with_offset_full=dw_bias_with_offset_full,
+        dw_requantize_multipliers=d_mults,
+        dw_requantize_shifts=d_shifts,
+        dw_stride=_coerce_int_pair(a["dw_stride"]),
+        dw_padding=_coerce_int_pair(a["dw_padding"]),
+        dw_input_offset=int(a["dw_input_offset"]),
+        dw_output_offset=int(a["dw_output_offset"]),
+        dw_activation_min=int(a["dw_activation_min"]),
+        dw_activation_max=int(a["dw_activation_max"]),
+    )
+
+
 def extract_quantized_add(node: Node, program: ExportedProgram, offsets, sizes) -> QuantizedAddLayer:
     a = _node_args_map(node, [
         "self", "self_zero_point", "self_multiplier", "self_shift",
@@ -488,6 +606,7 @@ EXTRACTORS = {
     "cortex_m.quantized_conv2d.default": extract_quantized_conv2d,
     "cortex_m.quantized_avg_pool2d.default": extract_quantized_avg_pool2d,
     "cortex_m.quantized_depthwise_conv2d.default": extract_quantized_depthwise_conv2d,
+    "cortex_m.quantized_conv2d_dwconv2d_fused.default": extract_quantized_conv2d_dwconv2d_fused,
     "cortex_m.quantized_add.default": extract_quantized_add,
     "cortex_m.pad.default": extract_cortex_m_pad,
     "aten.view_copy.default": _extract_memcpy,

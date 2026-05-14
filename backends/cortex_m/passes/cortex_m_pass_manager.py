@@ -28,6 +28,7 @@ from .clamp_hardswish_pass import ClampHardswishPass
 from .convert_to_cortex_m_pass import ConvertToCortexMPass
 from .decompose_hardswish_pass import DecomposeHardswishPass
 from .decompose_mean_pass import DecomposeMeanPass
+from .expand_dwconv_fusion_pass import ExpandDwconvFusionPass
 from .quantized_clamp_activation_pass import QuantizedClampActivationPass
 from .quantized_op_fusion_pass import QuantizedOpFusionPass
 from .replace_quant_nodes_pass import ReplaceQuantNodesPass
@@ -47,6 +48,14 @@ class CortexMPassManager(PassManager):
         DecomposeHardswishPass,
         QuantizedOpFusionPass,
         ConvertToCortexMPass,
+    ]
+
+    # Opt-in extension that fuses MV2 expand+dwconv chains.  Not on the
+    # default pass list because the cortex_m runtime kernel registry has no
+    # CMSIS-NN entry for the fused op; only the standalone Cortex-M55 + MVE
+    # codegen at examples/models/mv2_cortex_m_mve/ consumes it.
+    pass_list_with_expand_dwconv_fusion: list[PassClass] = pass_list + [
+        ExpandDwconvFusionPass,
     ]
 
     pass_list_transform_for_annotation: list[PassClass] = [

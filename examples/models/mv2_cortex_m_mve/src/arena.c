@@ -24,3 +24,12 @@ __attribute__((section(".bss.tensor_arena"), aligned(16)))
 __attribute__((aligned(16)))
 #endif
 uint8_t mv2_arena[MV2_ARENA_BYTES];
+
+/* Rolling expand-output scratch for the fused conv1x1+dwconv kernel.  Sized
+ * by the AOT planner to 3*in_w*expand_out_c bytes of the largest fused layer
+ * in the schedule.  Bypassed (zero-size array) when MV2_FUSED_SCRATCH_BYTES
+ * is 0, which happens when fusion is disabled in the AOT pipeline. */
+#if MV2_FUSED_SCRATCH_BYTES > 0
+__attribute__((aligned(16)))
+int8_t mv2_fused_scratch[MV2_FUSED_SCRATCH_BYTES];
+#endif
