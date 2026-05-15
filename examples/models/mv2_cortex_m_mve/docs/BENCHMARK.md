@@ -751,10 +751,20 @@ conditional picker — Phase G wins at every config tested):
 | 0.50 / 160 | 144 |  **80** | −44% |
 | 0.35 /  96 |  54 |  **26** | −52% |
 
-Phase G is bit-exact vs Phase A+B on host scalar (0/1000 logit
-mismatches across the full pareto).  The runtime kernel is
-currently scalar-only; MVE optimization is the natural next perf
-step but doesn't affect the memory numbers above.
+Phase G is bit-exact vs Phase A+B on host scalar AND vs the Python
+reference on FVP MVE (0/1000 logit mismatches in both cases).
+
+**Latency**: at 1.0/224 on Corstone-300 FVP, Phase G with MVE for
+qin/stem/1x1/dwconv runs in **153.5 M PMU cycles**, within 1% of
+the Phase A+B headline of 151.9 M.  The MVE 3x3 dwconv row
+computation was factored out of Phase F's inverted_residual_fused_s8
+into a `_dwconv3x3_row_s8` helper that both Phase G's B0 dw
+(stride-1) and B1 dw (stride-2) call.  Pre-dwconv-MVE Phase G ran
+at 215.8 M PMU — the dwconv vectorization is what closed the
+latency gap to Phase A+B.
+
+So at the 1.0/224 headline config: **same latency as Phase A+B,
+46% less arena+scratch**.
 
 ### Updated deployment sweet spots
 
@@ -861,13 +871,12 @@ MV2 specifically.  Items below in roughly descending priority.
 - **Phase D — head epilogue batching.**  Tried analytically; max
   saving is below noise (~0.02-0.5% of total).  Worth ~half a day
   if pursued.
-- **MVE acceleration for Phase G.**  The Phase G kernel is currently
-  scalar-only.  Following the Phase F pattern (packed-32 stem +
-  MVE channel-vectorized dwconv + `_conv1x1_row_mve_args` for 1x1
-  rows) should bring Phase G's per-op cycles close to the sum of
-  the constituent kernels.  Phase G represents ~50% of MV2's
-  compute (stem + B0 + B1), so this is the highest-leverage perf
-  win still on the table.
+- ✅ **MVE acceleration for Phase G** — completed.  qin / stem
+  packed-32 / 1x1 (B0 project, B1 expand, B1 project) all wired to
+  the existing MVE helpers, and the 3x3 dwconv (B0 dw stride-1,
+  B1 dw stride-2) factored out of Phase F's ires kernel into a
+  shared `_dwconv3x3_row_s8` helper.  Lands Phase G at 153.5 M PMU
+  (1.0/224) — same latency as Phase A+B's 151.9 M with -46% memory.
 - **Phase H — extend mega-fusion past B1.**  MV2 B2 is the obvious
   next candidate, but it has a residual add whose skip path is the
   B1 project output (= Phase G's current arena output).  Would
