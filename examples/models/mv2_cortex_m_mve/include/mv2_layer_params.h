@@ -176,6 +176,58 @@ typedef struct {
 } FusedConv2dDwconv2dParams;
 
 typedef struct {
+  /* Phase F: float input + per-tensor quantize folded into the
+   * stem+B0+project fused op.  The quantized int8 input (H*W*C bytes)
+   * never materializes — it's produced row-by-row into a 3-row int8
+   * rolling buffer (3*in_w*in_c bytes) the stem consumes immediately. */
+  uint32_t in_h, in_w, in_c;        /* input spatial (224x224x3 for MV2) */
+  uint32_t stem_out_h, stem_out_w;
+  uint32_t stem_out_c;
+  uint32_t out_h, out_w;
+  uint32_t project_out_c;
+  uint32_t stem_kernel_h, stem_kernel_w;
+  uint32_t stem_stride_h, stem_stride_w;
+  uint32_t stem_pad_h, stem_pad_w;
+  uint32_t dw_kernel_h, dw_kernel_w;
+  uint32_t dw_stride_h, dw_stride_w;
+  uint32_t dw_pad_h, dw_pad_w;
+  /* Per-tensor quantize params for the input. */
+  float quant_scale;
+  int32_t quant_zero_point;
+  int32_t quant_qmin;
+  int32_t quant_qmax;
+  /* Stem 3x3 */
+  const int8_t*  stem_weight;
+  const int8_t*  stem_weight_packed_32;
+  const int32_t* stem_bias;
+  const int32_t* stem_requant_mults;
+  const int8_t*  stem_requant_shifts;
+  int32_t stem_input_offset;
+  int32_t stem_output_offset;
+  int8_t  stem_activation_min;
+  int8_t  stem_activation_max;
+  /* Dwconv 3x3 */
+  const int8_t*  dw_weight;
+  const int32_t* dw_bias;
+  const int32_t* dw_bias_with_offset_full;
+  const int32_t* dw_requant_mults;
+  const int8_t*  dw_requant_shifts;
+  int32_t dw_input_offset;
+  int32_t dw_output_offset;
+  int8_t  dw_activation_min;
+  int8_t  dw_activation_max;
+  /* Project 1x1 */
+  const int8_t*  project_weight;
+  const int32_t* project_bias;
+  const int32_t* project_requant_mults;
+  const int8_t*  project_requant_shifts;
+  int32_t project_input_offset;
+  int32_t project_output_offset;
+  int8_t  project_activation_min;
+  int8_t  project_activation_max;
+} FusedQuantizeStemDwconv2dConv2dParams;
+
+typedef struct {
   /* MV2 first-stage chain: stem 3x3 stride-2 pad-1 Cin=3 -> B0 dwconv 3x3
    * stride-1 pad-1 -> B0 project 1x1.  Streams stem output rows into a
    * 3-row rolling buffer the dwconv consumes immediately, then a 1-row

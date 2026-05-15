@@ -31,6 +31,7 @@ from .decompose_mean_pass import DecomposeMeanPass
 from .dwconv_project_fusion_pass import DwconvProjectFusionPass
 from .expand_dwconv_fusion_pass import ExpandDwconvFusionPass
 from .expand_dwconv_project_fusion_pass import ExpandDwconvProjectFusionPass
+from .quantize_stem_dwconv_project_fusion_pass import QuantizeStemDwconvProjectFusionPass
 from .stem_dwconv_project_fusion_pass import StemDwconvProjectFusionPass
 from .quantized_clamp_activation_pass import QuantizedClampActivationPass
 from .quantized_op_fusion_pass import QuantizedOpFusionPass
@@ -72,6 +73,7 @@ class CortexMPassManager(PassManager):
         ExpandDwconvProjectFusionPass,
         DwconvProjectFusionPass,
         StemDwconvProjectFusionPass,
+        QuantizeStemDwconvProjectFusionPass,
     ]
 
     pass_list_transform_for_annotation: list[PassClass] = [

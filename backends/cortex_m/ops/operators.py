@@ -1582,6 +1582,165 @@ def quantized_stem_dwconv2d_conv2d_fused_impl(
 
 
 # ===================================================================
+# FUSED QUANTIZE + STEM + B0 (dwconv + project) — pulls the per-tensor
+# quantize into the stem chain so the H*W*C int8 input never materializes
+# in the arena (saves 150 KB at 1.0/224).
+# ===================================================================
+
+lib.define(
+    "quantize_stem_dwconv2d_conv2d_fused("
+    "Tensor input, "
+    "float quant_scale, int quant_zero_point, int quant_qmin, int quant_qmax, "
+    "Tensor stem_weight, Tensor? stem_bias, "
+    "int stem_input_offset, int stem_output_offset, "
+    "Tensor stem_requantize_multipliers, Tensor stem_requantize_shifts, "
+    "int stem_activation_min, int stem_activation_max, "
+    "Tensor dw_weight, Tensor? dw_bias, "
+    "int[] dw_stride, int[] dw_padding, "
+    "int dw_input_offset, int dw_output_offset, "
+    "Tensor dw_requantize_multipliers, Tensor dw_requantize_shifts, "
+    "int dw_activation_min, int dw_activation_max, "
+    "Tensor project_weight, Tensor? project_bias, "
+    "int project_input_offset, int project_output_offset, "
+    "Tensor project_requantize_multipliers, Tensor project_requantize_shifts, "
+    "int project_activation_min, int project_activation_max"
+    ") -> Tensor"
+)
+
+
+lib.define(
+    "quantize_stem_dwconv2d_conv2d_fused.out("
+    "Tensor input, "
+    "float quant_scale, int quant_zero_point, int quant_qmin, int quant_qmax, "
+    "Tensor stem_weight, Tensor? stem_bias, "
+    "int stem_input_offset, int stem_output_offset, "
+    "Tensor stem_requantize_multipliers, Tensor stem_requantize_shifts, "
+    "int stem_activation_min, int stem_activation_max, "
+    "Tensor dw_weight, Tensor? dw_bias, "
+    "int[] dw_stride, int[] dw_padding, "
+    "int dw_input_offset, int dw_output_offset, "
+    "Tensor dw_requantize_multipliers, Tensor dw_requantize_shifts, "
+    "int dw_activation_min, int dw_activation_max, "
+    "Tensor project_weight, Tensor? project_bias, "
+    "int project_input_offset, int project_output_offset, "
+    "Tensor project_requantize_multipliers, Tensor project_requantize_shifts, "
+    "int project_activation_min, int project_activation_max, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+
+
+@register_fake("cortex_m::quantize_stem_dwconv2d_conv2d_fused")  # type: ignore[misc]
+def quantize_stem_dwconv2d_conv2d_fused_meta(
+    input: torch.Tensor,
+    quant_scale: float,
+    quant_zero_point: int,
+    quant_qmin: int,
+    quant_qmax: int,
+    stem_weight: torch.Tensor,
+    stem_bias: torch.Tensor | None,
+    stem_input_offset: int,
+    stem_output_offset: int,
+    stem_requantize_multipliers: torch.Tensor,
+    stem_requantize_shifts: torch.Tensor,
+    stem_activation_min: int,
+    stem_activation_max: int,
+    dw_weight: torch.Tensor,
+    dw_bias: torch.Tensor | None,
+    dw_stride: Sequence[int],
+    dw_padding: Sequence[int],
+    dw_input_offset: int,
+    dw_output_offset: int,
+    dw_requantize_multipliers: torch.Tensor,
+    dw_requantize_shifts: torch.Tensor,
+    dw_activation_min: int,
+    dw_activation_max: int,
+    project_weight: torch.Tensor,
+    project_bias: torch.Tensor | None,
+    project_input_offset: int,
+    project_output_offset: int,
+    project_requantize_multipliers: torch.Tensor,
+    project_requantize_shifts: torch.Tensor,
+    project_activation_min: int,
+    project_activation_max: int,
+) -> torch.Tensor:
+    stem_shape = _compute_conv2d_output_shape(
+        input.shape, stem_weight.shape, (2, 2), (1, 1), (1, 1)
+    )
+    dw_shape = _compute_depthwise_conv2d_output_shape(
+        stem_shape, dw_weight.shape, list(dw_stride), list(dw_padding), [1, 1]
+    )
+    output_shape = _compute_conv2d_output_shape(
+        dw_shape, project_weight.shape, (1, 1), (0, 0), (1, 1)
+    )
+    return torch.empty(
+        output_shape,
+        dtype=torch.int8,
+        device=input.device,
+        memory_format=torch.channels_last,
+    )
+
+
+@impl(lib, "quantize_stem_dwconv2d_conv2d_fused", "CompositeExplicitAutograd")  # type: ignore[misc]
+def quantize_stem_dwconv2d_conv2d_fused_impl(
+    input: torch.Tensor,
+    quant_scale: float,
+    quant_zero_point: int,
+    quant_qmin: int,
+    quant_qmax: int,
+    stem_weight: torch.Tensor,
+    stem_bias: torch.Tensor | None,
+    stem_input_offset: int,
+    stem_output_offset: int,
+    stem_requantize_multipliers: torch.Tensor,
+    stem_requantize_shifts: torch.Tensor,
+    stem_activation_min: int,
+    stem_activation_max: int,
+    dw_weight: torch.Tensor,
+    dw_bias: torch.Tensor | None,
+    dw_stride: Sequence[int],
+    dw_padding: Sequence[int],
+    dw_input_offset: int,
+    dw_output_offset: int,
+    dw_requantize_multipliers: torch.Tensor,
+    dw_requantize_shifts: torch.Tensor,
+    dw_activation_min: int,
+    dw_activation_max: int,
+    project_weight: torch.Tensor,
+    project_bias: torch.Tensor | None,
+    project_input_offset: int,
+    project_output_offset: int,
+    project_requantize_multipliers: torch.Tensor,
+    project_requantize_shifts: torch.Tensor,
+    project_activation_min: int,
+    project_activation_max: int,
+) -> torch.Tensor:
+    q = quantize_per_tensor_impl(
+        input, quant_scale, quant_zero_point, quant_qmin, quant_qmax, torch.int8
+    )
+    return quantize_stem_dwconv2d_conv2d_fused_impl_skip_quant(
+        q,
+        stem_weight, stem_bias,
+        stem_input_offset, stem_output_offset,
+        stem_requantize_multipliers, stem_requantize_shifts,
+        stem_activation_min, stem_activation_max,
+        dw_weight, dw_bias, dw_stride, dw_padding,
+        dw_input_offset, dw_output_offset,
+        dw_requantize_multipliers, dw_requantize_shifts,
+        dw_activation_min, dw_activation_max,
+        project_weight, project_bias,
+        project_input_offset, project_output_offset,
+        project_requantize_multipliers, project_requantize_shifts,
+        project_activation_min, project_activation_max,
+    )
+
+
+def quantize_stem_dwconv2d_conv2d_fused_impl_skip_quant(q, *args):
+    """Helper: delegate to the existing stem-fused impl after quantizing."""
+    return quantized_stem_dwconv2d_conv2d_fused_impl(q, *args)
+
+
+# ===================================================================
 # QUANTIZED TRANSPOSE_CONV2D OPERATION DEFINITION
 # ===================================================================
 

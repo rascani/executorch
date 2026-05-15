@@ -146,9 +146,25 @@ def build_schedule(program: ExportedProgram) -> ProgramSchedule:
     if schedule.output_slot is None and final_q_layer is not None:
         schedule.output_slot = final_q_layer.output
 
-    # Input slot: the first quantize_per_tensor's output is the first int8 buffer
-    # that the C inference function writes to.
+    # Input slot: normally the first quantize_per_tensor's output (= int8
+    # tensor at the same shape as the model input).  When the quantize is
+    # folded into a Phase F fused op, the layer's output is the *B0
+    # project* shape — not the input shape.  In that case we synthesize
+    # a slot whose shape matches the raw float input dims.
+    from .extractors import FusedQuantizeStemDwconv2dConv2dLayer, TensorSlot
     for layer in schedule.layers:
+        if isinstance(layer, FusedQuantizeStemDwconv2dConv2dLayer):
+            # num_input_elements is N*C*H*W; assume the natural MV2 layout.
+            in_c = int(layer.stem_weight.shape[3])  # OHWI -> in_c
+            num = int(layer.num_input_elements)
+            spatial = max(1, int((num // (in_c if in_c > 0 else 1)) ** 0.5))
+            schedule.input_slot = TensorSlot(
+                name="model_input_float",
+                offset=0,
+                size=num,
+                shape=(1, in_c, spatial, spatial),
+            )
+            break
         if hasattr(layer, "output") and layer.output is not None:
             schedule.input_slot = layer.output
             break

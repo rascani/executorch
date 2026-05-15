@@ -28,6 +28,7 @@ from .extractors import (
     FusedConv2dDwconv2dLayer,
     FusedDwconv2dConv2dLayer,
     FusedInvertedResidualLayer,
+    FusedQuantizeStemDwconv2dConv2dLayer,
     FusedStemDwconv2dConv2dLayer,
     LinearLayer,
     MemcpyLayer,
@@ -145,6 +146,41 @@ def emit_weights(out_dir: Path, layers: Iterable, header_guard: str = "MV2_WEIGH
             defns.append(_emit_int8_array(f"{stem}_dw_requant_shifts", layer.dw_requantize_shifts))
             decls.append(f"extern const int32_t {stem}_dw_requant_mults[];")
             decls.append(f"extern const int8_t  {stem}_dw_requant_shifts[];")
+        elif isinstance(layer, FusedQuantizeStemDwconv2dConv2dLayer):
+            stem = f"L{i}_qsdp"
+            defns.append(_emit_int8_array(f"{stem}_stem_weight", layer.stem_weight))
+            decls.append(f"extern const int8_t {stem}_stem_weight[];")
+            if layer.stem_weight_packed_32 is not None:
+                defns.append(_emit_int8_array(f"{stem}_stem_weight_packed_32", layer.stem_weight_packed_32))
+                decls.append(f"extern const int8_t {stem}_stem_weight_packed_32[];")
+            if layer.stem_bias is not None:
+                defns.append(_emit_int32_array(f"{stem}_stem_bias", layer.stem_bias))
+                decls.append(f"extern const int32_t {stem}_stem_bias[];")
+            defns.append(_emit_int32_array(f"{stem}_stem_requant_mults", layer.stem_requantize_multipliers))
+            defns.append(_emit_int8_array(f"{stem}_stem_requant_shifts", layer.stem_requantize_shifts))
+            decls.append(f"extern const int32_t {stem}_stem_requant_mults[];")
+            decls.append(f"extern const int8_t  {stem}_stem_requant_shifts[];")
+            defns.append(_emit_int8_array(f"{stem}_dw_weight", layer.dw_weight))
+            decls.append(f"extern const int8_t {stem}_dw_weight[];")
+            if layer.dw_bias is not None:
+                defns.append(_emit_int32_array(f"{stem}_dw_bias", layer.dw_bias))
+                decls.append(f"extern const int32_t {stem}_dw_bias[];")
+            if layer.dw_bias_with_offset_full is not None:
+                defns.append(_emit_int32_array(f"{stem}_dw_bias_off", layer.dw_bias_with_offset_full))
+                decls.append(f"extern const int32_t {stem}_dw_bias_off[];")
+            defns.append(_emit_int32_array(f"{stem}_dw_requant_mults", layer.dw_requantize_multipliers))
+            defns.append(_emit_int8_array(f"{stem}_dw_requant_shifts", layer.dw_requantize_shifts))
+            decls.append(f"extern const int32_t {stem}_dw_requant_mults[];")
+            decls.append(f"extern const int8_t  {stem}_dw_requant_shifts[];")
+            defns.append(_emit_int8_array(f"{stem}_project_weight", layer.project_weight))
+            decls.append(f"extern const int8_t {stem}_project_weight[];")
+            if layer.project_bias is not None:
+                defns.append(_emit_int32_array(f"{stem}_project_bias", layer.project_bias))
+                decls.append(f"extern const int32_t {stem}_project_bias[];")
+            defns.append(_emit_int32_array(f"{stem}_project_requant_mults", layer.project_requantize_multipliers))
+            defns.append(_emit_int8_array(f"{stem}_project_requant_shifts", layer.project_requantize_shifts))
+            decls.append(f"extern const int32_t {stem}_project_requant_mults[];")
+            decls.append(f"extern const int8_t  {stem}_project_requant_shifts[];")
         elif isinstance(layer, FusedStemDwconv2dConv2dLayer):
             stem = f"L{i}_sdp"
             defns.append(_emit_int8_array(f"{stem}_stem_weight", layer.stem_weight))
@@ -298,20 +334,36 @@ def _compute_fused_scratch_bytes(schedule: ProgramSchedule) -> int:
             need = out_w * dw_c + out_w * project_out_c
             best = max(best, need)
         elif isinstance(layer, FusedStemDwconv2dConv2dLayer):
-            # Stem stride-2 halves the input.  Stem output spatial == B0
-            # dwconv input spatial.  3 rolling stem rows + 1 dwconv row +
-            # 1 project row.
             _, _, in_w, _ = _spatial_dims_full(layer.input.shape)
-            # stem out_w = in_w / 2
             stem_out_w = in_w // 2
             stem_out_c = int(layer.stem_weight.shape[0])
             project_out_c = int(layer.project_weight.shape[0])
-            # B0 dwconv has stride 1 in MV2.
             dw_stride_w = layer.dw_stride[1]
             dw_out_w = stem_out_w // dw_stride_w
             need = (3 * stem_out_w * stem_out_c
                     + dw_out_w * stem_out_c
                     + dw_out_w * project_out_c)
+            best = max(best, need)
+        elif isinstance(layer, FusedQuantizeStemDwconv2dConv2dLayer):
+            # As FusedStemDwconv2dConv2dLayer, plus an extra 3-row int8
+            # rolling buffer for the quantized input that the stem reads.
+            # Input shape is the float input (1, 3, H, W) — derive in_w
+            # and in_c from num_input_elements.  At MV2 1.0/224 this is
+            # (224, 3) giving 3*224*3 = 2016 extra bytes.
+            num_in = int(layer.num_input_elements)
+            in_c = int(layer.stem_weight.shape[3])  # OHWI -> in_c at dim 3
+            # Total input = N*C*H*W; assume N=1 and square -> H = W = sqrt(num_in / in_c).
+            spatial = max(1, int((num_in // (in_c if in_c > 0 else 1)) ** 0.5))
+            in_w = spatial
+            stem_out_w = in_w // 2
+            stem_out_c = int(layer.stem_weight.shape[0])
+            project_out_c = int(layer.project_weight.shape[0])
+            dw_stride_w = layer.dw_stride[1]
+            dw_out_w = stem_out_w // dw_stride_w
+            need = (3 * in_w * in_c                      # quantized-input rolling
+                    + 3 * stem_out_w * stem_out_c        # stem output rolling
+                    + dw_out_w * stem_out_c              # dwconv row
+                    + dw_out_w * project_out_c)          # project row
             best = max(best, need)
     return best
 
@@ -354,6 +406,9 @@ def emit_arena(out_dir: Path, schedule: ProgramSchedule) -> None:
                                 FusedConv2dDwconv2dLayer,
                                 AvgPool2dLayer, MemcpyLayer)):
             slots = [layer.input, layer.output]
+        elif isinstance(layer, FusedQuantizeStemDwconv2dConv2dLayer):
+            # No arena input slot — only the output.
+            slots = [layer.output]
         elif isinstance(layer, FusedInvertedResidualLayer):
             slots = [layer.input, layer.output]
             if layer.residual_input is not None:
@@ -513,6 +568,77 @@ def emit_params(
                 f"  .dw_output_offset = {layer.dw_output_offset},\n"
                 f"  .dw_activation_min = {layer.dw_activation_min},\n"
                 f"  .dw_activation_max = {layer.dw_activation_max},\n"
+                "};"
+            )
+        elif isinstance(layer, FusedQuantizeStemDwconv2dConv2dLayer):
+            # No input slot in arena (input is float, comes from entry-point arg).
+            # Derive spatial dims from num_input_elements and stem_weight shape.
+            num_in = int(layer.num_input_elements)
+            stem_out_c = layer.stem_weight.shape[0]
+            project_out_c = layer.project_weight.shape[0]
+            _, _, _, dw_c = layer.dw_weight.shape
+            # Stem weight is OHWI (out_c, kH, kW, in_c)
+            in_c = int(layer.stem_weight.shape[3])
+            spatial = max(1, int((num_in // (in_c if in_c > 0 else 1)) ** 0.5))
+            in_h = in_w = spatial
+            stem_out_h = in_h // 2
+            stem_out_w = in_w // 2
+            out_h, out_w, _ = _spatial_dims(layer.output.shape)
+            stem = f"L{i}_qsdp"
+            s_bias_ref = f"{stem}_stem_bias" if layer.stem_bias is not None else "(const int32_t*)0"
+            s_packed_ref = (
+                f"{stem}_stem_weight_packed_32"
+                if layer.stem_weight_packed_32 is not None else "(const int8_t*)0"
+            )
+            d_bias_ref = f"{stem}_dw_bias" if layer.dw_bias is not None else "(const int32_t*)0"
+            d_bias_off_ref = (
+                f"{stem}_dw_bias_off"
+                if layer.dw_bias_with_offset_full is not None else "(const int32_t*)0"
+            )
+            p_bias_ref = f"{stem}_project_bias" if layer.project_bias is not None else "(const int32_t*)0"
+            lines.append(
+                f"static const FusedQuantizeStemDwconv2dConv2dParams P_L{i}_qsdp = {{\n"
+                f"  .in_h = {in_h}u, .in_w = {in_w}u, .in_c = {in_c}u,\n"
+                f"  .stem_out_h = {stem_out_h}u, .stem_out_w = {stem_out_w}u,\n"
+                f"  .stem_out_c = {stem_out_c}u,\n"
+                f"  .out_h = {out_h}u, .out_w = {out_w}u,\n"
+                f"  .project_out_c = {project_out_c}u,\n"
+                f"  .stem_kernel_h = 3u, .stem_kernel_w = 3u,\n"
+                f"  .stem_stride_h = 2u, .stem_stride_w = 2u,\n"
+                f"  .stem_pad_h = 1u, .stem_pad_w = 1u,\n"
+                f"  .dw_kernel_h = 3u, .dw_kernel_w = 3u,\n"
+                f"  .dw_stride_h = {layer.dw_stride[0]}u, .dw_stride_w = {layer.dw_stride[1]}u,\n"
+                f"  .dw_pad_h = {layer.dw_padding[0]}u, .dw_pad_w = {layer.dw_padding[1]}u,\n"
+                f"  .quant_scale = {layer.quant_scale:.9g}f,\n"
+                f"  .quant_zero_point = {layer.quant_zero_point},\n"
+                f"  .quant_qmin = {layer.quant_qmin},\n"
+                f"  .quant_qmax = {layer.quant_qmax},\n"
+                f"  .stem_weight = {stem}_stem_weight,\n"
+                f"  .stem_weight_packed_32 = {s_packed_ref},\n"
+                f"  .stem_bias = {s_bias_ref},\n"
+                f"  .stem_requant_mults = {stem}_stem_requant_mults,\n"
+                f"  .stem_requant_shifts = {stem}_stem_requant_shifts,\n"
+                f"  .stem_input_offset = {layer.stem_input_offset},\n"
+                f"  .stem_output_offset = {layer.stem_output_offset},\n"
+                f"  .stem_activation_min = {layer.stem_activation_min},\n"
+                f"  .stem_activation_max = {layer.stem_activation_max},\n"
+                f"  .dw_weight = {stem}_dw_weight,\n"
+                f"  .dw_bias = {d_bias_ref},\n"
+                f"  .dw_bias_with_offset_full = {d_bias_off_ref},\n"
+                f"  .dw_requant_mults = {stem}_dw_requant_mults,\n"
+                f"  .dw_requant_shifts = {stem}_dw_requant_shifts,\n"
+                f"  .dw_input_offset = {layer.dw_input_offset},\n"
+                f"  .dw_output_offset = {layer.dw_output_offset},\n"
+                f"  .dw_activation_min = {layer.dw_activation_min},\n"
+                f"  .dw_activation_max = {layer.dw_activation_max},\n"
+                f"  .project_weight = {stem}_project_weight,\n"
+                f"  .project_bias = {p_bias_ref},\n"
+                f"  .project_requant_mults = {stem}_project_requant_mults,\n"
+                f"  .project_requant_shifts = {stem}_project_requant_shifts,\n"
+                f"  .project_input_offset = {layer.project_input_offset},\n"
+                f"  .project_output_offset = {layer.project_output_offset},\n"
+                f"  .project_activation_min = {layer.project_activation_min},\n"
+                f"  .project_activation_max = {layer.project_activation_max},\n"
                 "};"
             )
         elif isinstance(layer, FusedStemDwconv2dConv2dLayer):
@@ -743,6 +869,7 @@ def emit_inference_body(out_dir: Path, schedule: ProgramSchedule) -> None:
                               FusedInvertedResidualLayer,
                               FusedDwconv2dConv2dLayer,
                               FusedStemDwconv2dConv2dLayer,
+                              FusedQuantizeStemDwconv2dConv2dLayer,
                               AvgPool2dLayer, QuantizedAddLayer)):
             last_q_layer = layer
     if last_q_layer is not None:
@@ -822,6 +949,16 @@ def emit_inference_body(out_dir: Path, schedule: ProgramSchedule) -> None:
                 f"  stem_dwconv2d_conv2d_fused_s8("
                 f"(const int8_t*)(mv2_arena + ACT_OFFSET_{layer.input.name}), "
                 f"{out_buf}, &P_L{i}_sdp);"
+            )
+        elif isinstance(layer, FusedQuantizeStemDwconv2dConv2dLayer):
+            # Float input from entry-point arg — bypasses arena.
+            out_buf = (
+                "output_q" if layer.output.name == output_int8_slot
+                else f"(int8_t*)(mv2_arena + ACT_OFFSET_{layer.output.name})"
+            )
+            lines.append(
+                f"  quantize_stem_dwconv2d_conv2d_fused_s8("
+                f"input_float, {out_buf}, &P_L{i}_qsdp);"
             )
         elif isinstance(layer, QuantizedAddLayer):
             out_buf = (

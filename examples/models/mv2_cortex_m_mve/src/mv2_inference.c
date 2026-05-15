@@ -1734,6 +1734,560 @@ static __attribute__((always_inline)) inline void stem_dwconv2d_conv2d_fused_s8(
 }
 
 
+/* Scalar quantize-row helper — used by host build and as the fallback
+ * branch when MVE is unavailable. */
+static void _quantize_input_row_scalar(
+    const float* in_row,
+    int8_t* dst,
+    uint32_t in_w,
+    uint32_t in_c,
+    float scale,
+    int32_t zero_point,
+    int32_t qmin,
+    int32_t qmax) {
+  const float inv_scale = 1.0f / scale;
+  const uint32_t n = in_w * in_c;
+  for (uint32_t i = 0; i < n; ++i) {
+    float scaled = in_row[i] * inv_scale;
+    int32_t r = (int32_t)(scaled + (scaled >= 0.0f ? 0.5f : -0.5f));
+    r += zero_point;
+    if (r < qmin) r = qmin;
+    if (r > qmax) r = qmax;
+    dst[i] = (int8_t)r;
+  }
+}
+
+/* Scalar stem-row from explicit row pointers (NULL = pad). */
+static void _stem_row_scalar_from_rows(
+    const int8_t* row_at[3],
+    int8_t* out_row,
+    uint32_t in_w,
+    uint32_t out_w,
+    uint32_t out_c,
+    const int8_t* weight,  /* OHWI [out_c, 3, 3, 3] */
+    const int32_t* bias,
+    const int32_t* mults,
+    const int8_t* shifts,
+    int32_t input_offset,
+    int32_t output_offset,
+    int32_t act_min,
+    int32_t act_max) {
+  const size_t w_oc_stride = (size_t)3 * 3 * 3;
+  for (uint32_t ow = 0; ow < out_w; ++ow) {
+    for (uint32_t oc = 0; oc < out_c; ++oc) {
+      int32_t acc = (bias != (const int32_t*)0) ? bias[oc] : 0;
+      const int8_t* w_oc = weight + (size_t)oc * w_oc_stride;
+      for (uint32_t kh = 0; kh < 3; ++kh) {
+        if (!row_at[kh]) continue;
+        for (uint32_t kw = 0; kw < 3; ++kw) {
+          const int32_t iw = (int32_t)(ow * 2u) - 1 + (int32_t)kw;
+          if (iw < 0 || (uint32_t)iw >= in_w) continue;
+          const int8_t* x = row_at[kh] + (size_t)iw * 3;
+          const int8_t* w = w_oc + ((size_t)kh * 3 + kw) * 3;
+          for (uint32_t ic = 0; ic < 3; ++ic) {
+            acc += ((int32_t)x[ic] + input_offset) * (int32_t)w[ic];
+          }
+        }
+      }
+      acc = scalar_requantize(acc, mults[oc], shifts[oc]);
+      acc += output_offset;
+      if (acc < act_min) acc = act_min;
+      if (acc > act_max) acc = act_max;
+      out_row[(size_t)ow * out_c + oc] = (int8_t)acc;
+    }
+  }
+}
+
+#if MV2_USE_MVE
+/* Quantize one row of float input into int8 dst using the per-tensor
+ * (scale, zero_point) params.  Mirrors quantize_input's pixel loop with
+ * the outer row loop removed. */
+static void _quantize_input_row_mve(
+    const float* in_row,
+    int8_t* dst,
+    uint32_t in_w,
+    uint32_t in_c,
+    float scale,
+    int32_t zero_point,
+    int32_t qmin,
+    int32_t qmax) {
+  const float inv_scale = 1.0f / scale;
+  const uint32_t n = in_w * in_c;
+  uint32_t i = 0;
+  /* 4-wide vector quantize: vcvtq + vrnd + vaddq + vminq + vmaxq + vstrb */
+  for (; i + 4 <= n; i += 4) {
+    float32x4_t vf = vld1q_f32(in_row + i);
+    vf = vmulq_n_f32(vf, inv_scale);
+    int32x4_t vi = vcvtnq_s32_f32(vf);          /* round-to-nearest-even */
+    vi = vaddq_n_s32(vi, zero_point);
+    vi = vmaxq_s32(vi, vdupq_n_s32(qmin));
+    vi = vminq_s32(vi, vdupq_n_s32(qmax));
+    vstrbq_s32(dst + i, vi);
+  }
+  for (; i < n; ++i) {
+    float scaled = in_row[i] * inv_scale;
+    int32_t r = (int32_t)(scaled + (scaled >= 0.0f ? 0.5f : -0.5f));
+    r += zero_point;
+    if (r < qmin) r = qmin;
+    if (r > qmax) r = qmax;
+    dst[i] = (int8_t)r;
+  }
+}
+
+/* Variant of _stem_packed_row_mve that takes the 3 input row pointers
+ * directly (NULL = pad row).  Lets the caller supply a 3-row rolling
+ * buffer of quantized input. */
+static __attribute__((noinline))
+void _stem_packed_row_mve_from_rows(
+    const int8_t* row_at[3],
+    int8_t* out_row,
+    uint32_t in_w,
+    uint32_t out_w,
+    uint32_t out_c,
+    const int8_t* w_packed,
+    const int32_t* bias,
+    const int32_t* mults,
+    const int8_t* shifts,
+    int32_t input_offset,
+    int32_t output_offset,
+    int32_t act_min,
+    int32_t act_max) {
+  (void)in_w;  /* kept for API symmetry */
+  const int8_t pad_byte = (int8_t)(-input_offset);
+  const int32x4_t v_act_min = vdupq_n_s32(act_min);
+  const int32x4_t v_act_max = vdupq_n_s32(act_max);
+  for (uint32_t ow = 0; ow < out_w; ++ow) {
+    const int32_t iw_base = (int32_t)(ow * 2u) - 1;
+    int8_t patch[32] = {0};
+    for (uint32_t kh = 0; kh < 3; ++kh) {
+      int8_t* p_row = patch + kh * 9;
+      if (row_at[kh]) {
+        for (uint32_t kw = 0; kw < 3; ++kw) {
+          int32_t iw = iw_base + (int32_t)kw;
+          int8_t* p_pos = p_row + kw * 3;
+          if (iw >= 0 && iw < (int32_t)in_w) {
+            const int8_t* x_pos = row_at[kh] + (size_t)iw * 3;
+            p_pos[0] = x_pos[0];
+            p_pos[1] = x_pos[1];
+            p_pos[2] = x_pos[2];
+          } else {
+            p_pos[0] = pad_byte;
+            p_pos[1] = pad_byte;
+            p_pos[2] = pad_byte;
+          }
+        }
+      } else {
+        for (int i = 0; i < 9; ++i) p_row[i] = pad_byte;
+      }
+    }
+    int8x16_t vx_lo = vld1q_s8(patch + 0);
+    int8x16_t vx_hi = vld1q_s8(patch + 16);
+    for (uint32_t ocb = 0; ocb < out_c; ocb += 4) {
+      int32_t a0 = bias[ocb + 0];
+      int32_t a1 = bias[ocb + 1];
+      int32_t a2 = bias[ocb + 2];
+      int32_t a3 = bias[ocb + 3];
+      int8x16_t w0_lo = vld1q_s8(w_packed + (size_t)(ocb + 0) * 32 + 0);
+      int8x16_t w0_hi = vld1q_s8(w_packed + (size_t)(ocb + 0) * 32 + 16);
+      int8x16_t w1_lo = vld1q_s8(w_packed + (size_t)(ocb + 1) * 32 + 0);
+      int8x16_t w1_hi = vld1q_s8(w_packed + (size_t)(ocb + 1) * 32 + 16);
+      int8x16_t w2_lo = vld1q_s8(w_packed + (size_t)(ocb + 2) * 32 + 0);
+      int8x16_t w2_hi = vld1q_s8(w_packed + (size_t)(ocb + 2) * 32 + 16);
+      int8x16_t w3_lo = vld1q_s8(w_packed + (size_t)(ocb + 3) * 32 + 0);
+      int8x16_t w3_hi = vld1q_s8(w_packed + (size_t)(ocb + 3) * 32 + 16);
+      a0 = vmladavaq_s8(a0, vx_lo, w0_lo);
+      a0 = vmladavaq_s8(a0, vx_hi, w0_hi);
+      a1 = vmladavaq_s8(a1, vx_lo, w1_lo);
+      a1 = vmladavaq_s8(a1, vx_hi, w1_hi);
+      a2 = vmladavaq_s8(a2, vx_lo, w2_lo);
+      a2 = vmladavaq_s8(a2, vx_hi, w2_hi);
+      a3 = vmladavaq_s8(a3, vx_lo, w3_lo);
+      a3 = vmladavaq_s8(a3, vx_hi, w3_hi);
+      int32x4_t mult = vld1q_s32(mults + ocb);
+      int32x4_t shft = vldrbq_s32(shifts + ocb);
+      int32x4_t accv = {a0, a1, a2, a3};
+      accv = mve_requantize_per_channel_neg_shift(accv, mult, shft);
+      accv = vaddq_n_s32(accv, output_offset);
+      accv = vminq_s32(vmaxq_s32(accv, v_act_min), v_act_max);
+      vstrbq_s32(out_row + (size_t)ow * out_c + ocb, accv);
+    }
+  }
+}
+#endif
+
+/* ===========================================================================
+ * quantize_stem_dwconv2d_conv2d_fused_s8 — Phase F:
+ *   per-tensor quantize + stem 3x3 stride-2 + B0 dwconv + B0 project.
+ *
+ * Float input comes from outside arena (entry-point argument).  A 3-row
+ * int8 rolling buffer holds the recently-quantized input rows; only
+ * newly-needed rows are quantized on each stem output iteration.
+ * Eliminates the H*W*C int8 quantized-input tensor from the arena
+ * (150 KB at 1.0/224).
+ *
+ * Layout in mv2_fused_scratch:
+ *   [-- 3 int8 input rows --][-- 3 stem-output rows --][-- 1 dwconv row --][-- 1 project row --]
+ *
+ * The remainder mirrors stem_dwconv2d_conv2d_fused_s8.
+ * ===========================================================================
+ */
+static __attribute__((always_inline)) inline void quantize_stem_dwconv2d_conv2d_fused_s8(
+    const float* input_float, int8_t* output,
+    const FusedQuantizeStemDwconv2dConv2dParams* p) {
+  const uint32_t in_h = p->in_h;
+  const uint32_t in_w = p->in_w;
+  const uint32_t in_c = p->in_c;
+  const uint32_t stem_out_h = p->stem_out_h;
+  const uint32_t stem_out_w = p->stem_out_w;
+  const uint32_t stem_out_c = p->stem_out_c;
+  const uint32_t out_w = p->out_w;
+  const uint32_t out_h = p->out_h;
+  const uint32_t project_out_c = p->project_out_c;
+  const uint32_t dw_stride_h = p->dw_stride_h;
+  const uint32_t dw_stride_w = p->dw_stride_w;
+  const int32_t dw_pad_h = (int32_t)p->dw_pad_h;
+  const int32_t dw_pad_w = (int32_t)p->dw_pad_w;
+  const int32_t d_in_off = p->dw_input_offset;
+  const int32_t d_out_off = p->dw_output_offset;
+  const int32_t d_amin = p->dw_activation_min;
+  const int32_t d_amax = p->dw_activation_max;
+  const int32_t p_out_off = p->project_output_offset;
+  const int32_t p_amin = p->project_activation_min;
+  const int32_t p_amax = p->project_activation_max;
+
+  const uint32_t input_row_bytes = in_w * in_c;
+  const uint32_t stem_row_bytes = stem_out_w * stem_out_c;
+  const uint32_t dwconv_out_w = stem_out_w / dw_stride_w;
+
+  /* Layout: 3 int8 input rows, then 3 stem-output rows, then 1 dwconv row,
+   * then 1 project row. */
+  int8_t* qin_rolling[3] = {
+    mv2_fused_scratch + 0u * input_row_bytes,
+    mv2_fused_scratch + 1u * input_row_bytes,
+    mv2_fused_scratch + 2u * input_row_bytes,
+  };
+  int8_t* stem_rolling[3] = {
+    mv2_fused_scratch + 3u * input_row_bytes + 0u * stem_row_bytes,
+    mv2_fused_scratch + 3u * input_row_bytes + 1u * stem_row_bytes,
+    mv2_fused_scratch + 3u * input_row_bytes + 2u * stem_row_bytes,
+  };
+  int8_t* dwconv_row_buf = mv2_fused_scratch + 3u * input_row_bytes + 3u * stem_row_bytes;
+  int8_t* project_row_buf = dwconv_row_buf + dwconv_out_w * stem_out_c;
+
+  /* Quantized-input rolling buffer: track which input row each slot holds. */
+  int32_t qin_cached_row[3] = {-2, -2, -2};
+  int qin_next_slot = 0;
+
+  /* Stem-output rolling buffer state (same as stem_dwconv2d kernel). */
+  int32_t stem_cached_row[3] = {-2, -2, -2};
+  int stem_next_slot = 0;
+
+  /* Returns a pointer to the int8 quantized row for the given input row
+   * index, quantizing if not already cached.  Returns NULL for
+   * out-of-bounds rows (pad). */
+  #if MV2_USE_MVE
+    #define _QUANT_ROW_DISPATCH(_src, _dst) \
+      _quantize_input_row_mve((_src), (_dst), in_w, in_c, \
+          p->quant_scale, p->quant_zero_point, p->quant_qmin, p->quant_qmax)
+  #else
+    #define _QUANT_ROW_DISPATCH(_src, _dst) \
+      _quantize_input_row_scalar((_src), (_dst), in_w, in_c, \
+          p->quant_scale, p->quant_zero_point, p->quant_qmin, p->quant_qmax)
+  #endif
+
+  #define _ENSURE_QIN_ROW(row_idx) \
+    do { \
+      if ((int32_t)(row_idx) >= 0 && (uint32_t)(row_idx) < in_h) { \
+        int _found = 0; \
+        for (int _i = 0; _i < 3; ++_i) { \
+          if (qin_cached_row[_i] == (int32_t)(row_idx)) { _found = 1; break; } \
+        } \
+        if (!_found) { \
+          qin_cached_row[qin_next_slot] = (int32_t)(row_idx); \
+          _QUANT_ROW_DISPATCH( \
+              input_float + (size_t)(row_idx) * in_w * in_c, \
+              qin_rolling[qin_next_slot]); \
+          qin_next_slot = (qin_next_slot + 1) % 3; \
+        } \
+      } \
+    } while (0)
+
+  #define _GET_QIN_ROW(row_idx) ({ \
+    const int8_t* _r = (const int8_t*)0; \
+    if ((int32_t)(row_idx) >= 0 && (uint32_t)(row_idx) < in_h) { \
+      for (int _i = 0; _i < 3; ++_i) { \
+        if (qin_cached_row[_i] == (int32_t)(row_idx)) { _r = qin_rolling[_i]; break; } \
+      } \
+    } \
+    _r; \
+  })
+
+  /* Compute one stem-output row at `stem_oh`, writing to `dst`.
+   * Quantizes input rows on demand. */
+  #define _COMPUTE_STEM_ROW(stem_oh, dst) \
+    do { \
+      if ((int32_t)(stem_oh) < 0 || (uint32_t)(stem_oh) >= stem_out_h) { \
+        /* Synthesize pad row */ \
+        int8_t fill = (int8_t)(-d_in_off); \
+        for (uint32_t _i = 0; _i < stem_row_bytes; ++_i) (dst)[_i] = fill; \
+      } else { \
+        const int32_t _ih_base = (int32_t)((stem_oh) * 2u) - 1; \
+        _ENSURE_QIN_ROW(_ih_base + 0); \
+        _ENSURE_QIN_ROW(_ih_base + 1); \
+        _ENSURE_QIN_ROW(_ih_base + 2); \
+        const int8_t* _rows[3] = { \
+          _GET_QIN_ROW(_ih_base + 0), \
+          _GET_QIN_ROW(_ih_base + 1), \
+          _GET_QIN_ROW(_ih_base + 2), \
+        }; \
+        _STEM_ROW_FROM_ROWS_DISPATCH(_rows, (dst)); \
+      } \
+    } while (0)
+
+  #if MV2_USE_MVE
+    #define _STEM_ROW_FROM_ROWS_DISPATCH(_rows, _dst) \
+      do { \
+        if (p->stem_weight_packed_32 != (const int8_t*)0 \
+            && (stem_out_c & 3u) == 0u) { \
+          _stem_packed_row_mve_from_rows( \
+              (_rows), (_dst), in_w, stem_out_w, stem_out_c, \
+              p->stem_weight_packed_32, p->stem_bias, \
+              p->stem_requant_mults, p->stem_requant_shifts, \
+              p->stem_input_offset, p->stem_output_offset, \
+              p->stem_activation_min, p->stem_activation_max); \
+        } else { \
+          _stem_row_scalar_from_rows( \
+              (_rows), (_dst), in_w, stem_out_w, stem_out_c, \
+              p->stem_weight, p->stem_bias, \
+              p->stem_requant_mults, p->stem_requant_shifts, \
+              p->stem_input_offset, p->stem_output_offset, \
+              p->stem_activation_min, p->stem_activation_max); \
+        } \
+      } while (0)
+  #else
+    #define _STEM_ROW_FROM_ROWS_DISPATCH(_rows, _dst) \
+      _stem_row_scalar_from_rows( \
+          (_rows), (_dst), in_w, stem_out_w, stem_out_c, \
+          p->stem_weight, p->stem_bias, \
+          p->stem_requant_mults, p->stem_requant_shifts, \
+          p->stem_input_offset, p->stem_output_offset, \
+          p->stem_activation_min, p->stem_activation_max)
+  #endif
+
+  for (uint32_t oh = 0; oh < out_h; ++oh) {
+    const int32_t ih_base = (int32_t)(oh * dw_stride_h);
+    for (int dr = -1; dr <= 1; ++dr) {
+      int32_t row_idx = ih_base + dr;
+      int found = 0;
+      for (int i = 0; i < 3; ++i) {
+        if (stem_cached_row[i] == row_idx) { found = 1; break; }
+      }
+      if (!found) {
+        stem_cached_row[stem_next_slot] = row_idx;
+        _COMPUTE_STEM_ROW(row_idx, stem_rolling[stem_next_slot]);
+        stem_next_slot = (stem_next_slot + 1) % 3;
+      }
+    }
+    int8_t* row_at[3] = {0, 0, 0};
+    for (int dr = -1; dr <= 1; ++dr) {
+      int32_t row_idx = ih_base + dr;
+      for (int i = 0; i < 3; ++i) {
+        if (stem_cached_row[i] == row_idx) {
+          row_at[dr + 1] = stem_rolling[i];
+          break;
+        }
+      }
+    }
+
+    int8_t* out_row = output + (size_t)oh * (size_t)out_w * project_out_c;
+
+#if MV2_USE_MVE
+    /* Same dwconv MVE inner + project + memcpy as stem_dwconv2d_conv2d_fused_s8.
+     * Duplicated here to avoid plumbing a callback through; consider
+     * factoring into a helper if a fourth variant appears. */
+    const int32x4_t v_dw_act_min = vdupq_n_s32(d_amin);
+    const int32x4_t v_dw_act_max = vdupq_n_s32(d_amax);
+    const size_t dw_w_row_stride = (size_t)3 * stem_out_c;
+    const int8_t* dw_w = p->dw_weight;
+    const int32_t* d_bias_off = p->dw_bias_with_offset_full;
+    const int32x4_t v_dw_in_off = vdupq_n_s32(d_in_off);
+
+    uint32_t ow_mve_start = 1u;
+    uint32_t ow_mve_end;
+    if (dw_stride_w == 1u) {
+      ow_mve_end = (dwconv_out_w >= 5u) ? (dwconv_out_w - 4u) : 1u;
+    } else {
+      ow_mve_end = (stem_out_w >= 4u) ? ((stem_out_w - 3u) / 2u) : 1u;
+      if (ow_mve_end > dwconv_out_w) ow_mve_end = dwconv_out_w;
+      ow_mve_end = ow_mve_start + ((ow_mve_end - ow_mve_start) & ~1u);
+    }
+    if (ow_mve_end <= ow_mve_start) ow_mve_end = ow_mve_start;
+
+    #define _QSDP_BOUNDARY_PIXEL(ow_val) \
+    do { \
+      const uint32_t _ow = (ow_val); \
+      const int32_t _iw_base = (int32_t)(_ow * dw_stride_w); \
+      for (uint32_t cb = 0; cb < stem_out_c; cb += 4) { \
+        int32x4_t acc = (p->dw_bias != (const int32_t*)0) \
+            ? vld1q_s32(p->dw_bias + cb) : vdupq_n_s32(0); \
+        for (int dr = 0; dr < 3; ++dr) { \
+          const int32_t sr = ih_base + dr - dw_pad_h; \
+          if (sr < 0 || (uint32_t)sr >= stem_out_h) continue; \
+          const int8_t* row = row_at[dr]; \
+          const int8_t* w_row = dw_w + (size_t)dr * dw_w_row_stride + cb; \
+          for (int dc = 0; dc < 3; ++dc) { \
+            const int32_t sc = _iw_base + dc - dw_pad_w; \
+            if (sc < 0 || (uint32_t)sc >= stem_out_w) continue; \
+            int32x4_t x = vldrbq_s32(row + (size_t)sc * stem_out_c + cb); \
+            int32x4_t w = vldrbq_s32(w_row + (size_t)dc * stem_out_c); \
+            x = vaddq_s32(x, v_dw_in_off); \
+            acc = vaddq_s32(acc, vmulq_s32(x, w)); \
+          } \
+        } \
+        int32x4_t mult = vld1q_s32(p->dw_requant_mults + cb); \
+        int32x4_t shft = vldrbq_s32(p->dw_requant_shifts + cb); \
+        acc = mve_requantize_per_channel_neg_shift(acc, mult, shft); \
+        acc = vaddq_n_s32(acc, d_out_off); \
+        acc = vminq_s32(vmaxq_s32(acc, v_dw_act_min), v_dw_act_max); \
+        vstrbq_s32(dwconv_row_buf + (size_t)_ow * stem_out_c + cb, acc); \
+      } \
+    } while (0)
+
+    for (uint32_t ow = 0; ow < ow_mve_start && ow < dwconv_out_w; ++ow) {
+      _QSDP_BOUNDARY_PIXEL(ow);
+    }
+    if (dw_stride_w == 1u) {
+      for (uint32_t ow_base = ow_mve_start;
+           ow_base + 4 <= dwconv_out_w && ow_base + 4 <= ow_mve_end + 3;
+           ow_base += 4) {
+        for (uint32_t cb = 0; cb < stem_out_c; cb += 4) {
+          int32x4_t bias_v = vld1q_s32(d_bias_off + cb);
+          int32x4_t acc0 = bias_v, acc1 = bias_v, acc2 = bias_v, acc3 = bias_v;
+          for (int dr = 0; dr < 3; ++dr) {
+            const int8_t* x_base = row_at[dr]
+                + (size_t)(ow_base - 1) * stem_out_c + cb;
+            const int8_t* w_base = dw_w + (size_t)dr * dw_w_row_stride + cb;
+            int32x4_t w0 = vldrbq_s32(w_base + 0 * stem_out_c);
+            int32x4_t w1 = vldrbq_s32(w_base + 1 * stem_out_c);
+            int32x4_t w2 = vldrbq_s32(w_base + 2 * stem_out_c);
+            int32x4_t x0 = vldrbq_s32(x_base + 0 * stem_out_c);
+            int32x4_t x1 = vldrbq_s32(x_base + 1 * stem_out_c);
+            int32x4_t x2 = vldrbq_s32(x_base + 2 * stem_out_c);
+            int32x4_t x3 = vldrbq_s32(x_base + 3 * stem_out_c);
+            int32x4_t x4 = vldrbq_s32(x_base + 4 * stem_out_c);
+            int32x4_t x5 = vldrbq_s32(x_base + 5 * stem_out_c);
+            acc0 = vaddq_s32(acc0, vmulq_s32(x0, w0));
+            acc0 = vaddq_s32(acc0, vmulq_s32(x1, w1));
+            acc0 = vaddq_s32(acc0, vmulq_s32(x2, w2));
+            acc1 = vaddq_s32(acc1, vmulq_s32(x1, w0));
+            acc1 = vaddq_s32(acc1, vmulq_s32(x2, w1));
+            acc1 = vaddq_s32(acc1, vmulq_s32(x3, w2));
+            acc2 = vaddq_s32(acc2, vmulq_s32(x2, w0));
+            acc2 = vaddq_s32(acc2, vmulq_s32(x3, w1));
+            acc2 = vaddq_s32(acc2, vmulq_s32(x4, w2));
+            acc3 = vaddq_s32(acc3, vmulq_s32(x3, w0));
+            acc3 = vaddq_s32(acc3, vmulq_s32(x4, w1));
+            acc3 = vaddq_s32(acc3, vmulq_s32(x5, w2));
+          }
+          int32x4_t mult = vld1q_s32(p->dw_requant_mults + cb);
+          int32x4_t shft = vldrbq_s32(p->dw_requant_shifts + cb);
+          acc0 = mve_requantize_per_channel_neg_shift(acc0, mult, shft);
+          acc1 = mve_requantize_per_channel_neg_shift(acc1, mult, shft);
+          acc2 = mve_requantize_per_channel_neg_shift(acc2, mult, shft);
+          acc3 = mve_requantize_per_channel_neg_shift(acc3, mult, shft);
+          acc0 = vaddq_n_s32(acc0, d_out_off);
+          acc1 = vaddq_n_s32(acc1, d_out_off);
+          acc2 = vaddq_n_s32(acc2, d_out_off);
+          acc3 = vaddq_n_s32(acc3, d_out_off);
+          acc0 = vminq_s32(vmaxq_s32(acc0, v_dw_act_min), v_dw_act_max);
+          acc1 = vminq_s32(vmaxq_s32(acc1, v_dw_act_min), v_dw_act_max);
+          acc2 = vminq_s32(vmaxq_s32(acc2, v_dw_act_min), v_dw_act_max);
+          acc3 = vminq_s32(vmaxq_s32(acc3, v_dw_act_min), v_dw_act_max);
+          int8_t* o = dwconv_row_buf + (size_t)ow_base * stem_out_c + cb;
+          vstrbq_s32(o + 0 * stem_out_c, acc0);
+          vstrbq_s32(o + 1 * stem_out_c, acc1);
+          vstrbq_s32(o + 2 * stem_out_c, acc2);
+          vstrbq_s32(o + 3 * stem_out_c, acc3);
+        }
+      }
+    }
+    uint32_t ow_tail_start;
+    if (dw_stride_w == 1u) {
+      ow_tail_start = ow_mve_start + ((ow_mve_end > ow_mve_start)
+          ? ((ow_mve_end - ow_mve_start - 1) / 4 + 1) * 4 : 0);
+    } else {
+      ow_tail_start = ow_mve_start + ((ow_mve_end > ow_mve_start)
+          ? ((ow_mve_end - ow_mve_start - 1) / 2 + 1) * 2 : 0);
+    }
+    if (ow_tail_start > dwconv_out_w) ow_tail_start = dwconv_out_w;
+    for (uint32_t ow = ow_tail_start; ow < dwconv_out_w; ++ow) {
+      _QSDP_BOUNDARY_PIXEL(ow);
+    }
+    #undef _QSDP_BOUNDARY_PIXEL
+
+    _conv1x1_row_mve_args(
+        dwconv_row_buf, project_row_buf,
+        out_w, stem_out_c, project_out_c,
+        p->project_weight, p->project_bias,
+        p->project_requant_mults, p->project_requant_shifts,
+        p_out_off, p_amin, p_amax);
+    __builtin_memcpy(out_row, project_row_buf,
+                     (size_t)out_w * project_out_c);
+#else
+    /* Scalar fallback: identical body to stem_dwconv2d's scalar path,
+     * but reading from row_at[] (rolling buffer of stem rows). */
+    for (uint32_t ow = 0; ow < dwconv_out_w; ++ow) {
+      const int32_t iw_base = (int32_t)(ow * dw_stride_w);
+      for (uint32_t c = 0; c < stem_out_c; ++c) {
+        int32_t acc = (p->dw_bias != (const int32_t*)0) ? p->dw_bias[c] : 0;
+        for (int dr = 0; dr < 3; ++dr) {
+          const int32_t sr = ih_base + dr - dw_pad_h;
+          if (sr < 0 || (uint32_t)sr >= stem_out_h) continue;
+          const int8_t* row = row_at[dr];
+          for (int dc = 0; dc < 3; ++dc) {
+            const int32_t sc = iw_base + dc - dw_pad_w;
+            if (sc < 0 || (uint32_t)sc >= stem_out_w) continue;
+            const int32_t x = (int32_t)row[(size_t)sc * stem_out_c + c] + d_in_off;
+            const int32_t w =
+                (int32_t)p->dw_weight[((size_t)dr * 3 + dc) * stem_out_c + c];
+            acc += x * w;
+          }
+        }
+        acc = scalar_requantize(acc, p->dw_requant_mults[c], p->dw_requant_shifts[c]);
+        acc += d_out_off;
+        if (acc < d_amin) acc = d_amin;
+        if (acc > d_amax) acc = d_amax;
+        dwconv_row_buf[(size_t)ow * stem_out_c + c] = (int8_t)acc;
+      }
+    }
+    for (uint32_t ow = 0; ow < out_w; ++ow) {
+      const int8_t* x_pos = dwconv_row_buf + (size_t)ow * stem_out_c;
+      int8_t* out_pos = out_row + (size_t)ow * project_out_c;
+      for (uint32_t oc = 0; oc < project_out_c; ++oc) {
+        int32_t acc = (p->project_bias != (const int32_t*)0) ? p->project_bias[oc] : 0;
+        const int8_t* w_oc = p->project_weight + (size_t)oc * stem_out_c;
+        for (uint32_t ic = 0; ic < stem_out_c; ++ic) {
+          acc += ((int32_t)x_pos[ic] + p->project_input_offset) * (int32_t)w_oc[ic];
+        }
+        acc = scalar_requantize(acc, p->project_requant_mults[oc],
+                                p->project_requant_shifts[oc]);
+        acc += p_out_off;
+        if (acc < p_amin) acc = p_amin;
+        if (acc > p_amax) acc = p_amax;
+        out_pos[oc] = (int8_t)acc;
+      }
+    }
+#endif
+  }
+  #undef _ENSURE_QIN_ROW
+  #undef _GET_QIN_ROW
+  #undef _COMPUTE_STEM_ROW
+  #undef _QUANT_ROW_DISPATCH
+  #undef _STEM_ROW_FROM_ROWS_DISPATCH
+  (void)project_row_buf;  /* unused in scalar fallback */
+}
+
+
 /* ===========================================================================
  * dwconv2d_conv2d_fused_s8 — MV2 B0-style block (expand_ratio=1):
  *   3x3 dwconv -> 1x1 project, no preceding expand.
