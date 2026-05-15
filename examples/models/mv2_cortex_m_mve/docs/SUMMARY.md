@@ -94,46 +94,53 @@ Worth recording because the *non*-finding is also useful:
 | Stem conv further optimization | <1% total | Already packed-im2col, ~6× faster than scalar |
 | 3/4-op fusion at width-0.35 | Per-block math favorable but planner-level regression | Eliminations don't coincide with global arena peak; conditional pass selection handles it |
 
-## MV2 optimization meat still on the bone
+## MV2 optimization meat that was on the bone — and what's left
 
-### Memory: B0 dwconv-project fusion (significant)
+### Phase A: B0 dwconv+project fusion ✅ DONE
 
-The current 1.0/224 peak of 802 KB is driven by the **B0 inverted-residual
-block**: stem output (32×112² = 401 KB) is live alongside the B0 dwconv
-output (32×112² = 401 KB) — neither is fused because B0 has
-`expand_ratio=1`, so there's no expand conv for our pattern matchers to
-hook onto.
+MV2's first inverted-residual block has `expand_ratio=1` (no expand
+conv), so its 3×3 dwconv → 1×1 project pair wasn't matched by the
+existing fusion passes.  `DwconvProjectFusionPass` matches this
+pattern and emits `cortex_m.quantized_dwconv2d_conv2d_fused`.  The
+runtime kernel streams the B0 dwconv output through a single-row
+scratch into the project conv.
 
-A new pass `DwconvProjectFusionPass` (matching `dwconv → project` without
-the expand prefix) plus a corresponding runtime kernel would eliminate
-one of those 401 KB tensors, shrinking the peak to roughly 400 KB at
-1.0/224 — a further **50% reduction over today's fused result**. The
-implementation is structurally the same as the existing 2-op fusion
-(rolling buffer between dwconv and project), just without the expand row
-helper.
+Result at 1.0/224: arena 803 KB → 602 KB (-25%), latency +0.7%.
 
-Effort estimate: ~2 days. Risk: bit-exactness via the proven rolling-
-buffer pattern; new kernel mostly reuses existing dwconv + 1×1 conv MVE
-inner loops.
+### Phase B: Stem + B0 chain fusion ✅ DONE
 
-### Memory: Stem + B0 fusion (potentially bigger)
+`StemDwconvProjectFusionPass` extends Phase A by also absorbing the
+stem conv (3×3 stride-2 Cin=3) into the fused op.  The stem
+packed-im2col inner was refactored into a per-row helper
+(`_stem_packed_row_mve`) that produces stem rows on demand into a
+3-row rolling buffer that B0's dwconv consumes immediately.
 
-The stem conv (3×3 stride-2 Cin=3 → 32 channels at 112²) feeds B0's
-dwconv. If the stem could also be streamed (output rows produced into a
-small rolling buffer that B0's dwconv consumes immediately), the stem
-output's 401 KB allocation goes away too.
+Result at 1.0/224: arena 602 KB → 351 KB (-42% additional).  Latency
+actually *decreased* by 2.9M PMU (-1.9%) because the streaming
+eliminated a 401 KB writeback + 401 KB read of the stem output
+through the memory hierarchy.  First "free" memory win in the project.
 
-The stem's MVE path is the packed-32 im2col kernel. Adapting it to
-produce one row at a time is mechanical. Pairing with B0's dwconv
-(consumed via the standard 3-row rolling buffer) is the natural
-extension.
+Combined Phases A+B vs the unfused baseline at 1.0/224: arena
+1505 KB → 390 KB (**-74%**) at +4.3% latency.
 
-Effort estimate: ~3 days. Significant payoff at the headline config: at
-1.0/224, peak could drop from 802 KB to ~200 KB (just the B0 project
-output + small rolling buffers + quantized input).
+### Phase C: Stem 2-pixel batching ⚠ NO MEASURABLE WIN
 
-These two opportunities together could plausibly drop 1.0/224 arena from
-841 KB to **~250 KB**, a 70% reduction from the unfused baseline.
+Theory: stem inner is partly weight-load-bound; halving the load count
+per pixel should buy ~1-2% on total inference.  Measured: within
+noise (152.0M PMU vs 151.9M).  The compiler likely couldn't keep 8
+simultaneous accumulators in registers and spilled — offsetting the
+load savings.  Kept the patch anyway because it also collapsed
+conv2d_s8's standalone stem path into a single call to the shared
+`_stem_packed_row_mve` helper (clean code reduction).
+
+### Phase D, E: skipped with documented rationale
+
+- **Head epilogue batching** (Phase D): theoretical max ~0.02-0.5% of
+  total — below measurement noise.
+- **Multi-block fusion** (Phase E): MV2's residual-add pattern blocks
+  it for the candidate pairs.  Most consecutive same-spatial blocks
+  have a residual whose skip path needs the block-boundary tensor
+  materialized.
 
 ### Memory: multi-block fusion (modest)
 
@@ -224,29 +231,29 @@ for its own sake. That latter held.
 
 | Metric | Before | After | Ratio |
 |---|---|---|---|
-| 1.0/224 latency | 1158M PMU (extrapolated scalar baseline) | 153.7M PMU | **7.5×** |
-| 1.0/224 vs CMSIS-NN | 172.2M PMU | 153.7M PMU | 1.12× faster |
-| 1.0/224 arena | 1505 KB | 841 KB | -44% |
-| Smallest deployable | wouldn't fit any MCU | 0.35/96 at 81 KB / 35 ms | enabled new deployment tier |
+| 1.0/224 latency | 1158M PMU (extrapolated scalar baseline) | 151.9M PMU | **7.6×** |
+| 1.0/224 vs CMSIS-NN | 172.2M PMU | 151.9M PMU | 1.13× faster |
+| 1.0/224 arena | 1505 KB | 390 KB | **-74%** |
+| Smallest deployable | wouldn't fit any MCU | 0.35/96 at 54 KB / 35 ms | enabled 64 KB MCU tier |
 
-The remaining MV2 headroom catalogued above could plausibly drop 1.0/224
-arena to ~250 KB if pursued.
+The 1.0/224 model now fits in 512 KB SRAM — a tier that was unreachable
+when the project started.
 
 ## Recommended next direction
 
-If continuing the experiment, the highest-value next step is **B0
-dwconv+project fusion + stem fusion**: bounded scope (~1 week), large
-payoff (potentially 50-70% additional arena reduction at headline
-configs), and uses techniques that are already validated in the existing
-2-op/3-op patterns.
+The biggest remaining MV2 memory items have been done.  Remaining
+opportunities in descending value:
 
-Other directions in roughly descending value:
-
-1. **Real-silicon validation** — closes the FVP-vs-deployment gap, makes
-   the result externally credible.
-2. **Generalize to MCUNet-VWW** — tests CNN-to-CNN portability without
-   the transformer-shaped gap KWT exposed. Most informative
-   capability-test that's still bounded scope.
-3. **Multi-block fusion** — modest payoff, large effort.
-4. **Quantization-level optimization** (int4, per-block recipes) —
-   high potential but separate project scope.
+1. **Real-silicon validation** — closes the FVP-vs-deployment gap,
+   makes the result externally credible.  Required for any external
+   claim of these numbers.
+2. **Generalize to MCUNet-VWW or other CNN model** — tests CNN-to-CNN
+   portability without the transformer-shaped gap KWT exposed.  Most
+   informative capability-test that's still bounded scope.
+3. **Quantization-level optimization** (int4 weights or mixed-precision
+   activations) — high potential but separate project scope.  Could
+   further halve weight memory (helps flash) or shrink late-layer
+   activation memory selectively.
+4. **Apply to other models in the repo** (KWT, Silero-VAD,
+   Tinyissimo-YOLO) — KWT exposed a substantial transformer-shaped
+   gap; the others may be more amenable.

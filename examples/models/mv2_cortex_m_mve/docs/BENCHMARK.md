@@ -639,31 +639,72 @@ passes and picks the one with smaller total (arena + scratch).
 Width-1.0/0.75/0.5 invariably pick ires; width-0.35 invariably picks
 2-op.  No regressions in the final pareto.
 
-### Combined headline: pareto frontier across all 20 configs (3/4-op fused)
+### Operator fusion — Phase A (B0 dwconv+project) + Phase B (stem chain)
+
+After 2-op and 3/4-op fusion landed, the remaining 1.0/224 arena peak
+was the B0 inverted-residual block: the stem output (32 channels at
+112^2 = 401 KB) co-live with the B0 dwconv output (also 401 KB).
+Neither was matched by the existing fusion passes because B0 has
+`expand_ratio=1` (no expand conv prefix).
+
+Phase A added `DwconvProjectFusionPass` matching `dwconv → conv1x1`
+without an expand prefix, plus the runtime kernel
+`dwconv2d_conv2d_fused_s8`.  Eliminates the B0 dwconv output by
+streaming it through a single-row scratch into the project conv.
+At 1.0/224: arena drops 802 KB → 602 KB (-25%).
+
+Phase B extends the chain further by also absorbing the stem conv into
+the fused op.  `StemDwconvProjectFusionPass` matches the
+`stem (3x3 stride-2 Cin=3) → quantized_dwconv2d_conv2d_fused` chain
+and emits `quantized_stem_dwconv2d_conv2d_fused`.  The runtime kernel
+`stem_dwconv2d_conv2d_fused_s8` reuses the existing packed-32 stem
+inner (factored into `_stem_packed_row_mve` as a per-row helper) to
+produce stem rows on demand into a 3-row rolling buffer that B0's
+dwconv consumes immediately.  At 1.0/224: arena drops 602 KB → 351 KB.
+
+Phase B is a "free" memory win — latency actually *decreases* by
+2.9M PMU (-1.9%) at 1.0/224 because the streaming eliminates a 401 KB
+writeback + 401 KB read of the stem output through the memory
+hierarchy.  This is the first phase in the whole project where memory
+reduction came with a latency *bonus* rather than a tax.
+
+### Final pareto frontier across all 20 configs (Phases A+B, conditional)
 
 | width \ res | **224** | **192** | **160** | **128** | **96** |
 |---:|---:|---:|---:|---:|---:|
-| **1.00** | 842K / 153.7M | 623K / 113.8M | 437K / 79.2M | 284K / 51.2M | 164K / 28.9M |
-| **0.75** | 641K / 124.7M | 476K /  92.4M | 335K / 64.2M | 219K / 41.7M | 127K / 23.5M |
-| **0.50** | 424K /  72.3M | 314K /  53.5M | 221K / 37.4M | 144K / 24.4M |  83K / 13.8M |
-| **0.35** | 421K /  54.8M | 311K /  40.6M | 219K / 28.4M | 142K / 18.5M |  82K / 10.6M |
+| **1.00** | 390K / 151.9M | 291K / 112.4M | 207K / 78.3M | 137K / 50.7M |  81K / 28.6M |
+| **0.75** | 390K / 125.2M | 291K /  92.6M | 207K / 64.6M | 137K / 41.8M |  81K / 23.6M |
+| **0.50** | 273K /  72.0M | 204K /  53.4M | 144K / 37.3M |  95K / 24.2M |  56K / 13.8M |
+| **0.35** | 270K /  54.5M | 201K /  40.4M | 142K / 28.3M |  93K / 18.4M |  54K / 10.5M |
 
-Format: `arena KB / PMU cycles`.  Bold-equivalent (smallest in each
-SRAM tier):
+Format: `(arena + scratch) KB / PMU cycles`.  Memory reductions vs the
+pre-A+B pareto: -33% to -54% across all 20 configs.  Latency deltas:
+-1.2% to +0.8%, mostly neutral.
+
+Two striking observations: (a) width-1.0 and width-0.75 now produce
+identical arenas at every resolution because both stem widths produce
+the same 32 channels at half resolution; the early-layer tensors that
+previously made width-1.0 larger have been eliminated.  (b) the
+full-fat 1.0/224 now fits in 512 KB SRAM — a deployment tier that was
+unreachable when the project started (1505 KB unfused → 390 KB
+fused, 74% reduction at 4.3% latency cost).
+
+### Updated deployment sweet spots
 
 | SRAM budget | Best deployable config | Latency @ 300 MHz |
 |---|---|---|
-| ≤512 KB | 0.5 / 224 at 424 KB | 241 ms |
-| ≤256 KB | 0.5 / 128 at 144 KB | 81 ms |
-| ≤256 KB | 1.0 / 128 at 284 KB ⚠ over | — |
-| ≤128 KB | 0.5 / 96 at 83 KB | 46 ms |
-| ≤128 KB | 0.35 / 96 at 82 KB | 35 ms |
-| ≤96 KB  | 0.5 / 96 at 83 KB | 46 ms |
-| ≤96 KB  | 0.35 / 96 at 82 KB | 35 ms |
+| ≤512 KB | **1.0 / 224** at 390 KB | 506 ms |
+| ≤256 KB | 0.5 / 224 at 273 KB | 240 ms |
+| ≤256 KB | 1.0 / 160 at 207 KB | 261 ms |
+| ≤128 KB | 0.5 / 128 at 95 KB | 81 ms |
+| ≤128 KB | 0.35 / 128 at 93 KB | 61 ms |
+| ≤96 KB  | 0.5 / 96 at 56 KB | 46 ms |
+| ≤64 KB  | **0.35 / 96** at 54 KB | **35 ms** |
 
-The pareto frontier now reaches **~80 KB / 35 ms** — a 19× memory
-reduction and 14× latency reduction vs unfused MV2-1.0/224, both
-deployable on hardware that wouldn't have run MV2 at all before.
+The pareto now reaches **~54 KB / 35 ms** — 28× memory reduction and
+14× latency reduction vs the unfused MV2-1.0/224 baseline.  Real-
+silicon validation on a 256+ KB Cortex-M55 SoC would now be a viable
+deployment target for full-fat ImageNet MobileNetV2.
 
 ### Implementation summary
 
@@ -677,6 +718,9 @@ deployable on hardware that wouldn't have run MV2 at all before.
 | 6 | New edge op `quantized_conv2d_dwconv2d_conv2d_fused` + codegen | ~0.5 day |
 | 7 | C kernel: `inverted_residual_fused_s8` (scalar + MVE dwconv tile + MVE project row via `_conv1x1_row_mve_args` helper + MVE residual add) | ~1.5 days |
 | 8 | Pareto sweep (20 configs × ~3 min each) | ~1 hour wall |
+| 9 | Phase A: `DwconvProjectFusionPass` + `dwconv2d_conv2d_fused_s8` kernel for B0-style blocks | ~1 day |
+| 10 | Phase B: `StemDwconvProjectFusionPass` + `stem_dwconv2d_conv2d_fused_s8` kernel with row-streaming stem | ~1 day |
+| 11 | Second pareto sweep, BENCHMARK.md refresh | ~1 hour wall |
 
 Total: ~6 engineer-days for the AOT/runtime/numerics-validation work.
 The agent that produced this work demonstrated capability across
