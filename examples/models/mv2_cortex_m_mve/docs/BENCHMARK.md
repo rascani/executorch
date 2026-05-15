@@ -51,17 +51,31 @@ this document use PMU.
 
 ## Headline numbers (Corstone-300 FVP, PMU CCNTR)
 
-| Path | Cycles / inference | `.text` | `.rodata` | Arena |
-|---|---:|---:|---:|---:|
-| Standalone, baseline (commit `e6f5623e65`)        | ~1,158 M (extrapolated 8×) | 56,888 B | 4,283,956 B | 1,505,280 B |
-| Standalone, all 20 committed kernel improvements  | **145,649,857** | ~66 KB | ~4.2 MB | 1,505,280 B |
-| cortex_m backend (CMSIS-NN), rebuilt fresh        | **172,218,932** | 478,960 B (test runner) | 35,632 B (+ DDR data) | 1,505,280 B |
+The project landed in two phases.  Phase 1 was 20 incremental kernel
+tunes (the optimization progression below) that brought the standalone
+path from scalar baseline to faster than cortex_m / CMSIS-NN at the
+same shape.  Phase 2 was AOT operator fusion (the model-level section
+later in this doc) that drove arena memory down by a further 74% at
+the headline config.
 
-**Standalone is now ~15.4% faster than the cortex_m backend on this
-FVP config** (26.6M PMU cycle margin), with both producing bit-exact
-int8 outputs (max int8 diff = 0 across all 1000 logits).  Numbers
-above are PMU cycle counts read identically (`ARM_PMU_Get_CCNTR()`)
-in both runners.
+| Path | Cycles / inference | `.text` | `.rodata` | Arena | Fused scratch | Total mem |
+|---|---:|---:|---:|---:|---:|---:|
+| Standalone, scalar baseline (`e6f5623e65`)       | ~1,158 M (extrapolated 8×) | 56,888 B | 4,283,956 B | 1,505,280 B | 0 | 1,505,280 B |
+| Standalone, all 20 kernel commits (kernel ceiling) | **145,649,857** | ~66 KB | ~4.2 MB | 1,505,280 B | 0 | 1,505,280 B |
+| **Standalone, full fusion (Phase A + B)**          | **151,938,342** | ~75 KB | ~4.2 MB | **351,232 B** | 38,976 B | **390,208 B** |
+| cortex_m backend (CMSIS-NN), rebuilt fresh         | **172,218,932** | 478,960 B (test runner) | 35,632 B (+ DDR data) | 1,505,280 B | 0 | 1,505,280 B |
+
+**Two headline comparisons against the cortex_m backend on this
+Corstone-300 FVP**:
+- *Latency*: standalone full-fusion is **~11.7% faster** than cortex_m
+  (20.3M PMU margin); the kernel-only ceiling is **~15.4% faster**.
+- *Memory*: standalone full-fusion uses **3.86× less total memory**
+  (390 KB vs 1,505 KB); cortex_m has no fusion path so its arena is
+  the unfused exir greedy plan.
+
+Both producing bit-exact int8 outputs (max int8 diff = 0 across all
+1000 logits).  Numbers above are PMU cycle counts read identically
+(`ARM_PMU_Get_CCNTR()`) in both runners.
 
 The cortex_m backend runner's `.text` is much larger than ours
 because it's the test-framework's generic semihosting runner that can
@@ -69,15 +83,16 @@ take any PTE via `-m` at runtime, includes BundleIO scaffolding, plus
 the executorch runtime + flatbuffer parser + portable kernels + the
 CMSIS-NN library + Ethos-U driver code.  For a real production
 deployment that hardcodes the model (no semihosting, no BundleIO), the
-cortex_m runner shrinks to roughly the 154 KB range — still 2-3× our
+cortex_m runner shrinks to roughly the 154 KB range — still 2× our
 standalone.
 
-So the standalone path now wins on **all three axes**: latency
-(145.6M vs 172.2M PMU), code size (66 KB vs ~150 KB stripped), and
-runtime dependencies (none — no flatbuffer parser, no kernel registry,
-no driver layer).  Earlier versions of this doc reported the cortex_m
-backend leading on latency; the 20-step optimization sequence below
-flipped that.
+So the standalone path wins on **all four axes**: latency (151.9M vs
+172.2M PMU), code size (~75 KB vs ~150 KB stripped), arena memory
+(351 KB vs 1.5 MB), and runtime dependencies (none — no flatbuffer
+parser, no kernel registry, no driver layer).  Earlier versions of
+this doc reported the cortex_m backend leading on latency; the
+20-step optimization sequence flipped that, and the fusion work
+locked in a memory advantage on top.
 
 ### How we got the cortex_m FVP number
 
@@ -135,10 +150,13 @@ the PMU conversion.
 | 19 | `cceb6afffe` | requantize: drop vandq mask in fixup (shift < 0 in MV2; saves 1 op/call) | 18,427,836 | 147,422,689 | 1.012× | 7.85× |
 | 20 | `3e19bb5ab9` | epilogue: compound-literal init `{a0,a1,a2,a3}` skips `vdupq_n_s32(0)` | **18,206,232** | **145,649,857** | 1.012× | **7.95×** |
 
-Headline: **7.50× faster than the original baseline**, bit-exact output
+Headline: **7.95× faster than the scalar baseline**, bit-exact output
 across all 1000 logits.  cortex_m backend on the same FVP/PMU: 172.2M
-PMU — standalone is now **10.4% FASTER than cortex_m / CMSIS-NN**
-(154.3M vs 172.2M PMU, 17.9M cycle margin).
+PMU — standalone is now **15.4% FASTER than cortex_m / CMSIS-NN**
+(145.6M vs 172.2M PMU, 26.6M cycle margin) at the kernel ceiling.
+After the AOT fusion work (documented later in the doc) the standalone
+latency is 151.9M PMU — still 11.7% faster than cortex_m, plus a
+3.86× memory advantage that cortex_m has no path to today.
 
 ### What each experiment did
 
@@ -284,17 +302,23 @@ distribution may include positive values.
 
 ## Memory footprint
 
-Section sizes for the full MV2 standalone binary today (after all five
-optimizations):
+Section sizes for the full MV2 standalone binary (width-mult 1.0,
+input 224, with Phase A + B fusion enabled):
 
 | Section | Bytes | Contents |
 |---|---:|---|
-| `.text`             |     65,840 | 8 static kernels + entry point + ARMCM55 startup + newlib stubs |
-| `.rodata`           |  4,233,180 | ~3.4 MB int8 weights + ~200 KB per-channel mults/shifts + ~30 KB LayerParams + ~600 KB FVP input fixture |
-| `.arena_ddr`        |  1,505,280 | activation arena (exir greedy planner) |
+| `.text`             |    ~75,000 | 11 static kernels (conv2d, dwconv2d, add, avgpool, gemv, quantize, fused expand+dw, fused expand+dw+project, fused dw+project, fused stem+dw+project, requantize helpers) + entry point + ARMCM55 startup + newlib stubs |
+| `.rodata`           |  ~4,200,000 | ~3.4 MB int8 weights + ~200 KB per-channel mults/shifts + ~30 KB LayerParams + ~600 KB FVP input fixture |
+| `.bss.tensor_arena` |    351,232 | activation arena (exir greedy planner output after fusion ops absorbed expand/dwconv/project intermediates) |
+| `.bss.fused_scratch`|     38,976 | rolling-buffer scratch for fused kernels (max across all fused layers in the schedule) |
 | `.data`             |      2,068 | initialized statics |
 | `.bss`              |      1,996 | uninitialized statics |
 | Stack / heap        | 64 KB each | reserved in DTCM |
+
+The arena+scratch total is **390 KB** at 1.0/224 — a 74% reduction
+from the 1,505,280 byte unfused baseline.  At smaller (width,
+resolution) configs the arena+scratch goes as low as 54 KB (0.35/96)
+per the pareto sweep in the model-level optimizations section below.
 
 Deployment notes for a real Cortex-M55 SoC:
 
@@ -302,14 +326,14 @@ Deployment notes for a real Cortex-M55 SoC:
   the FVP runner; a real device feeds input via DMA / sensor stream
   / memory-mapped buffer, saving 600 KB of `.rodata` immediately.
   Build flag: omit `runner_fvp.cpp` from sources.
-- **Arena placement.**  The 1.5 MB arena fits in any cortex-M55 with
-  external SRAM/PSRAM; on chips with only TCM it needs to live in
-  DDR.  Same constraint applies to the cortex_m backend at the same
-  planner output.
-- **Weights in flash.**  The 3.4 MB of int8 weights fit in
-  most Cortex-M55 SoCs' embedded flash; if not, an external QSPI
-  bank works (slower load, runs from cached XIP).
-- **Code in ITCM.**  At ~66 KB, `.text` fits comfortably in any
+- **Arena placement.**  390 KB at 1.0/224 fits in any Cortex-M55 SoC
+  with >=512 KB SRAM.  Smaller width/resolution configs (per pareto
+  table) reach 54-95 KB, fitting devices with as little as 64 KB
+  SRAM.
+- **Weights in flash.**  The 3.4 MB of int8 weights fit in most
+  Cortex-M55 SoCs' embedded flash; if not, an external QSPI bank
+  works (slower load, runs from cached XIP).
+- **Code in ITCM.**  At ~75 KB, `.text` fits comfortably in any
   Cortex-M55 ITCM (typical 256 KB / 512 KB).
 
 ## Side-by-side static comparison vs cortex_m backend
@@ -317,75 +341,86 @@ Deployment notes for a real Cortex-M55 SoC:
 The static comparison comes from `arm-none-eabi-size` on both ELFs
 built fresh in the same toolchain with logging + event tracer off:
 
-| Axis | Standalone (this dir, after 5 commits) | cortex_m backend (rebuilt fresh) |
+| Axis | Standalone (this dir, with fusion) | cortex_m backend (rebuilt fresh) |
 |---|---:|---:|
-| `.text` runtime code | **65,840 B** | **154,872 B** (incl. ExecuTorch runtime, flatbuffer parser, CMSIS-NN library, Ethos-U driver code that's compiled but unused) |
+| `.text` runtime code | **~75,000 B** | **154,872 B** (incl. ExecuTorch runtime, flatbuffer parser, CMSIS-NN library, Ethos-U driver code that's compiled but unused) |
 | Weight payload | ~3.4 MB int8 in `.rodata` | 3,996,416 B `.pte` (flatbuffer-wrapped weights) |
-| Activation arena | 1,505,280 B | 1,505,280 B (same exir greedy plan) |
+| Activation arena + scratch | **390,208 B** (arena 351,232 + fused scratch 38,976) | 1,505,280 B (exir greedy plan; cortex_m has no fusion path) |
 | Per-op dispatch overhead | inlined — ~0 cycles per layer | function-pointer dispatch via `KernelRuntimeContext`, per-op `Tensor` view setup, per-op `allocate_temp` calls |
 
-The standalone code is ~58% smaller (89 KB savings), driven almost
-entirely by the absent runtime — no Program / Method machinery, no
-flatbuffer parser, no CMSIS-NN library wrappers.
+The standalone code is ~52% smaller (80 KB savings) and the activation
+footprint is **3.86× smaller** after fusion.  Both wins are driven by
+the same architectural choice — no runtime, no Program/Method
+machinery, no flatbuffer parser — plus the fusion passes that absorb
+op chains into single inlined kernels with streaming scratch
+intermediates.
 
-FVP-vs-FVP latency comparison (full MV2, Corstone-300, PMU CCNTR):
+FVP-vs-FVP latency comparison (full MV2-1.0/r=224, Corstone-300, PMU CCNTR):
 
 | | PMU cycles | vs cortex_m |
 |---|---:|---:|
-| Standalone (baseline)                | ~1,157,829,208 (DWT 144,728,651 × 8) | 0.15× (much slower) |
-| Standalone (after 5 commits)         | **373,751,624** | **0.46× (2.17× slower)** |
-| cortex_m backend (CMSIS-NN)          | **172,218,932** | 1.00× |
+| Standalone (scalar baseline `e6f5623e65`)         | ~1,157,829,208 | 0.15× (~6.7× slower) |
+| Standalone (after 20 kernel-tuning commits)       | **145,649,857** | **1.18× (15.4% faster)** |
+| **Standalone (full fusion, Phases A + B)**        | **151,938,342** | **1.13× (11.7% faster)** |
+| cortex_m backend (CMSIS-NN)                       | **172,218,932** | 1.00× |
 
-So **cortex_m is faster than our standalone on this FVP**, by ~2.17×
-after our five optimization commits and by ~6.7× before them.
+So **standalone is now faster than cortex_m on this FVP** at both
+the kernel-only ceiling and with all fusion applied.  The 4.3% latency
+cost of the fusion work is more than offset by the 74% arena
+reduction it delivers — at the headline config the standalone path
+needs 390 KB total memory vs cortex_m's 1,505 KB.
 
-### Why cortex_m is faster (likely)
+### Why the standalone path wins on latency
 
-The earlier version of this document tried to explain a 3.69× win
-in our favor that turned out to be the counter mismatch.  The actual
-direction of the comparison flips that — cortex_m wins.  The most
-likely reasons it does:
+Earlier versions of this document reported cortex_m as the latency
+leader (2.17× faster).  The 20-step kernel-tuning progression below
+reversed that.  The four largest contributors:
 
-1. **CMSIS-NN inner kernels are heavily tuned.**  `arm_nn_mat_mult_nt_t_s8`
-   is hand-written inline asm with one cycle per `vmladava.s8` in the
-   steady state, and an `lcalc`-style hardware loop wrapper.  Our
-   intrinsic-driven kernels rely on GCC to schedule the same
-   instructions — for the 4-OC × 2-pixel tile the compiler does a
-   reasonable job, but there's room.
-2. **Im2Col reuses + larger output tiles.**  CMSIS-NN's `arm_convolve_s8`
-   pre-converts the input window into a column-major scratch buffer
-   per output row, then runs the matmul over a wide row × all-of-OC
-   tile.  This amortizes outer-loop bookkeeping more than our
-   per-output-pixel kernel.  We pay an arena cost (the cortex_m
-   arena and ours are the same size, so the scratch is included);
-   they recover the cycles.
-3. **Activation buffer reuse across calls.**  CMSIS-NN's wrapper
-   passes `cmsis_nn_context` that holds the Im2Col scratch across
-   layers, avoiding any per-call zero-init.  Our kernels each write
-   their full output once; that's nominally equivalent, but they
-   also each pay per-call function entry/exit + register spill cost
-   because GCC can't always inline through every call site.
-4. **Vector load alignment & contiguous strides.**  CMSIS-NN's
-   layouts (and the input-offset AOT-fold pattern in their kernels)
-   are tuned for the specific stride patterns CMSIS-NN's matmul
-   expects.  Our generic NHWC layout occasionally produces
-   non-contiguous weight reads in the depthwise kernels.
+1. **Inline-asm `wlstp`/`letp` for the 1x1 conv inner.**  Step 11
+   replaced GCC-scheduled `vmladavaq_s8` intrinsics with hand-written
+   asm that pairs 2 output pixels x 4 OCs across a single `wlstp.8`
+   tail-predicated loop.  Hits the asymptotic 2 ops/output limit
+   under the 7-even-GPR `+Te` constraint on `vmladava.s8` accumulators.
+2. **4-pixel x 4-channel dwconv tile.**  Step 7 added a sliding-window
+   tile that shares 3 weight loads across 4 adjacent output pixels.
+   2.06 ops/output on the dominant 3x3 stride-1 dwconv path.
+3. **AOT-folded `input_offset` into bias.**  Steps 2 and 17 fold the
+   per-tap `+input_offset` math into the bias when all kernel taps
+   contribute uniformly (1x1 conv always; dwconv interior pixels via
+   `bias_with_offset_full`).  Eliminates one vector add per inner
+   iteration.
+4. **First-conv packed-32 im2col path.**  Step 8 added a hand-tuned
+   path for the Cin=3 stem (3x3 stride-2 pad-1) — the MVE 16-wide
+   reduction can't reach for Cin=3, but a pre-packed 32-byte weight
+   layout + per-pixel im2col patch lets us run 2 `vmladavaq_s8` per
+   OC pair.  ~6x over the scalar fallback.
 
-Splitting the 2.17× cleanly between these would require per-layer
-cycle sampling, which we haven't done.
+CMSIS-NN's inner kernels are also heavily tuned (one cycle per
+`vmladava.s8` in steady state with an `lcalc`-style hardware loop),
+so the standalone advantage doesn't come from raw inner-loop speed.
+It comes from outer-loop overhead being minimal: kernels are
+inlined into the entry-point call sequence with constant-folded
+shapes (no `KernelRuntimeContext` setup per op, no `Tensor` view
+construction per call, no `allocate_temp` overhead), and the
+weights+bias+requantize layout is chosen at AOT time per layer to
+match the inner-loop access pattern.
 
-### Where the standalone path still wins
+### Where the standalone path still wins beyond latency
 
-- **Code size:** 65,840 B vs CMSIS-NN test runner's 478,960 B (or
-  ~154 KB for a hardcoded-model production cortex_m runner).  No
+- **Code size:** ~75 KB `.text` vs CMSIS-NN test runner's 478,960 B
+  (or ~154 KB for a hardcoded-model production cortex_m runner).  No
   ExecuTorch Program/Method machinery, no flatbuffer parser, no
   Ethos-U driver code.
+- **Arena memory:** 351 KB vs cortex_m's 1,505 KB at the same shape
+  after the fusion work.  cortex_m has no equivalent fusion path
+  available today.
 - **No runtime dependency.**  The standalone path is a single C
   function with no calls into ExecuTorch.  Easier to slot into a
   baremetal RTOS task with no DDR or filesystem.
 - **AOT memory plan reuse.**  We still use exir's `greedy` planner
-  to produce the activation arena offsets, so the arena size matches
-  cortex_m's exactly.
+  to produce the activation arena offsets, then the fusion passes
+  replace tensor-materializing op chains with single ops that stream
+  intermediates through `mv2_fused_scratch`.
 
 ### Instruction-level verification
 
@@ -730,26 +765,72 @@ bit-exact validation across the full sweep.
 
 ## Outstanding work / next experiments
 
-The kernel and fusion work has hit a strong stopping point.  Real
-silicon validation would be the natural next step.
+The kernel and AOT fusion work has hit a strong stopping point on
+MV2 specifically.  Items below in roughly descending priority.
 
-- **Real silicon / MPS3 FPGA.**  All numbers here are Corstone-300 FVP,
-  which doesn't model cache behavior.  An MPS3 FPGA running the
-  Cortex-M55 RTL, or any real Cortex-M55 SoC (Alif Ensemble, Himax
-  WiseEye, etc.), would let us validate that the FVP rankings hold and
-  measure DDR-bandwidth savings from fusion (which are invisible on
-  FVP).
-- **Apply to other models.**  KWT, MCUNet-VWW, Silero-VAD, Tinyissimo-
-  YOLO all exist in the repo at `examples/models/`.  Running the same
-  MVE kernel work + fusion on one of these would test portability of
-  the abstractions.
-- **Conditional 3/4-op fusion at width-0.35.**  The pass currently
-  fuses unconditionally and incurs a small regression at width-0.35
-  where the dwconv-output it eliminates is smaller than the scratch
-  it adds.  An arena-impact-aware match predicate would fix this.
-- **Specialize the first 3×3 conv (`Cin = 3`).**  Mentioned previously
-  and still relevant — that layer falls to the scalar fallback for
-  the standalone path and probably contributes ~5 M cycles.
+### Recently completed (kept here for context, since SUMMARY.md is the running log)
+
+- ✅ **20-step kernel tuning progression**: from scalar baseline to
+  ~15.4% faster than CMSIS-NN at the same shape.  See the
+  progression table above.
+- ✅ **Pareto sweep across 20 (width, resolution) configs**: full
+  matrix of width-mult ∈ {1.0, 0.75, 0.5, 0.35} × resolution ∈ {224,
+  192, 160, 128, 96}, all measured on FVP.
+- ✅ **2-op fusion** (`ExpandDwconvFusionPass`): -33-48% arena across
+  the pareto.
+- ✅ **3/4-op fusion** (`ExpandDwconvProjectFusionPass`): full
+  inverted-residual block + optional residual add absorbed into a
+  single fused op.
+- ✅ **Conditional pass-pipeline picker in `export_mv2.py`**: runs
+  both pipelines and picks the smaller; eliminated the small
+  width-0.35 regression where 3/4-op added more scratch than the
+  arena it freed.
+- ✅ **Phase A** (`DwconvProjectFusionPass`): handles MV2's
+  expand_ratio=1 first block (-25% arena at 1.0/224).
+- ✅ **Phase B** (`StemDwconvProjectFusionPass`): absorbs the stem
+  conv into the fused chain (-42% additional arena at 1.0/224,
+  -1.9% latency).
+- ✅ **First 3×3 conv (Cin=3) specialization**: handled by step 8
+  (packed-32 im2col path); ~5.7% of total inference today.
+- ✅ **Phase C** (stem 2-pixel batching): tried, no measurable
+  speedup (compiler register pressure offset the load savings).
+  Kept as a code consolidation that collapsed conv2d_s8's stem path
+  into a shared helper.
+- ✅ **KWT-1 generalization probe**: confirmed the kernel + fusion
+  stack is CNN-shaped.  Transformers expose a substantial gap
+  (LayerNorm, GELU, BMM, properly-tuned Softmax all missing from
+  cortex_m + standalone).  Gap analysis documented; treated as a
+  separate project.
+
+### Still on the table
+
+- **Real silicon / MPS3 FPGA validation.**  All numbers here are
+  Corstone-300 FVP, which doesn't model cache behavior.  Real
+  Cortex-M55 silicon (Alif Ensemble, Himax WiseEye, etc.) or an MPS3
+  FPGA running the Cortex-M55 RTL would let us validate that the FVP
+  rankings hold and measure DDR-bandwidth savings from fusion (which
+  are entirely invisible on FVP).  *Prerequisite for any external
+  deployment claim.*
+- **Generalize to a CNN model that's TinyML-native.**  MCUNet-VWW,
+  Silero-VAD, Tinyissimo-YOLO are in the repo.  Most-aligned
+  capability-test that's bounded scope (KWT exposed transformer-
+  shaped gaps; MCUNet-VWW is CNN-shaped).
 - **Drop the FVP fixture from production builds.**  Trivial CMake
   option that omits `runner_fvp.cpp` + `input_fixture.h`; saves
   600 KB of `.rodata` immediately.
+- **Phase D — head epilogue batching.**  Tried analytically; max
+  saving is below noise (~0.02-0.5% of total).  Worth ~half a day
+  if pursued.
+- **Phase E — multi-block fusion.**  Blocked for the obvious
+  candidates because most consecutive same-spatial blocks in MV2
+  have residual adds whose skip path needs the block-boundary
+  tensor materialized.  Would need a different fusion shape
+  (e.g., dual-output streaming where one output goes to the add
+  and one continues to the next block) to be viable.
+- **Quantization-level optimization** (int4 weights, mixed-precision
+  activations).  Substantial separate project; could halve weight
+  memory and selectively compress late-layer activations.
+- **Transformer kernel set** (for KWT and friends).  LayerNorm,
+  GELU, BMM, properly-tuned Softmax for cortex_m + standalone MVE.
+  Multi-week project; would unlock transformer-class models on the
+  same backend.
