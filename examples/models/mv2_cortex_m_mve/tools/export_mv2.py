@@ -116,23 +116,93 @@ def main() -> None:
             _check_ir_validity=False,
         ),
     )
-    if args.fuse_inverted_residual:
-        pass_list = CortexMPassManager.pass_list_with_inverted_residual_fusion
-    elif args.fuse_expand_dwconv:
-        pass_list = CortexMPassManager.pass_list_with_expand_dwconv_fusion
-    else:
-        pass_list = CortexMPassManager.pass_list
-    program = CortexMPassManager(
-        edge.exported_program(), pass_list
-    ).transform()
 
     fixture = example_input.permute(0, 2, 3, 1).contiguous().reshape(1, 1, -1)
 
-    ref_float = program.module()(example_input)
-    top1 = int(ref_float.argmax(dim=-1).item())
-    print(f"Float top-1: {top1}")
+    def _build_schedule(pass_list):
+        """Re-run the post-edge pipeline with the given pass list and run
+        the dump (which invokes the memory planner).  Returns the schedule
+        and a reference float-output (computed from the pass-transformed
+        program so that the int8 reference saved at the end matches the
+        actual artifacts in the dump directory)."""
+        prog = CortexMPassManager(
+            edge.exported_program(), pass_list
+        ).transform()
+        ref = prog.module()(example_input)
+        top1 = int(ref.argmax(dim=-1).item())
+        return prog, ref, top1
 
-    schedule = dump(program, args.out_dir, input_fixture=fixture, expected_top1=top1)
+    # When 3/4-op fusion is requested, run both that pipeline and the 2-op
+    # fallback, then dump whichever has the smaller total (arena + fused
+    # scratch).  This avoids the small-shape regression where the planner
+    # finds zero arena reduction from the extra fusion and the scratch
+    # addition is pure overhead.  Width-1.0 and width-0.5 invariably pick
+    # ires; width-0.35 invariably picks 2-op.
+    import shutil
+    import tempfile
+    candidate_pass_lists: list[tuple[str, list]] = []
+    if args.fuse_inverted_residual:
+        candidate_pass_lists = [
+            ("inverted_residual", CortexMPassManager.pass_list_with_inverted_residual_fusion),
+            ("expand_dwconv", CortexMPassManager.pass_list_with_expand_dwconv_fusion),
+        ]
+    elif args.fuse_expand_dwconv:
+        candidate_pass_lists = [
+            ("expand_dwconv", CortexMPassManager.pass_list_with_expand_dwconv_fusion),
+        ]
+    else:
+        candidate_pass_lists = [("none", CortexMPassManager.pass_list)]
+
+    best_total = None
+    best_tag = None
+    best_dump_dir: Path | None = None
+    best_schedule = None
+    best_ref_float = None
+    best_top1 = None
+    for tag, pl in candidate_pass_lists:
+        prog, ref_float, top1 = _build_schedule(pl)
+        tmp_dir = Path(tempfile.mkdtemp(prefix=f"mv2_export_{tag}_"))
+        sched = dump(prog, tmp_dir, input_fixture=fixture, expected_top1=top1)
+        # Total = arena + fused scratch.
+        scratch = 0
+        arena_h = (tmp_dir / "mv2_arena.h").read_text()
+        import re
+        m = re.search(r"MV2_FUSED_SCRATCH_BYTES\s+(\d+)u", arena_h)
+        if m is not None:
+            scratch = int(m.group(1))
+        total = sched.arena_bytes + scratch
+        print(f"  candidate '{tag}': arena={sched.arena_bytes} scratch={scratch} total={total}")
+        if best_total is None or total < best_total:
+            if best_dump_dir is not None:
+                shutil.rmtree(best_dump_dir, ignore_errors=True)
+            best_total = total
+            best_tag = tag
+            best_dump_dir = tmp_dir
+            best_schedule = sched
+            best_ref_float = ref_float
+            best_top1 = top1
+        else:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    assert best_dump_dir is not None
+    print(f"Picked pass pipeline: {best_tag} (total bytes = {best_total})")
+
+    # Move the winning artifacts into the user-requested out_dir.
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    for child in best_dump_dir.iterdir():
+        dest = args.out_dir / child.name
+        if dest.exists():
+            if dest.is_file():
+                dest.unlink()
+            else:
+                shutil.rmtree(dest)
+        shutil.move(str(child), dest)
+    shutil.rmtree(best_dump_dir, ignore_errors=True)
+
+    schedule = best_schedule
+    ref_float = best_ref_float
+    top1 = best_top1
+    print(f"Float top-1: {top1}")
 
     scale = schedule.output_scale
     zp = schedule.output_zero_point

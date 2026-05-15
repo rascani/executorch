@@ -628,7 +628,16 @@ only 4-5% additional gain because the 2-op fusion already eliminated
 the dominant peak.  **Width-0.35 is a small regression** in both axes:
 the extra scratch (dwconv-row + project-row) grows faster than the
 eliminated dwconv-output tensor when the channel counts are very small.
-A future refinement would condition the pass on per-block arena impact.
+
+The issue is planner-level, not per-block: at width-0.35, the planner
+finds no arena reduction even though per-block math is favorable
+(every block has eliminated bytes >> scratch added), because the
+global peak is determined by tensors that 3/4-op fusion doesn't touch.
+The fix lives in the export tool: when `--fuse-inverted-residual` is
+set, `tools/export_mv2.py` runs both the 2-op and 3/4-op planning
+passes and picks the one with smaller total (arena + scratch).
+Width-1.0/0.75/0.5 invariably pick ires; width-0.35 invariably picks
+2-op.  No regressions in the final pareto.
 
 ### Combined headline: pareto frontier across all 20 configs (3/4-op fused)
 
