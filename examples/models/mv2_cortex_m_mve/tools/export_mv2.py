@@ -79,6 +79,13 @@ def main() -> None:
              "project-output intermediates from the arena. Implies "
              "--fuse-expand-dwconv.",
     )
+    parser.add_argument(
+        "--fuse-phase-g", action="store_true",
+        help="Experimental: also fuse the quantize_per_tensor + stem + B0 +"
+             " B1 into a single op. Implies --fuse-inverted-residual. The"
+             " picker still falls back to the lighter pipelines if Phase G"
+             " produces a larger arena+scratch total.",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -141,7 +148,13 @@ def main() -> None:
     import shutil
     import tempfile
     candidate_pass_lists: list[tuple[str, list]] = []
-    if args.fuse_inverted_residual:
+    if args.fuse_phase_g:
+        candidate_pass_lists = [
+            ("phase_g", CortexMPassManager.pass_list_with_phase_g),
+            ("inverted_residual", CortexMPassManager.pass_list_with_inverted_residual_fusion),
+            ("expand_dwconv", CortexMPassManager.pass_list_with_expand_dwconv_fusion),
+        ]
+    elif args.fuse_inverted_residual:
         candidate_pass_lists = [
             ("inverted_residual", CortexMPassManager.pass_list_with_inverted_residual_fusion),
             ("expand_dwconv", CortexMPassManager.pass_list_with_expand_dwconv_fusion),

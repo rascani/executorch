@@ -364,4 +364,94 @@ typedef struct {
   int8_t  residual_activation_max;
 } FusedInvertedResidualParams;
 
+typedef struct {
+  /* Phase G: float input + quantize + stem 3x3 + B0 dwconv + B0 project
+   * + B1 expand + B1 dwconv + B1 project, all streamed through nested
+   * rolling buffers.  B0's project output (e.g. 16ch x 112^2 = 200 KB at
+   * 1.0/224) never materializes — its rows feed B1's 1x1 expand directly.
+   * The largest intermediate that does exist is the B1-expand output
+   * rolling buffer (3 rows of expand_out_c bytes at B1's input spatial).
+   */
+  uint32_t in_h, in_w, in_c;        /* input spatial (224x224x3 for MV2) */
+  uint32_t stem_out_h, stem_out_w;
+  uint32_t stem_out_c;
+  uint32_t b0_out_h, b0_out_w;      /* B0 project output spatial = stem output spatial */
+  uint32_t b0_project_out_c;
+  uint32_t b1_dw_out_h, b1_dw_out_w;
+  uint32_t out_h, out_w;            /* B1 project output spatial */
+  uint32_t b1_project_out_c;
+  uint32_t stem_kernel_h, stem_kernel_w;
+  uint32_t stem_stride_h, stem_stride_w;
+  uint32_t stem_pad_h, stem_pad_w;
+  uint32_t b0_dw_kernel_h, b0_dw_kernel_w;
+  uint32_t b0_dw_stride_h, b0_dw_stride_w;
+  uint32_t b0_dw_pad_h, b0_dw_pad_w;
+  uint32_t b1_dw_kernel_h, b1_dw_kernel_w;
+  uint32_t b1_dw_stride_h, b1_dw_stride_w;
+  uint32_t b1_dw_pad_h, b1_dw_pad_w;
+  /* Per-tensor quantize params for the input. */
+  float quant_scale;
+  int32_t quant_zero_point;
+  int32_t quant_qmin;
+  int32_t quant_qmax;
+  /* Stem 3x3 */
+  const int8_t*  stem_weight;
+  const int8_t*  stem_weight_packed_32;
+  const int32_t* stem_bias;
+  const int32_t* stem_requant_mults;
+  const int8_t*  stem_requant_shifts;
+  int32_t stem_input_offset;
+  int32_t stem_output_offset;
+  int8_t  stem_activation_min;
+  int8_t  stem_activation_max;
+  /* B0 dwconv 3x3 */
+  const int8_t*  b0_dw_weight;
+  const int32_t* b0_dw_bias;
+  const int32_t* b0_dw_bias_with_offset_full;
+  const int32_t* b0_dw_requant_mults;
+  const int8_t*  b0_dw_requant_shifts;
+  int32_t b0_dw_input_offset;
+  int32_t b0_dw_output_offset;
+  int8_t  b0_dw_activation_min;
+  int8_t  b0_dw_activation_max;
+  /* B0 project 1x1 */
+  const int8_t*  b0_project_weight;
+  const int32_t* b0_project_bias;
+  const int32_t* b0_project_requant_mults;
+  const int8_t*  b0_project_requant_shifts;
+  int32_t b0_project_input_offset;
+  int32_t b0_project_output_offset;
+  int8_t  b0_project_activation_min;
+  int8_t  b0_project_activation_max;
+  /* B1 expand 1x1 */
+  const int8_t*  b1_expand_weight;
+  const int32_t* b1_expand_bias;
+  const int32_t* b1_expand_requant_mults;
+  const int8_t*  b1_expand_requant_shifts;
+  int32_t b1_expand_input_offset;
+  int32_t b1_expand_output_offset;
+  int8_t  b1_expand_activation_min;
+  int8_t  b1_expand_activation_max;
+  uint32_t b1_expand_out_c;
+  /* B1 dwconv 3x3 */
+  const int8_t*  b1_dw_weight;
+  const int32_t* b1_dw_bias;
+  const int32_t* b1_dw_bias_with_offset_full;
+  const int32_t* b1_dw_requant_mults;
+  const int8_t*  b1_dw_requant_shifts;
+  int32_t b1_dw_input_offset;
+  int32_t b1_dw_output_offset;
+  int8_t  b1_dw_activation_min;
+  int8_t  b1_dw_activation_max;
+  /* B1 project 1x1 */
+  const int8_t*  b1_project_weight;
+  const int32_t* b1_project_bias;
+  const int32_t* b1_project_requant_mults;
+  const int8_t*  b1_project_requant_shifts;
+  int32_t b1_project_input_offset;
+  int32_t b1_project_output_offset;
+  int8_t  b1_project_activation_min;
+  int8_t  b1_project_activation_max;
+} FusedQuantizeStemInvertedResidualParams;
+
 #endif

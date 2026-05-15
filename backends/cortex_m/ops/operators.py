@@ -1741,6 +1741,215 @@ def quantize_stem_dwconv2d_conv2d_fused_impl_skip_quant(q, *args):
 
 
 # ===================================================================
+# Phase G: quantize + stem + B0 + B1 mega-fusion.
+#
+# Extends the quantize_stem_dwconv2d_conv2d_fused op (Phase F) to also
+# absorb the following inverted-residual block (B1 in MV2 terms).  The
+# B0 project output (16 channels x 112^2 = 200 KB at 1.0/224) never
+# materializes — it streams row-by-row into B1's expand via a 3-row
+# rolling buffer.  Phase G is the deepest fusion we do: 4 nested
+# rolling buffers (quantized input -> stem output -> B0 project ->
+# B1 expand) plus the per-call dwconv and project row scratches.
+# ===================================================================
+
+lib.define(
+    "quantize_stem_inverted_residual_fused("
+    "Tensor input, "
+    "float quant_scale, int quant_zero_point, int quant_qmin, int quant_qmax, "
+    "Tensor stem_weight, Tensor? stem_bias, "
+    "int stem_input_offset, int stem_output_offset, "
+    "Tensor stem_requantize_multipliers, Tensor stem_requantize_shifts, "
+    "int stem_activation_min, int stem_activation_max, "
+    "Tensor b0_dw_weight, Tensor? b0_dw_bias, "
+    "int[] b0_dw_stride, int[] b0_dw_padding, "
+    "int b0_dw_input_offset, int b0_dw_output_offset, "
+    "Tensor b0_dw_requantize_multipliers, Tensor b0_dw_requantize_shifts, "
+    "int b0_dw_activation_min, int b0_dw_activation_max, "
+    "Tensor b0_project_weight, Tensor? b0_project_bias, "
+    "int b0_project_input_offset, int b0_project_output_offset, "
+    "Tensor b0_project_requantize_multipliers, Tensor b0_project_requantize_shifts, "
+    "int b0_project_activation_min, int b0_project_activation_max, "
+    "Tensor b1_expand_weight, Tensor? b1_expand_bias, "
+    "int b1_expand_input_offset, int b1_expand_output_offset, "
+    "Tensor b1_expand_requantize_multipliers, Tensor b1_expand_requantize_shifts, "
+    "int b1_expand_activation_min, int b1_expand_activation_max, "
+    "Tensor b1_dw_weight, Tensor? b1_dw_bias, "
+    "int[] b1_dw_stride, int[] b1_dw_padding, "
+    "int b1_dw_input_offset, int b1_dw_output_offset, "
+    "Tensor b1_dw_requantize_multipliers, Tensor b1_dw_requantize_shifts, "
+    "int b1_dw_activation_min, int b1_dw_activation_max, "
+    "Tensor b1_project_weight, Tensor? b1_project_bias, "
+    "int b1_project_input_offset, int b1_project_output_offset, "
+    "Tensor b1_project_requantize_multipliers, Tensor b1_project_requantize_shifts, "
+    "int b1_project_activation_min, int b1_project_activation_max"
+    ") -> Tensor"
+)
+
+
+lib.define(
+    "quantize_stem_inverted_residual_fused.out("
+    "Tensor input, "
+    "float quant_scale, int quant_zero_point, int quant_qmin, int quant_qmax, "
+    "Tensor stem_weight, Tensor? stem_bias, "
+    "int stem_input_offset, int stem_output_offset, "
+    "Tensor stem_requantize_multipliers, Tensor stem_requantize_shifts, "
+    "int stem_activation_min, int stem_activation_max, "
+    "Tensor b0_dw_weight, Tensor? b0_dw_bias, "
+    "int[] b0_dw_stride, int[] b0_dw_padding, "
+    "int b0_dw_input_offset, int b0_dw_output_offset, "
+    "Tensor b0_dw_requantize_multipliers, Tensor b0_dw_requantize_shifts, "
+    "int b0_dw_activation_min, int b0_dw_activation_max, "
+    "Tensor b0_project_weight, Tensor? b0_project_bias, "
+    "int b0_project_input_offset, int b0_project_output_offset, "
+    "Tensor b0_project_requantize_multipliers, Tensor b0_project_requantize_shifts, "
+    "int b0_project_activation_min, int b0_project_activation_max, "
+    "Tensor b1_expand_weight, Tensor? b1_expand_bias, "
+    "int b1_expand_input_offset, int b1_expand_output_offset, "
+    "Tensor b1_expand_requantize_multipliers, Tensor b1_expand_requantize_shifts, "
+    "int b1_expand_activation_min, int b1_expand_activation_max, "
+    "Tensor b1_dw_weight, Tensor? b1_dw_bias, "
+    "int[] b1_dw_stride, int[] b1_dw_padding, "
+    "int b1_dw_input_offset, int b1_dw_output_offset, "
+    "Tensor b1_dw_requantize_multipliers, Tensor b1_dw_requantize_shifts, "
+    "int b1_dw_activation_min, int b1_dw_activation_max, "
+    "Tensor b1_project_weight, Tensor? b1_project_bias, "
+    "int b1_project_input_offset, int b1_project_output_offset, "
+    "Tensor b1_project_requantize_multipliers, Tensor b1_project_requantize_shifts, "
+    "int b1_project_activation_min, int b1_project_activation_max, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+
+
+@register_fake("cortex_m::quantize_stem_inverted_residual_fused")  # type: ignore[misc]
+def quantize_stem_inverted_residual_fused_meta(
+    input: torch.Tensor,
+    quant_scale: float, quant_zero_point: int,
+    quant_qmin: int, quant_qmax: int,
+    stem_weight: torch.Tensor, stem_bias: torch.Tensor | None,
+    stem_input_offset: int, stem_output_offset: int,
+    stem_requantize_multipliers: torch.Tensor, stem_requantize_shifts: torch.Tensor,
+    stem_activation_min: int, stem_activation_max: int,
+    b0_dw_weight: torch.Tensor, b0_dw_bias: torch.Tensor | None,
+    b0_dw_stride: Sequence[int], b0_dw_padding: Sequence[int],
+    b0_dw_input_offset: int, b0_dw_output_offset: int,
+    b0_dw_requantize_multipliers: torch.Tensor, b0_dw_requantize_shifts: torch.Tensor,
+    b0_dw_activation_min: int, b0_dw_activation_max: int,
+    b0_project_weight: torch.Tensor, b0_project_bias: torch.Tensor | None,
+    b0_project_input_offset: int, b0_project_output_offset: int,
+    b0_project_requantize_multipliers: torch.Tensor, b0_project_requantize_shifts: torch.Tensor,
+    b0_project_activation_min: int, b0_project_activation_max: int,
+    b1_expand_weight: torch.Tensor, b1_expand_bias: torch.Tensor | None,
+    b1_expand_input_offset: int, b1_expand_output_offset: int,
+    b1_expand_requantize_multipliers: torch.Tensor, b1_expand_requantize_shifts: torch.Tensor,
+    b1_expand_activation_min: int, b1_expand_activation_max: int,
+    b1_dw_weight: torch.Tensor, b1_dw_bias: torch.Tensor | None,
+    b1_dw_stride: Sequence[int], b1_dw_padding: Sequence[int],
+    b1_dw_input_offset: int, b1_dw_output_offset: int,
+    b1_dw_requantize_multipliers: torch.Tensor, b1_dw_requantize_shifts: torch.Tensor,
+    b1_dw_activation_min: int, b1_dw_activation_max: int,
+    b1_project_weight: torch.Tensor, b1_project_bias: torch.Tensor | None,
+    b1_project_input_offset: int, b1_project_output_offset: int,
+    b1_project_requantize_multipliers: torch.Tensor, b1_project_requantize_shifts: torch.Tensor,
+    b1_project_activation_min: int, b1_project_activation_max: int,
+) -> torch.Tensor:
+    stem_shape = _compute_conv2d_output_shape(
+        input.shape, stem_weight.shape, (2, 2), (1, 1), (1, 1)
+    )
+    b0_dw_shape = _compute_depthwise_conv2d_output_shape(
+        stem_shape, b0_dw_weight.shape, list(b0_dw_stride), list(b0_dw_padding), [1, 1]
+    )
+    b0_project_shape = _compute_conv2d_output_shape(
+        b0_dw_shape, b0_project_weight.shape, (1, 1), (0, 0), (1, 1)
+    )
+    b1_expand_shape = _compute_conv2d_output_shape(
+        b0_project_shape, b1_expand_weight.shape, (1, 1), (0, 0), (1, 1)
+    )
+    b1_dw_shape = _compute_depthwise_conv2d_output_shape(
+        b1_expand_shape, b1_dw_weight.shape, list(b1_dw_stride), list(b1_dw_padding), [1, 1]
+    )
+    output_shape = _compute_conv2d_output_shape(
+        b1_dw_shape, b1_project_weight.shape, (1, 1), (0, 0), (1, 1)
+    )
+    return torch.empty(
+        output_shape,
+        dtype=torch.int8,
+        device=input.device,
+        memory_format=torch.channels_last,
+    )
+
+
+@impl(lib, "quantize_stem_inverted_residual_fused", "CompositeExplicitAutograd")  # type: ignore[misc]
+def quantize_stem_inverted_residual_fused_impl(
+    input: torch.Tensor,
+    quant_scale: float, quant_zero_point: int,
+    quant_qmin: int, quant_qmax: int,
+    stem_weight: torch.Tensor, stem_bias: torch.Tensor | None,
+    stem_input_offset: int, stem_output_offset: int,
+    stem_requantize_multipliers: torch.Tensor, stem_requantize_shifts: torch.Tensor,
+    stem_activation_min: int, stem_activation_max: int,
+    b0_dw_weight: torch.Tensor, b0_dw_bias: torch.Tensor | None,
+    b0_dw_stride: Sequence[int], b0_dw_padding: Sequence[int],
+    b0_dw_input_offset: int, b0_dw_output_offset: int,
+    b0_dw_requantize_multipliers: torch.Tensor, b0_dw_requantize_shifts: torch.Tensor,
+    b0_dw_activation_min: int, b0_dw_activation_max: int,
+    b0_project_weight: torch.Tensor, b0_project_bias: torch.Tensor | None,
+    b0_project_input_offset: int, b0_project_output_offset: int,
+    b0_project_requantize_multipliers: torch.Tensor, b0_project_requantize_shifts: torch.Tensor,
+    b0_project_activation_min: int, b0_project_activation_max: int,
+    b1_expand_weight: torch.Tensor, b1_expand_bias: torch.Tensor | None,
+    b1_expand_input_offset: int, b1_expand_output_offset: int,
+    b1_expand_requantize_multipliers: torch.Tensor, b1_expand_requantize_shifts: torch.Tensor,
+    b1_expand_activation_min: int, b1_expand_activation_max: int,
+    b1_dw_weight: torch.Tensor, b1_dw_bias: torch.Tensor | None,
+    b1_dw_stride: Sequence[int], b1_dw_padding: Sequence[int],
+    b1_dw_input_offset: int, b1_dw_output_offset: int,
+    b1_dw_requantize_multipliers: torch.Tensor, b1_dw_requantize_shifts: torch.Tensor,
+    b1_dw_activation_min: int, b1_dw_activation_max: int,
+    b1_project_weight: torch.Tensor, b1_project_bias: torch.Tensor | None,
+    b1_project_input_offset: int, b1_project_output_offset: int,
+    b1_project_requantize_multipliers: torch.Tensor, b1_project_requantize_shifts: torch.Tensor,
+    b1_project_activation_min: int, b1_project_activation_max: int,
+) -> torch.Tensor:
+    """Reference Python impl: compose the Phase F op then the 3/4-op
+    inverted-residual op.  Used only for AOT validation and shape
+    inference paths; the runtime kernel streams everything row-by-row."""
+    b0_out = quantize_stem_dwconv2d_conv2d_fused_impl(
+        input,
+        quant_scale, quant_zero_point, quant_qmin, quant_qmax,
+        stem_weight, stem_bias,
+        stem_input_offset, stem_output_offset,
+        stem_requantize_multipliers, stem_requantize_shifts,
+        stem_activation_min, stem_activation_max,
+        b0_dw_weight, b0_dw_bias, b0_dw_stride, b0_dw_padding,
+        b0_dw_input_offset, b0_dw_output_offset,
+        b0_dw_requantize_multipliers, b0_dw_requantize_shifts,
+        b0_dw_activation_min, b0_dw_activation_max,
+        b0_project_weight, b0_project_bias,
+        b0_project_input_offset, b0_project_output_offset,
+        b0_project_requantize_multipliers, b0_project_requantize_shifts,
+        b0_project_activation_min, b0_project_activation_max,
+    )
+    return quantized_conv2d_dwconv2d_conv2d_fused_impl(
+        b0_out,
+        b1_expand_weight, b1_expand_bias,
+        b1_expand_input_offset, b1_expand_output_offset,
+        b1_expand_requantize_multipliers, b1_expand_requantize_shifts,
+        b1_expand_activation_min, b1_expand_activation_max,
+        b1_dw_weight, b1_dw_bias, b1_dw_stride, b1_dw_padding,
+        b1_dw_input_offset, b1_dw_output_offset,
+        b1_dw_requantize_multipliers, b1_dw_requantize_shifts,
+        b1_dw_activation_min, b1_dw_activation_max,
+        b1_project_weight, b1_project_bias,
+        b1_project_input_offset, b1_project_output_offset,
+        b1_project_requantize_multipliers, b1_project_requantize_shifts,
+        b1_project_activation_min, b1_project_activation_max,
+        None,  # no residual at B1 (stride-2)
+        0, 0, 0, 0, 0, 0, 0, 0, 0, -128, 127,
+    )
+
+
+# ===================================================================
 # QUANTIZED TRANSPOSE_CONV2D OPERATION DEFINITION
 # ===================================================================
 

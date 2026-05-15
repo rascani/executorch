@@ -203,6 +203,82 @@ class FusedInvertedResidualLayer:
 
 
 @dataclass
+class FusedQuantizeStemInvertedResidualLayer:
+    """Phase G: quantize + stem + B0 (dwconv + project) + B1 (expand + dwconv
+    + project) all fused into one runtime call.  B0's project output never
+    materializes — its rows stream directly into B1's expand."""
+    kernel: str = "quantize_stem_inverted_residual_fused_s8"
+    input_name: str = ""
+    output: TensorSlot = None
+    num_input_elements: int = 0
+    quant_scale: float = 1.0
+    quant_zero_point: int = 0
+    quant_qmin: int = -128
+    quant_qmax: int = 127
+    # Stem
+    stem_weight: torch.Tensor = None
+    stem_bias: Optional[torch.Tensor] = None
+    stem_weight_packed_32: Optional[torch.Tensor] = None
+    stem_requantize_multipliers: torch.Tensor = None
+    stem_requantize_shifts: torch.Tensor = None
+    stem_input_offset: int = 0
+    stem_output_offset: int = 0
+    stem_activation_min: int = -128
+    stem_activation_max: int = 127
+    # B0 dwconv
+    b0_dw_weight: torch.Tensor = None
+    b0_dw_bias: Optional[torch.Tensor] = None
+    b0_dw_bias_with_offset_full: Optional[torch.Tensor] = None
+    b0_dw_requantize_multipliers: torch.Tensor = None
+    b0_dw_requantize_shifts: torch.Tensor = None
+    b0_dw_stride: tuple = (1, 1)
+    b0_dw_padding: tuple = (1, 1)
+    b0_dw_input_offset: int = 0
+    b0_dw_output_offset: int = 0
+    b0_dw_activation_min: int = -128
+    b0_dw_activation_max: int = 127
+    # B0 project
+    b0_project_weight: torch.Tensor = None
+    b0_project_bias: Optional[torch.Tensor] = None
+    b0_project_requantize_multipliers: torch.Tensor = None
+    b0_project_requantize_shifts: torch.Tensor = None
+    b0_project_input_offset: int = 0
+    b0_project_output_offset: int = 0
+    b0_project_activation_min: int = -128
+    b0_project_activation_max: int = 127
+    # B1 expand
+    b1_expand_weight: torch.Tensor = None
+    b1_expand_bias: Optional[torch.Tensor] = None
+    b1_expand_requantize_multipliers: torch.Tensor = None
+    b1_expand_requantize_shifts: torch.Tensor = None
+    b1_expand_input_offset: int = 0
+    b1_expand_output_offset: int = 0
+    b1_expand_activation_min: int = -128
+    b1_expand_activation_max: int = 127
+    # B1 dwconv
+    b1_dw_weight: torch.Tensor = None
+    b1_dw_bias: Optional[torch.Tensor] = None
+    b1_dw_bias_with_offset_full: Optional[torch.Tensor] = None
+    b1_dw_requantize_multipliers: torch.Tensor = None
+    b1_dw_requantize_shifts: torch.Tensor = None
+    b1_dw_stride: tuple = (1, 1)
+    b1_dw_padding: tuple = (1, 1)
+    b1_dw_input_offset: int = 0
+    b1_dw_output_offset: int = 0
+    b1_dw_activation_min: int = -128
+    b1_dw_activation_max: int = 127
+    # B1 project
+    b1_project_weight: torch.Tensor = None
+    b1_project_bias: Optional[torch.Tensor] = None
+    b1_project_requantize_multipliers: torch.Tensor = None
+    b1_project_requantize_shifts: torch.Tensor = None
+    b1_project_input_offset: int = 0
+    b1_project_output_offset: int = 0
+    b1_project_activation_min: int = -128
+    b1_project_activation_max: int = 127
+
+
+@dataclass
 class FusedQuantizeStemDwconv2dConv2dLayer:
     """quantize_per_tensor + stem 3x3 stride-2 + B0 dwconv 3x3 + B0 project
     1x1 fused into one runtime call.  Reads raw float input; the per-tensor
@@ -940,6 +1016,199 @@ def extract_quantize_stem_dwconv2d_conv2d_fused(
     )
 
 
+def extract_quantize_stem_inverted_residual_fused(
+    node: Node, program: ExportedProgram, offsets, sizes
+) -> FusedQuantizeStemInvertedResidualLayer:
+    a = _node_args_map(node, [
+        "input",
+        "quant_scale", "quant_zero_point", "quant_qmin", "quant_qmax",
+        "stem_weight", "stem_bias",
+        "stem_input_offset", "stem_output_offset",
+        "stem_requantize_multipliers", "stem_requantize_shifts",
+        "stem_activation_min", "stem_activation_max",
+        "b0_dw_weight", "b0_dw_bias",
+        "b0_dw_stride", "b0_dw_padding",
+        "b0_dw_input_offset", "b0_dw_output_offset",
+        "b0_dw_requantize_multipliers", "b0_dw_requantize_shifts",
+        "b0_dw_activation_min", "b0_dw_activation_max",
+        "b0_project_weight", "b0_project_bias",
+        "b0_project_input_offset", "b0_project_output_offset",
+        "b0_project_requantize_multipliers", "b0_project_requantize_shifts",
+        "b0_project_activation_min", "b0_project_activation_max",
+        "b1_expand_weight", "b1_expand_bias",
+        "b1_expand_input_offset", "b1_expand_output_offset",
+        "b1_expand_requantize_multipliers", "b1_expand_requantize_shifts",
+        "b1_expand_activation_min", "b1_expand_activation_max",
+        "b1_dw_weight", "b1_dw_bias",
+        "b1_dw_stride", "b1_dw_padding",
+        "b1_dw_input_offset", "b1_dw_output_offset",
+        "b1_dw_requantize_multipliers", "b1_dw_requantize_shifts",
+        "b1_dw_activation_min", "b1_dw_activation_max",
+        "b1_project_weight", "b1_project_bias",
+        "b1_project_input_offset", "b1_project_output_offset",
+        "b1_project_requantize_multipliers", "b1_project_requantize_shifts",
+        "b1_project_activation_min", "b1_project_activation_max",
+    ])
+
+    # Stem (mirrors Phase F): packed-32 weight layout + bias_with_offset fold.
+    s_w_t = _resolve_tensor(program, a["stem_weight"])
+    s_b_t = _resolve_tensor(program, a["stem_bias"]) if a["stem_bias"] is not None else None
+    s_w_int32 = s_w_t.detach().to(torch.int32).contiguous()
+    out_c, kh, kw, in_c = s_w_int32.shape
+    flat = s_w_int32.reshape(out_c, kh * kw * in_c)
+    pad = torch.zeros((out_c, 32 - flat.shape[1]), dtype=torch.int32)
+    s_w_packed_32 = torch.cat([flat, pad], dim=1).to(torch.int8).contiguous()
+    sum_w_per_oc = s_w_int32.flatten(1).sum(dim=1)
+    s_offset_term = sum_w_per_oc * int(a["stem_input_offset"])
+    if s_b_t is not None:
+        s_bias_folded = (
+            s_b_t.detach().to(torch.int32).flatten() + s_offset_term
+        ).to(torch.int32).contiguous()
+    else:
+        s_bias_folded = s_offset_term.to(torch.int32).contiguous()
+
+    # B0 dwconv: optional bias_with_offset_full fold when input_offset != 0.
+    b0_dw_w_t = _resolve_tensor(program, a["b0_dw_weight"])
+    b0_dw_b_t = _resolve_tensor(program, a["b0_dw_bias"]) if a["b0_dw_bias"] is not None else None
+    b0_dw_bias_with_offset_full = None
+    if b0_dw_b_t is not None and int(a["b0_dw_input_offset"]) != 0:
+        b0_dw_int32 = b0_dw_w_t.detach().to(torch.int32)
+        sum_b0_dw_per_c = b0_dw_int32.sum(dim=(0, 1, 2))
+        b0_dw_offset_term = sum_b0_dw_per_c * int(a["b0_dw_input_offset"])
+        b0_dw_bias_with_offset_full = (
+            b0_dw_b_t.detach().to(torch.int32).flatten() + b0_dw_offset_term
+        ).to(torch.int32).contiguous()
+
+    # B0 project: input_offset folded into bias.
+    b0_p_w_t = _resolve_tensor(program, a["b0_project_weight"])
+    b0_p_b_t = _resolve_tensor(program, a["b0_project_bias"]) if a["b0_project_bias"] is not None else None
+    b0_p_int32 = b0_p_w_t.detach().to(torch.int32).contiguous()
+    sum_b0_p_per_oc = b0_p_int32.flatten(1).sum(dim=1)
+    b0_p_offset_term = sum_b0_p_per_oc * int(a["b0_project_input_offset"])
+    if b0_p_b_t is not None:
+        b0_p_bias_folded = (
+            b0_p_b_t.detach().to(torch.int32).flatten() + b0_p_offset_term
+        ).to(torch.int32).contiguous()
+    else:
+        b0_p_bias_folded = b0_p_offset_term.to(torch.int32).contiguous()
+
+    # B1 expand: input_offset folded into bias.
+    b1_e_w_t = _resolve_tensor(program, a["b1_expand_weight"])
+    b1_e_b_t = _resolve_tensor(program, a["b1_expand_bias"]) if a["b1_expand_bias"] is not None else None
+    b1_e_int32 = b1_e_w_t.detach().to(torch.int32).contiguous()
+    sum_b1_e_per_oc = b1_e_int32.flatten(1).sum(dim=1)
+    b1_e_offset_term = sum_b1_e_per_oc * int(a["b1_expand_input_offset"])
+    if b1_e_b_t is not None:
+        b1_e_bias_folded = (
+            b1_e_b_t.detach().to(torch.int32).flatten() + b1_e_offset_term
+        ).to(torch.int32).contiguous()
+    else:
+        b1_e_bias_folded = b1_e_offset_term.to(torch.int32).contiguous()
+
+    # B1 dwconv: optional bias_with_offset_full fold.
+    b1_dw_w_t = _resolve_tensor(program, a["b1_dw_weight"])
+    b1_dw_b_t = _resolve_tensor(program, a["b1_dw_bias"]) if a["b1_dw_bias"] is not None else None
+    b1_dw_bias_with_offset_full = None
+    if b1_dw_b_t is not None and int(a["b1_dw_input_offset"]) != 0:
+        b1_dw_int32 = b1_dw_w_t.detach().to(torch.int32)
+        sum_b1_dw_per_c = b1_dw_int32.sum(dim=(0, 1, 2))
+        b1_dw_offset_term = sum_b1_dw_per_c * int(a["b1_dw_input_offset"])
+        b1_dw_bias_with_offset_full = (
+            b1_dw_b_t.detach().to(torch.int32).flatten() + b1_dw_offset_term
+        ).to(torch.int32).contiguous()
+
+    # B1 project: input_offset folded into bias.
+    b1_p_w_t = _resolve_tensor(program, a["b1_project_weight"])
+    b1_p_b_t = _resolve_tensor(program, a["b1_project_bias"]) if a["b1_project_bias"] is not None else None
+    b1_p_int32 = b1_p_w_t.detach().to(torch.int32).contiguous()
+    sum_b1_p_per_oc = b1_p_int32.flatten(1).sum(dim=1)
+    b1_p_offset_term = sum_b1_p_per_oc * int(a["b1_project_input_offset"])
+    if b1_p_b_t is not None:
+        b1_p_bias_folded = (
+            b1_p_b_t.detach().to(torch.int32).flatten() + b1_p_offset_term
+        ).to(torch.int32).contiguous()
+    else:
+        b1_p_bias_folded = b1_p_offset_term.to(torch.int32).contiguous()
+
+    input_node = a["input"]
+    input_fake = get_first_fake_tensor(input_node) if hasattr(input_node, "name") else None
+    num_input = 1
+    if input_fake is not None:
+        for dim in input_fake.shape:
+            num_input *= int(dim)
+
+    def _mults(name):
+        return _resolve_tensor(program, a[name]).detach().to(torch.int32).flatten().contiguous()
+
+    def _shifts(name):
+        return _resolve_tensor(program, a[name]).detach().to(torch.int8).flatten().contiguous()
+
+    return FusedQuantizeStemInvertedResidualLayer(
+        input_name=str(input_node.name) if hasattr(input_node, "name") else "input_float",
+        output=_slot_from_node(node, offsets, sizes),
+        num_input_elements=num_input,
+        quant_scale=float(a["quant_scale"]),
+        quant_zero_point=int(a["quant_zero_point"]),
+        quant_qmin=int(a["quant_qmin"]),
+        quant_qmax=int(a["quant_qmax"]),
+        stem_weight=s_w_t.detach().to(torch.int8).contiguous(),
+        stem_bias=s_bias_folded,
+        stem_weight_packed_32=s_w_packed_32,
+        stem_requantize_multipliers=_mults("stem_requantize_multipliers"),
+        stem_requantize_shifts=_shifts("stem_requantize_shifts"),
+        stem_input_offset=int(a["stem_input_offset"]),
+        stem_output_offset=int(a["stem_output_offset"]),
+        stem_activation_min=int(a["stem_activation_min"]),
+        stem_activation_max=int(a["stem_activation_max"]),
+        b0_dw_weight=b0_dw_w_t.detach().to(torch.int8).contiguous(),
+        b0_dw_bias=b0_dw_b_t.detach().to(torch.int32).flatten().contiguous() if b0_dw_b_t is not None else None,
+        b0_dw_bias_with_offset_full=b0_dw_bias_with_offset_full,
+        b0_dw_requantize_multipliers=_mults("b0_dw_requantize_multipliers"),
+        b0_dw_requantize_shifts=_shifts("b0_dw_requantize_shifts"),
+        b0_dw_stride=_coerce_int_pair(a["b0_dw_stride"]),
+        b0_dw_padding=_coerce_int_pair(a["b0_dw_padding"]),
+        b0_dw_input_offset=int(a["b0_dw_input_offset"]),
+        b0_dw_output_offset=int(a["b0_dw_output_offset"]),
+        b0_dw_activation_min=int(a["b0_dw_activation_min"]),
+        b0_dw_activation_max=int(a["b0_dw_activation_max"]),
+        b0_project_weight=b0_p_w_t.detach().to(torch.int8).contiguous(),
+        b0_project_bias=b0_p_bias_folded,
+        b0_project_requantize_multipliers=_mults("b0_project_requantize_multipliers"),
+        b0_project_requantize_shifts=_shifts("b0_project_requantize_shifts"),
+        b0_project_input_offset=0,  # folded into bias
+        b0_project_output_offset=int(a["b0_project_output_offset"]),
+        b0_project_activation_min=int(a["b0_project_activation_min"]),
+        b0_project_activation_max=int(a["b0_project_activation_max"]),
+        b1_expand_weight=b1_e_w_t.detach().to(torch.int8).contiguous(),
+        b1_expand_bias=b1_e_bias_folded,
+        b1_expand_requantize_multipliers=_mults("b1_expand_requantize_multipliers"),
+        b1_expand_requantize_shifts=_shifts("b1_expand_requantize_shifts"),
+        b1_expand_input_offset=0,  # folded into bias
+        b1_expand_output_offset=int(a["b1_expand_output_offset"]),
+        b1_expand_activation_min=int(a["b1_expand_activation_min"]),
+        b1_expand_activation_max=int(a["b1_expand_activation_max"]),
+        b1_dw_weight=b1_dw_w_t.detach().to(torch.int8).contiguous(),
+        b1_dw_bias=b1_dw_b_t.detach().to(torch.int32).flatten().contiguous() if b1_dw_b_t is not None else None,
+        b1_dw_bias_with_offset_full=b1_dw_bias_with_offset_full,
+        b1_dw_requantize_multipliers=_mults("b1_dw_requantize_multipliers"),
+        b1_dw_requantize_shifts=_shifts("b1_dw_requantize_shifts"),
+        b1_dw_stride=_coerce_int_pair(a["b1_dw_stride"]),
+        b1_dw_padding=_coerce_int_pair(a["b1_dw_padding"]),
+        b1_dw_input_offset=int(a["b1_dw_input_offset"]),
+        b1_dw_output_offset=int(a["b1_dw_output_offset"]),
+        b1_dw_activation_min=int(a["b1_dw_activation_min"]),
+        b1_dw_activation_max=int(a["b1_dw_activation_max"]),
+        b1_project_weight=b1_p_w_t.detach().to(torch.int8).contiguous(),
+        b1_project_bias=b1_p_bias_folded,
+        b1_project_requantize_multipliers=_mults("b1_project_requantize_multipliers"),
+        b1_project_requantize_shifts=_shifts("b1_project_requantize_shifts"),
+        b1_project_input_offset=0,  # folded into bias
+        b1_project_output_offset=int(a["b1_project_output_offset"]),
+        b1_project_activation_min=int(a["b1_project_activation_min"]),
+        b1_project_activation_max=int(a["b1_project_activation_max"]),
+    )
+
+
 def extract_quantized_stem_dwconv2d_conv2d_fused(
     node: Node, program: ExportedProgram, offsets, sizes
 ) -> FusedStemDwconv2dConv2dLayer:
@@ -1180,6 +1449,7 @@ EXTRACTORS = {
     "cortex_m.quantized_dwconv2d_conv2d_fused.default": extract_quantized_dwconv2d_conv2d_fused,
     "cortex_m.quantized_stem_dwconv2d_conv2d_fused.default": extract_quantized_stem_dwconv2d_conv2d_fused,
     "cortex_m.quantize_stem_dwconv2d_conv2d_fused.default": extract_quantize_stem_dwconv2d_conv2d_fused,
+    "cortex_m.quantize_stem_inverted_residual_fused.default": extract_quantize_stem_inverted_residual_fused,
     "cortex_m.quantized_add.default": extract_quantized_add,
     "cortex_m.pad.default": extract_cortex_m_pad,
     "aten.view_copy.default": _extract_memcpy,

@@ -32,6 +32,9 @@ from .dwconv_project_fusion_pass import DwconvProjectFusionPass
 from .expand_dwconv_fusion_pass import ExpandDwconvFusionPass
 from .expand_dwconv_project_fusion_pass import ExpandDwconvProjectFusionPass
 from .quantize_stem_dwconv_project_fusion_pass import QuantizeStemDwconvProjectFusionPass
+from .quantize_stem_inverted_residual_fusion_pass import (
+    QuantizeStemInvertedResidualFusionPass,
+)
 from .stem_dwconv_project_fusion_pass import StemDwconvProjectFusionPass
 from .quantized_clamp_activation_pass import QuantizedClampActivationPass
 from .quantized_op_fusion_pass import QuantizedOpFusionPass
@@ -74,6 +77,17 @@ class CortexMPassManager(PassManager):
         DwconvProjectFusionPass,
         StemDwconvProjectFusionPass,
         QuantizeStemDwconvProjectFusionPass,
+    ]
+
+    # Phase G: extends the inverted-residual fusion path one more step,
+    # absorbing MV2's first inverted-residual block (B1) into the
+    # quantize+stem+B0 mega-op.  Eliminates the B0 project output (200 KB
+    # at 1.0/224) from the arena; the rolling-buffer C kernel was
+    # validated bit-exact vs Phase F on host.  Opt-in until we have full
+    # FVP validation; export_mv2.py's picker will fall back to Phase F
+    # at small widths where the deeper fusion doesn't pay off.
+    pass_list_with_phase_g: list[PassClass] = pass_list_with_inverted_residual_fusion + [
+        QuantizeStemInvertedResidualFusionPass,
     ]
 
     pass_list_transform_for_annotation: list[PassClass] = [

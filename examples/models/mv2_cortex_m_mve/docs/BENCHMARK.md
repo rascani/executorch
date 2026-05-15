@@ -724,6 +724,38 @@ full-fat 1.0/224 now fits in 512 KB SRAM — a deployment tier that was
 unreachable when the project started (1505 KB unfused → 390 KB
 fused, 74% reduction at 4.3% latency cost).
 
+### Operator fusion — Phase F (quantize+stem+B0) and Phase G (+B1)
+
+Two more passes were added on top of Phase A+B by absorbing the
+entry-side ops into the same mega-fused operator:
+
+- **Phase F** (`QuantizeStemDwconvProjectFusionPass`): the
+  `cortex_m::quantize_per_tensor` op fuses with the stem chain so
+  the int8 quantized input (3×224² = 150 KB at 1.0/224) never
+  materializes in the arena. Float input streams 3 rows at a time
+  through a small qin rolling buffer that feeds the stem directly.
+- **Phase G** (`QuantizeStemInvertedResidualFusionPass`): the next
+  inverted-residual block (MV2 B1) is folded into the Phase F op,
+  eliminating the B0 project output (16 ch × 112² = 200 KB at
+  1.0/224). 4 nested rolling buffers (qin → stem → b0_project →
+  b1_expand) plus per-call b0_dw and b1_dw row scratches keep the
+  whole chain alive in ~60 KB of fused scratch.
+
+Arena+scratch totals (Phase G picked over Phase A+B+F by the
+conditional picker — Phase G wins at every config tested):
+
+| width / res | Phase A+B (KB) | Phase G total (KB) | Δ |
+|---:|---:|---:|---:|
+| 1.00 / 224 | 390 | **211** | −46% |
+| 0.75 / 192 | 291 | **160** | −45% |
+| 0.50 / 160 | 144 |  **80** | −44% |
+| 0.35 /  96 |  54 |  **26** | −52% |
+
+Phase G is bit-exact vs Phase A+B on host scalar (0/1000 logit
+mismatches across the full pareto).  The runtime kernel is
+currently scalar-only; MVE optimization is the natural next perf
+step but doesn't affect the memory numbers above.
+
 ### Updated deployment sweet spots
 
 | SRAM budget | Best deployable config | Latency @ 300 MHz |
@@ -790,6 +822,14 @@ MV2 specifically.  Items below in roughly descending priority.
 - ✅ **Phase B** (`StemDwconvProjectFusionPass`): absorbs the stem
   conv into the fused chain (-42% additional arena at 1.0/224,
   -1.9% latency).
+- ✅ **Phase F** (`QuantizeStemDwconvProjectFusionPass`): folds the
+  per-tensor quantize into the stem fused op; eliminates the int8
+  quantized input from the arena (150 KB at 1.0/224).
+- ✅ **Phase G** (`QuantizeStemInvertedResidualFusionPass`): extends
+  Phase F to also absorb MV2 B1; eliminates the B0 project output
+  (200 KB at 1.0/224). Combined with the picker, drops the 1.0/224
+  total memory to 211 KB and the 0.35/96 sweet spot to 26 KB.
+  Scalar runtime, bit-exact vs Phase F on host.
 - ✅ **First 3×3 conv (Cin=3) specialization**: handled by step 8
   (packed-32 im2col path); ~5.7% of total inference today.
 - ✅ **Phase C** (stem 2-pixel batching): tried, no measurable
@@ -821,12 +861,19 @@ MV2 specifically.  Items below in roughly descending priority.
 - **Phase D — head epilogue batching.**  Tried analytically; max
   saving is below noise (~0.02-0.5% of total).  Worth ~half a day
   if pursued.
-- **Phase E — multi-block fusion.**  Blocked for the obvious
-  candidates because most consecutive same-spatial blocks in MV2
-  have residual adds whose skip path needs the block-boundary
-  tensor materialized.  Would need a different fusion shape
-  (e.g., dual-output streaming where one output goes to the add
-  and one continues to the next block) to be viable.
+- **MVE acceleration for Phase G.**  The Phase G kernel is currently
+  scalar-only.  Following the Phase F pattern (packed-32 stem +
+  MVE channel-vectorized dwconv + `_conv1x1_row_mve_args` for 1x1
+  rows) should bring Phase G's per-op cycles close to the sum of
+  the constituent kernels.  Phase G represents ~50% of MV2's
+  compute (stem + B0 + B1), so this is the highest-leverage perf
+  win still on the table.
+- **Phase H — extend mega-fusion past B1.**  MV2 B2 is the obvious
+  next candidate, but it has a residual add whose skip path is the
+  B1 project output (= Phase G's current arena output).  Would
+  need a dual-output kernel shape (one output to the residual buffer,
+  one continues to B3's expand) to be viable.  Memory savings would
+  be the 24 ch × 56² = ~75 KB B2 output.
 - **Quantization-level optimization** (int4 weights, mixed-precision
   activations).  Substantial separate project; could halve weight
   memory and selectively compress late-layer activations.

@@ -3612,6 +3612,381 @@ static void gemv_s8(const int8_t* input, int8_t* output, const LinearParams* p) 
   PROF_END(gemv);
 }
 
+/* ===========================================================================
+ * quantize_stem_inverted_residual_fused_s8 — Phase G:
+ *   per-tensor quantize + stem 3x3 stride-2 +
+ *   B0 dwconv + B0 project (1x1) +
+ *   B1 expand (1x1) + B1 dwconv (stride-2 in MV2) + B1 project (1x1).
+ *
+ * Eliminates two large intermediates relative to Phase F:
+ *   - the quantized int8 input (already gone in Phase F)
+ *   - the B0 project output (16ch x 112^2 = 200 KB at 1.0/224)
+ *
+ * Scalar-only reference for bit-exact validation; MVE fast paths can be
+ * added later in the same style as Phase F.
+ *
+ * Layout in mv2_fused_scratch (offsets monotonically increasing):
+ *   [-- 3 qin rows --]
+ *   [-- 3 stem rows --]
+ *   [-- 1 b0_dw row --]
+ *   [-- 3 b0_project rows --]
+ *   [-- 3 b1_expand rows --]
+ *   [-- 1 b1_dw row --]
+ *
+ * Outer loop is over b1 dw output rows.  For each, three b1_expand rows
+ * (covering the 3x3 dw window) are ensured via _ENSURE_B1E_ROW.  Each new
+ * b1_expand row requires the b0_project row at the same y, which itself
+ * may require new stem rows, which may require new qin rows.  All caches
+ * are 3-deep round-robin, matching the largest 3x3 window in the chain.
+ * ===========================================================================
+ */
+static __attribute__((always_inline)) inline void quantize_stem_inverted_residual_fused_s8(
+    const float* input_float, int8_t* output,
+    const FusedQuantizeStemInvertedResidualParams* p) {
+  const uint32_t in_h = p->in_h;
+  const uint32_t in_w = p->in_w;
+  const uint32_t in_c = p->in_c;
+  const uint32_t stem_out_h = p->stem_out_h;
+  const uint32_t stem_out_w = p->stem_out_w;
+  const uint32_t stem_out_c = p->stem_out_c;
+  const uint32_t b0_out_h = p->b0_out_h;
+  const uint32_t b0_out_w = p->b0_out_w;
+  const uint32_t b0_p_c = p->b0_project_out_c;
+  const uint32_t b1_e_c = p->b1_expand_out_c;
+  const uint32_t b1_dw_out_w = p->b1_dw_out_w;
+  const uint32_t out_h = p->out_h;
+  const uint32_t out_w = p->out_w;
+  const uint32_t b1_p_c = p->b1_project_out_c;
+
+  const int32_t b0_dw_pad_h = (int32_t)p->b0_dw_pad_h;
+  const int32_t b0_dw_pad_w = (int32_t)p->b0_dw_pad_w;
+  const uint32_t b0_dw_stride_w = p->b0_dw_stride_w;
+  const int32_t b1_dw_pad_h = (int32_t)p->b1_dw_pad_h;
+  const int32_t b1_dw_pad_w = (int32_t)p->b1_dw_pad_w;
+  const uint32_t b1_dw_stride_h = p->b1_dw_stride_h;
+  const uint32_t b1_dw_stride_w = p->b1_dw_stride_w;
+
+  const int32_t b0_dw_in_off = p->b0_dw_input_offset;
+  const int32_t b0_dw_out_off = p->b0_dw_output_offset;
+  const int32_t b0_dw_amin = p->b0_dw_activation_min;
+  const int32_t b0_dw_amax = p->b0_dw_activation_max;
+  const int32_t b0_p_in_off = p->b0_project_input_offset; /* folded into bias */
+  const int32_t b0_p_out_off = p->b0_project_output_offset;
+  const int32_t b0_p_amin = p->b0_project_activation_min;
+  const int32_t b0_p_amax = p->b0_project_activation_max;
+  const int32_t b1_e_in_off = p->b1_expand_input_offset; /* folded into bias */
+  const int32_t b1_e_out_off = p->b1_expand_output_offset;
+  const int32_t b1_e_amin = p->b1_expand_activation_min;
+  const int32_t b1_e_amax = p->b1_expand_activation_max;
+  const int32_t b1_dw_in_off = p->b1_dw_input_offset;
+  const int32_t b1_dw_out_off = p->b1_dw_output_offset;
+  const int32_t b1_dw_amin = p->b1_dw_activation_min;
+  const int32_t b1_dw_amax = p->b1_dw_activation_max;
+  const int32_t b1_p_in_off = p->b1_project_input_offset; /* folded into bias */
+  const int32_t b1_p_out_off = p->b1_project_output_offset;
+  const int32_t b1_p_amin = p->b1_project_activation_min;
+  const int32_t b1_p_amax = p->b1_project_activation_max;
+
+  const uint32_t input_row_bytes = in_w * in_c;
+  const uint32_t stem_row_bytes = stem_out_w * stem_out_c;
+  const uint32_t b0_dw_row_bytes = b0_out_w * stem_out_c;
+  const uint32_t b0_p_row_bytes = b0_out_w * b0_p_c;
+  const uint32_t b1_e_row_bytes = b0_out_w * b1_e_c;
+  const uint32_t b1_dw_row_bytes = b1_dw_out_w * b1_e_c;
+  (void)b1_dw_row_bytes;
+
+  uint32_t off = 0;
+  int8_t* qin_rolling[3] = {
+    mv2_fused_scratch + off + 0u * input_row_bytes,
+    mv2_fused_scratch + off + 1u * input_row_bytes,
+    mv2_fused_scratch + off + 2u * input_row_bytes,
+  };
+  off += 3u * input_row_bytes;
+  int8_t* stem_rolling[3] = {
+    mv2_fused_scratch + off + 0u * stem_row_bytes,
+    mv2_fused_scratch + off + 1u * stem_row_bytes,
+    mv2_fused_scratch + off + 2u * stem_row_bytes,
+  };
+  off += 3u * stem_row_bytes;
+  int8_t* b0_dw_row_buf = mv2_fused_scratch + off;
+  off += b0_dw_row_bytes;
+  int8_t* b0_p_rolling[3] = {
+    mv2_fused_scratch + off + 0u * b0_p_row_bytes,
+    mv2_fused_scratch + off + 1u * b0_p_row_bytes,
+    mv2_fused_scratch + off + 2u * b0_p_row_bytes,
+  };
+  off += 3u * b0_p_row_bytes;
+  int8_t* b1_e_rolling[3] = {
+    mv2_fused_scratch + off + 0u * b1_e_row_bytes,
+    mv2_fused_scratch + off + 1u * b1_e_row_bytes,
+    mv2_fused_scratch + off + 2u * b1_e_row_bytes,
+  };
+  off += 3u * b1_e_row_bytes;
+  int8_t* b1_dw_row_buf = mv2_fused_scratch + off;
+
+  int32_t qin_cached_row[3] = {-2, -2, -2};
+  int qin_next_slot = 0;
+  int32_t stem_cached_row[3] = {-2, -2, -2};
+  int stem_next_slot = 0;
+  int32_t b0_p_cached_row[3] = {-2, -2, -2};
+  int b0_p_next_slot = 0;
+  int32_t b1_e_cached_row[3] = {-2, -2, -2};
+  int b1_e_next_slot = 0;
+
+  /* --- qin / stem row producers (same shape as Phase F) ------------------- */
+  #define _G_ENSURE_QIN(row_idx) do { \
+    if ((int32_t)(row_idx) >= 0 && (uint32_t)(row_idx) < in_h) { \
+      int _found = 0; \
+      for (int _i = 0; _i < 3; ++_i) \
+        if (qin_cached_row[_i] == (int32_t)(row_idx)) { _found = 1; break; } \
+      if (!_found) { \
+        qin_cached_row[qin_next_slot] = (int32_t)(row_idx); \
+        _quantize_input_row_scalar( \
+            input_float + (size_t)(row_idx) * in_w * in_c, \
+            qin_rolling[qin_next_slot], in_w, in_c, \
+            p->quant_scale, p->quant_zero_point, \
+            p->quant_qmin, p->quant_qmax); \
+        qin_next_slot = (qin_next_slot + 1) % 3; \
+      } \
+    } \
+  } while (0)
+  #define _G_GET_QIN(row_idx) ({ \
+    const int8_t* _r = (const int8_t*)0; \
+    if ((int32_t)(row_idx) >= 0 && (uint32_t)(row_idx) < in_h) { \
+      for (int _i = 0; _i < 3; ++_i) \
+        if (qin_cached_row[_i] == (int32_t)(row_idx)) { _r = qin_rolling[_i]; break; } \
+    } \
+    _r; \
+  })
+  #define _G_COMPUTE_STEM_ROW(stem_oh, dst) do { \
+    int32_t _g_stem_oh = (int32_t)(stem_oh); \
+    if (_g_stem_oh < 0 || (uint32_t)_g_stem_oh >= stem_out_h) { \
+      int8_t fill = (int8_t)(-b0_dw_in_off); \
+      for (uint32_t _i = 0; _i < stem_row_bytes; ++_i) (dst)[_i] = fill; \
+    } else { \
+      const int32_t _g_stem_ih = _g_stem_oh * 2 - 1; \
+      _G_ENSURE_QIN(_g_stem_ih + 0); \
+      _G_ENSURE_QIN(_g_stem_ih + 1); \
+      _G_ENSURE_QIN(_g_stem_ih + 2); \
+      const int8_t* _rows[3] = { \
+        _G_GET_QIN(_g_stem_ih + 0), \
+        _G_GET_QIN(_g_stem_ih + 1), \
+        _G_GET_QIN(_g_stem_ih + 2), \
+      }; \
+      _stem_row_scalar_from_rows( \
+          _rows, (dst), in_w, stem_out_w, stem_out_c, \
+          p->stem_weight, p->stem_bias, \
+          p->stem_requant_mults, p->stem_requant_shifts, \
+          p->stem_input_offset, p->stem_output_offset, \
+          p->stem_activation_min, p->stem_activation_max); \
+    } \
+  } while (0)
+  #define _G_ENSURE_STEM(row_idx) do { \
+    int _found = 0; \
+    for (int _i = 0; _i < 3; ++_i) \
+      if (stem_cached_row[_i] == (int32_t)(row_idx)) { _found = 1; break; } \
+    if (!_found) { \
+      stem_cached_row[stem_next_slot] = (int32_t)(row_idx); \
+      _G_COMPUTE_STEM_ROW((int32_t)(row_idx), stem_rolling[stem_next_slot]); \
+      stem_next_slot = (stem_next_slot + 1) % 3; \
+    } \
+  } while (0)
+  #define _G_GET_STEM(row_idx) ({ \
+    int8_t* _r = (int8_t*)0; \
+    for (int _i = 0; _i < 3; ++_i) \
+      if (stem_cached_row[_i] == (int32_t)(row_idx)) { _r = stem_rolling[_i]; break; } \
+    _r; \
+  })
+
+  /* --- compute one B0 project row at b0_oh into dst ----------------------- */
+  #define _G_COMPUTE_B0P_ROW(b0_oh, dst) do { \
+    int32_t _g_b0p_oh = (int32_t)(b0_oh); \
+    if (_g_b0p_oh < 0 || (uint32_t)_g_b0p_oh >= b0_out_h) { \
+      int8_t fill = 0; \
+      for (uint32_t _i = 0; _i < b0_p_row_bytes; ++_i) (dst)[_i] = fill; \
+    } else { \
+      _G_ENSURE_STEM(_g_b0p_oh - 1); \
+      _G_ENSURE_STEM(_g_b0p_oh + 0); \
+      _G_ENSURE_STEM(_g_b0p_oh + 1); \
+      const int8_t* _srows[3] = { \
+        _G_GET_STEM(_g_b0p_oh - 1), \
+        _G_GET_STEM(_g_b0p_oh + 0), \
+        _G_GET_STEM(_g_b0p_oh + 1), \
+      }; \
+      for (uint32_t ow = 0; ow < b0_out_w; ++ow) { \
+        const int32_t iw_base = (int32_t)(ow * b0_dw_stride_w); \
+        for (uint32_t c = 0; c < stem_out_c; ++c) { \
+          int32_t acc = (p->b0_dw_bias != (const int32_t*)0) ? p->b0_dw_bias[c] : 0; \
+          for (int dr = 0; dr < 3; ++dr) { \
+            const int32_t sr = _g_b0p_oh + dr - b0_dw_pad_h; \
+            if (sr < 0 || (uint32_t)sr >= stem_out_h) continue; \
+            const int8_t* row = _srows[dr]; \
+            for (int dc = 0; dc < 3; ++dc) { \
+              const int32_t sc = iw_base + dc - b0_dw_pad_w; \
+              if (sc < 0 || (uint32_t)sc >= stem_out_w) continue; \
+              const int32_t x = (int32_t)row[(size_t)sc * stem_out_c + c] + b0_dw_in_off; \
+              const int32_t w = (int32_t)p->b0_dw_weight[((size_t)dr * 3 + dc) * stem_out_c + c]; \
+              acc += x * w; \
+            } \
+          } \
+          acc = scalar_requantize(acc, p->b0_dw_requant_mults[c], p->b0_dw_requant_shifts[c]); \
+          acc += b0_dw_out_off; \
+          if (acc < b0_dw_amin) acc = b0_dw_amin; \
+          if (acc > b0_dw_amax) acc = b0_dw_amax; \
+          b0_dw_row_buf[(size_t)ow * stem_out_c + c] = (int8_t)acc; \
+        } \
+      } \
+      for (uint32_t ow = 0; ow < b0_out_w; ++ow) { \
+        const int8_t* x_pos = b0_dw_row_buf + (size_t)ow * stem_out_c; \
+        int8_t* out_pos = (dst) + (size_t)ow * b0_p_c; \
+        for (uint32_t oc = 0; oc < b0_p_c; ++oc) { \
+          int32_t acc = (p->b0_project_bias != (const int32_t*)0) ? p->b0_project_bias[oc] : 0; \
+          const int8_t* w_oc = p->b0_project_weight + (size_t)oc * stem_out_c; \
+          for (uint32_t ic = 0; ic < stem_out_c; ++ic) { \
+            acc += ((int32_t)x_pos[ic] + b0_p_in_off) * (int32_t)w_oc[ic]; \
+          } \
+          acc = scalar_requantize(acc, p->b0_project_requant_mults[oc], p->b0_project_requant_shifts[oc]); \
+          acc += b0_p_out_off; \
+          if (acc < b0_p_amin) acc = b0_p_amin; \
+          if (acc > b0_p_amax) acc = b0_p_amax; \
+          out_pos[oc] = (int8_t)acc; \
+        } \
+      } \
+    } \
+  } while (0)
+  #define _G_ENSURE_B0P(row_idx) do { \
+    int _found = 0; \
+    for (int _i = 0; _i < 3; ++_i) \
+      if (b0_p_cached_row[_i] == (int32_t)(row_idx)) { _found = 1; break; } \
+    if (!_found) { \
+      b0_p_cached_row[b0_p_next_slot] = (int32_t)(row_idx); \
+      _G_COMPUTE_B0P_ROW((int32_t)(row_idx), b0_p_rolling[b0_p_next_slot]); \
+      b0_p_next_slot = (b0_p_next_slot + 1) % 3; \
+    } \
+  } while (0)
+  #define _G_GET_B0P(row_idx) ({ \
+    int8_t* _r = (int8_t*)0; \
+    for (int _i = 0; _i < 3; ++_i) \
+      if (b0_p_cached_row[_i] == (int32_t)(row_idx)) { _r = b0_p_rolling[_i]; break; } \
+    _r; \
+  })
+
+  /* --- compute one B1 expand row at the y of the corresponding b0_p row --- */
+  #define _G_COMPUTE_B1E_ROW(b1e_oh, dst) do { \
+    if ((int32_t)(b1e_oh) < 0 || (uint32_t)(b1e_oh) >= b0_out_h) { \
+      int8_t fill = (int8_t)(-b1_dw_in_off); \
+      for (uint32_t _i = 0; _i < b1_e_row_bytes; ++_i) (dst)[_i] = fill; \
+    } else { \
+      _G_ENSURE_B0P((int32_t)(b1e_oh)); \
+      const int8_t* _in = _G_GET_B0P((int32_t)(b1e_oh)); \
+      for (uint32_t ow = 0; ow < b0_out_w; ++ow) { \
+        const int8_t* x_pos = _in + (size_t)ow * b0_p_c; \
+        int8_t* out_pos = (dst) + (size_t)ow * b1_e_c; \
+        for (uint32_t oc = 0; oc < b1_e_c; ++oc) { \
+          int32_t acc = (p->b1_expand_bias != (const int32_t*)0) ? p->b1_expand_bias[oc] : 0; \
+          const int8_t* w_oc = p->b1_expand_weight + (size_t)oc * b0_p_c; \
+          for (uint32_t ic = 0; ic < b0_p_c; ++ic) { \
+            acc += ((int32_t)x_pos[ic] + b1_e_in_off) * (int32_t)w_oc[ic]; \
+          } \
+          acc = scalar_requantize(acc, p->b1_expand_requant_mults[oc], p->b1_expand_requant_shifts[oc]); \
+          acc += b1_e_out_off; \
+          if (acc < b1_e_amin) acc = b1_e_amin; \
+          if (acc > b1_e_amax) acc = b1_e_amax; \
+          out_pos[oc] = (int8_t)acc; \
+        } \
+      } \
+    } \
+  } while (0)
+  #define _G_ENSURE_B1E(row_idx) do { \
+    int _found = 0; \
+    for (int _i = 0; _i < 3; ++_i) \
+      if (b1_e_cached_row[_i] == (int32_t)(row_idx)) { _found = 1; break; } \
+    if (!_found) { \
+      b1_e_cached_row[b1_e_next_slot] = (int32_t)(row_idx); \
+      _G_COMPUTE_B1E_ROW((int32_t)(row_idx), b1_e_rolling[b1_e_next_slot]); \
+      b1_e_next_slot = (b1_e_next_slot + 1) % 3; \
+    } \
+  } while (0)
+  #define _G_GET_B1E(row_idx) ({ \
+    int8_t* _r = (int8_t*)0; \
+    for (int _i = 0; _i < 3; ++_i) \
+      if (b1_e_cached_row[_i] == (int32_t)(row_idx)) { _r = b1_e_rolling[_i]; break; } \
+    _r; \
+  })
+
+  /* --- outer loop: produce one B1 project (= block output) row per iter -- */
+  for (uint32_t oh = 0; oh < out_h; ++oh) {
+    const int32_t ih_base = (int32_t)(oh * b1_dw_stride_h);
+    _G_ENSURE_B1E(ih_base - 1);
+    _G_ENSURE_B1E(ih_base + 0);
+    _G_ENSURE_B1E(ih_base + 1);
+    const int8_t* row_at[3] = {
+      _G_GET_B1E(ih_base - 1),
+      _G_GET_B1E(ih_base + 0),
+      _G_GET_B1E(ih_base + 1),
+    };
+
+    /* Step C: B1 dwconv row into b1_dw_row_buf. */
+    for (uint32_t ow = 0; ow < b1_dw_out_w; ++ow) {
+      const int32_t iw_base = (int32_t)(ow * b1_dw_stride_w);
+      for (uint32_t c = 0; c < b1_e_c; ++c) {
+        int32_t acc = (p->b1_dw_bias != (const int32_t*)0) ? p->b1_dw_bias[c] : 0;
+        for (int dr = 0; dr < 3; ++dr) {
+          const int32_t sr = ih_base + dr - b1_dw_pad_h;
+          if (sr < 0 || (uint32_t)sr >= b0_out_h) continue;
+          const int8_t* row = row_at[dr];
+          if (!row) continue;
+          for (int dc = 0; dc < 3; ++dc) {
+            const int32_t sc = iw_base + dc - b1_dw_pad_w;
+            if (sc < 0 || (uint32_t)sc >= b0_out_w) continue;
+            const int32_t x = (int32_t)row[(size_t)sc * b1_e_c + c] + b1_dw_in_off;
+            const int32_t w = (int32_t)p->b1_dw_weight[((size_t)dr * 3 + dc) * b1_e_c + c];
+            acc += x * w;
+          }
+        }
+        acc = scalar_requantize(acc, p->b1_dw_requant_mults[c], p->b1_dw_requant_shifts[c]);
+        acc += b1_dw_out_off;
+        if (acc < b1_dw_amin) acc = b1_dw_amin;
+        if (acc > b1_dw_amax) acc = b1_dw_amax;
+        b1_dw_row_buf[(size_t)ow * b1_e_c + c] = (int8_t)acc;
+      }
+    }
+
+    /* Step D: B1 project 1x1 directly into block output row. */
+    int8_t* out_row = output + (size_t)oh * (size_t)out_w * b1_p_c;
+    for (uint32_t ow = 0; ow < out_w; ++ow) {
+      const int8_t* x_pos = b1_dw_row_buf + (size_t)ow * b1_e_c;
+      int8_t* out_pos = out_row + (size_t)ow * b1_p_c;
+      for (uint32_t oc = 0; oc < b1_p_c; ++oc) {
+        int32_t acc = (p->b1_project_bias != (const int32_t*)0) ? p->b1_project_bias[oc] : 0;
+        const int8_t* w_oc = p->b1_project_weight + (size_t)oc * b1_e_c;
+        for (uint32_t ic = 0; ic < b1_e_c; ++ic) {
+          acc += ((int32_t)x_pos[ic] + b1_p_in_off) * (int32_t)w_oc[ic];
+        }
+        acc = scalar_requantize(acc, p->b1_project_requant_mults[oc], p->b1_project_requant_shifts[oc]);
+        acc += b1_p_out_off;
+        if (acc < b1_p_amin) acc = b1_p_amin;
+        if (acc > b1_p_amax) acc = b1_p_amax;
+        out_pos[oc] = (int8_t)acc;
+      }
+    }
+  }
+
+  #undef _G_ENSURE_QIN
+  #undef _G_GET_QIN
+  #undef _G_COMPUTE_STEM_ROW
+  #undef _G_ENSURE_STEM
+  #undef _G_GET_STEM
+  #undef _G_COMPUTE_B0P_ROW
+  #undef _G_ENSURE_B0P
+  #undef _G_GET_B0P
+  #undef _G_COMPUTE_B1E_ROW
+  #undef _G_ENSURE_B1E
+  #undef _G_GET_B1E
+
+}
+
+
 void mobilenet_v2_inference(const float* input_float, int8_t* output_q) {
   /* Body generated by tools/dump_mv2_artifacts.py — emits one call per
    * lowered cortex_m op.  Output is int8 logits; the Python test side

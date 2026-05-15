@@ -151,9 +151,16 @@ def build_schedule(program: ExportedProgram) -> ProgramSchedule:
     # folded into a Phase F fused op, the layer's output is the *B0
     # project* shape — not the input shape.  In that case we synthesize
     # a slot whose shape matches the raw float input dims.
-    from .extractors import FusedQuantizeStemDwconv2dConv2dLayer, TensorSlot
+    from .extractors import (
+        FusedQuantizeStemDwconv2dConv2dLayer,
+        FusedQuantizeStemInvertedResidualLayer,
+        TensorSlot,
+    )
     for layer in schedule.layers:
-        if isinstance(layer, FusedQuantizeStemDwconv2dConv2dLayer):
+        if isinstance(
+            layer,
+            (FusedQuantizeStemDwconv2dConv2dLayer, FusedQuantizeStemInvertedResidualLayer),
+        ):
             # num_input_elements is N*C*H*W; assume the natural MV2 layout.
             in_c = int(layer.stem_weight.shape[3])  # OHWI -> in_c
             num = int(layer.num_input_elements)
