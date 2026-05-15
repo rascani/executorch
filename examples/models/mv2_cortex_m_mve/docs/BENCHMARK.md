@@ -877,6 +877,15 @@ MV2 specifically.  Items below in roughly descending priority.
   B1 dw stride-2) factored out of Phase F's ires kernel into a
   shared `_dwconv3x3_row_s8` helper.  Lands Phase G at 153.5 M PMU
   (1.0/224) — same latency as Phase A+B's 151.9 M with -46% memory.
+- ❌ **`-Ofast` instead of `-O3`** — tested at 1.0/224, delta was
+  +0.06% PMU cycles (153.51 M -> 153.61 M).  The hot path is
+  ~99.9% int8 arithmetic; `-ffast-math` only touches the float
+  `quantize_input` row, which is already a rounding-error of the
+  total cycle budget.  CMSIS-NN benefits from `-Ofast` because of
+  richer float-utility code paths that don't exist in this build.
+  Also previously confirmed negative: `-flto`, `-funroll-loops`,
+  fine-grained `-fno-tree-*` flags.  Stay on `-O3
+  -ffunction-sections -fdata-sections`.
 - **Phase H — extend mega-fusion past B1.**  MV2 B2 is the obvious
   next candidate, but it has a residual add whose skip path is the
   B1 project output (= Phase G's current arena output).  Would
