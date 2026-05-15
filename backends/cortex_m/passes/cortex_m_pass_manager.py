@@ -28,6 +28,7 @@ from .clamp_hardswish_pass import ClampHardswishPass
 from .convert_to_cortex_m_pass import ConvertToCortexMPass
 from .decompose_hardswish_pass import DecomposeHardswishPass
 from .decompose_mean_pass import DecomposeMeanPass
+from .dwconv_project_fusion_pass import DwconvProjectFusionPass
 from .expand_dwconv_fusion_pass import ExpandDwconvFusionPass
 from .expand_dwconv_project_fusion_pass import ExpandDwconvProjectFusionPass
 from .quantized_clamp_activation_pass import QuantizedClampActivationPass
@@ -62,10 +63,13 @@ class CortexMPassManager(PassManager):
     # Same opt-in path but with the additional project conv (and optional
     # residual add) absorbed into a single fused op per inverted-residual
     # block.  Eliminates both the dwconv output and the project output
-    # intermediates from the arena.
+    # intermediates from the arena.  DwconvProjectFusionPass runs last and
+    # picks up MV2 B0-style blocks (expand_ratio=1) that don't match the
+    # expand+dwconv pattern.
     pass_list_with_inverted_residual_fusion: list[PassClass] = pass_list + [
         ExpandDwconvFusionPass,
         ExpandDwconvProjectFusionPass,
+        DwconvProjectFusionPass,
     ]
 
     pass_list_transform_for_annotation: list[PassClass] = [

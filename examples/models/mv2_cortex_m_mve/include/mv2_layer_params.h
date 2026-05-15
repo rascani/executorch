@@ -176,6 +176,37 @@ typedef struct {
 } FusedConv2dDwconv2dParams;
 
 typedef struct {
+  /* MV2 B0-style block (expand_ratio=1): 3x3 dwconv -> 1x1 project, no
+   * preceding expand conv.  Single rolling-row scratch for the dwconv
+   * output that the project conv consumes immediately. */
+  uint32_t in_h, in_w, in_c;
+  uint32_t out_h, out_w;            /* project output spatial (= dwconv output spatial) */
+  uint32_t project_out_c;
+  uint32_t kernel_h, kernel_w;      /* dwconv kernel (always 3) */
+  uint32_t stride_h, stride_w;
+  uint32_t pad_h, pad_w;            /* dwconv padding (always 1) */
+  /* Dwconv 3x3 */
+  const int8_t*  dw_weight;
+  const int32_t* dw_bias;
+  const int32_t* dw_bias_with_offset_full;
+  const int32_t* dw_requant_mults;
+  const int8_t*  dw_requant_shifts;
+  int32_t dw_input_offset;
+  int32_t dw_output_offset;
+  int8_t  dw_activation_min;
+  int8_t  dw_activation_max;
+  /* Project 1x1 */
+  const int8_t*  project_weight;
+  const int32_t* project_bias;
+  const int32_t* project_requant_mults;
+  const int8_t*  project_requant_shifts;
+  int32_t project_input_offset;
+  int32_t project_output_offset;
+  int8_t  project_activation_min;
+  int8_t  project_activation_max;
+} FusedDwconv2dConv2dParams;
+
+typedef struct {
   /* Full MV2 inverted-residual block: 1x1 expand -> 3x3 dwconv -> 1x1
    * project [-> int8 residual add].  Two intermediates (expand output
    * and dwconv output) are streamed through small rolling buffers in

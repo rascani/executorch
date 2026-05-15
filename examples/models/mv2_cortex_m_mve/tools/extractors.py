@@ -202,6 +202,40 @@ class FusedInvertedResidualLayer:
 
 
 @dataclass
+class FusedDwconv2dConv2dLayer:
+    """MV2 B0-style block (expand_ratio=1): 3x3 dwconv + 1x1 project fused.
+
+    Runtime kernel streams the dwconv output through a single row buffer
+    that the project conv consumes immediately, eliminating the full
+    HxWxC dwconv intermediate.
+    """
+    kernel: str = "dwconv2d_conv2d_fused_s8"
+    input: TensorSlot = None
+    output: TensorSlot = None
+    # Dwconv 3x3
+    dw_weight: torch.Tensor = None
+    dw_bias: Optional[torch.Tensor] = None
+    dw_bias_with_offset_full: Optional[torch.Tensor] = None
+    dw_requantize_multipliers: torch.Tensor = None
+    dw_requantize_shifts: torch.Tensor = None
+    dw_stride: tuple = (1, 1)
+    dw_padding: tuple = (1, 1)
+    dw_input_offset: int = 0
+    dw_output_offset: int = 0
+    dw_activation_min: int = -128
+    dw_activation_max: int = 127
+    # Project 1x1
+    project_weight: torch.Tensor = None
+    project_bias: Optional[torch.Tensor] = None
+    project_requantize_multipliers: torch.Tensor = None
+    project_requantize_shifts: torch.Tensor = None
+    project_input_offset: int = 0
+    project_output_offset: int = 0
+    project_activation_min: int = -128
+    project_activation_max: int = 127
+
+
+@dataclass
 class QuantizedAddLayer:
     kernel: str = "add_s8"
     self_in: TensorSlot = None
@@ -706,6 +740,71 @@ def extract_quantized_conv2d_dwconv2d_conv2d_fused(
     )
 
 
+def extract_quantized_dwconv2d_conv2d_fused(
+    node: Node, program: ExportedProgram, offsets, sizes
+) -> FusedDwconv2dConv2dLayer:
+    a = _node_args_map(node, [
+        "input",
+        "dw_weight", "dw_bias",
+        "dw_stride", "dw_padding",
+        "dw_input_offset", "dw_output_offset",
+        "dw_requantize_multipliers", "dw_requantize_shifts",
+        "dw_activation_min", "dw_activation_max",
+        "project_weight", "project_bias",
+        "project_input_offset", "project_output_offset",
+        "project_requantize_multipliers", "project_requantize_shifts",
+        "project_activation_min", "project_activation_max",
+    ])
+    # Dwconv with optional bias_with_offset_full.
+    d_w_t = _resolve_tensor(program, a["dw_weight"])
+    d_b_t = _resolve_tensor(program, a["dw_bias"]) if a["dw_bias"] is not None else None
+    dw_bias_with_offset_full = None
+    if d_b_t is not None and int(a["dw_input_offset"]) != 0:
+        d_w_int32 = d_w_t.detach().to(torch.int32)
+        sum_dw_per_c = d_w_int32.sum(dim=(0, 1, 2))
+        dw_offset_term = sum_dw_per_c * int(a["dw_input_offset"])
+        dw_bias_with_offset_full = (
+            d_b_t.detach().to(torch.int32).flatten() + dw_offset_term
+        ).to(torch.int32).contiguous()
+
+    # Project 1x1 with offset-fold.
+    p_w_t = _resolve_tensor(program, a["project_weight"])
+    p_b_t = _resolve_tensor(program, a["project_bias"]) if a["project_bias"] is not None else None
+    p_w_int32 = p_w_t.detach().to(torch.int32).contiguous()
+    sum_w_per_oc = p_w_int32.flatten(1).sum(dim=1)
+    offset_term = sum_w_per_oc * int(a["project_input_offset"])
+    if p_b_t is not None:
+        p_bias_folded = (
+            p_b_t.detach().to(torch.int32).flatten() + offset_term
+        ).to(torch.int32).contiguous()
+    else:
+        p_bias_folded = offset_term.to(torch.int32).contiguous()
+
+    return FusedDwconv2dConv2dLayer(
+        input=_slot_from_node(a["input"], offsets, sizes),
+        output=_slot_from_node(node, offsets, sizes),
+        dw_weight=d_w_t.detach().to(torch.int8).contiguous(),
+        dw_bias=d_b_t.detach().to(torch.int32).flatten().contiguous() if d_b_t is not None else None,
+        dw_bias_with_offset_full=dw_bias_with_offset_full,
+        dw_requantize_multipliers=_resolve_tensor(program, a["dw_requantize_multipliers"]).detach().to(torch.int32).flatten().contiguous(),
+        dw_requantize_shifts=_resolve_tensor(program, a["dw_requantize_shifts"]).detach().to(torch.int8).flatten().contiguous(),
+        dw_stride=_coerce_int_pair(a["dw_stride"]),
+        dw_padding=_coerce_int_pair(a["dw_padding"]),
+        dw_input_offset=int(a["dw_input_offset"]),
+        dw_output_offset=int(a["dw_output_offset"]),
+        dw_activation_min=int(a["dw_activation_min"]),
+        dw_activation_max=int(a["dw_activation_max"]),
+        project_weight=p_w_t.detach().to(torch.int8).contiguous(),
+        project_bias=p_bias_folded,
+        project_requantize_multipliers=_resolve_tensor(program, a["project_requantize_multipliers"]).detach().to(torch.int32).flatten().contiguous(),
+        project_requantize_shifts=_resolve_tensor(program, a["project_requantize_shifts"]).detach().to(torch.int8).flatten().contiguous(),
+        project_input_offset=0,  # folded into bias
+        project_output_offset=int(a["project_output_offset"]),
+        project_activation_min=int(a["project_activation_min"]),
+        project_activation_max=int(a["project_activation_max"]),
+    )
+
+
 def extract_quantized_add(node: Node, program: ExportedProgram, offsets, sizes) -> QuantizedAddLayer:
     a = _node_args_map(node, [
         "self", "self_zero_point", "self_multiplier", "self_shift",
@@ -780,6 +879,7 @@ EXTRACTORS = {
     "cortex_m.quantized_depthwise_conv2d.default": extract_quantized_depthwise_conv2d,
     "cortex_m.quantized_conv2d_dwconv2d_fused.default": extract_quantized_conv2d_dwconv2d_fused,
     "cortex_m.quantized_conv2d_dwconv2d_conv2d_fused.default": extract_quantized_conv2d_dwconv2d_conv2d_fused,
+    "cortex_m.quantized_dwconv2d_conv2d_fused.default": extract_quantized_dwconv2d_conv2d_fused,
     "cortex_m.quantized_add.default": extract_quantized_add,
     "cortex_m.pad.default": extract_cortex_m_pad,
     "aten.view_copy.default": _extract_memcpy,

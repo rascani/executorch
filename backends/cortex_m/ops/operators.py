@@ -1312,6 +1312,124 @@ def quantized_conv2d_dwconv2d_conv2d_fused_impl(
 
 
 # ===================================================================
+# FUSED DWCONV 3x3 + 1x1 PROJECT — for MV2 B0-style blocks (expand_ratio=1)
+# ===================================================================
+#
+# MV2's first inverted-residual block has expand_ratio=1 (no expand conv),
+# so it doesn't match the 3-op expand+dwconv+project pattern.  This op
+# fuses just the dwconv + project tail.  Eliminates the H*W*C_dw
+# intermediate between them; the dwconv output streams one row at a time
+# into the project conv via a single dwconv-row scratch buffer.
+
+lib.define(
+    "quantized_dwconv2d_conv2d_fused("
+    "Tensor input, "
+    "Tensor dw_weight, Tensor? dw_bias, "
+    "int[] dw_stride, int[] dw_padding, "
+    "int dw_input_offset, int dw_output_offset, "
+    "Tensor dw_requantize_multipliers, Tensor dw_requantize_shifts, "
+    "int dw_activation_min, int dw_activation_max, "
+    "Tensor project_weight, Tensor? project_bias, "
+    "int project_input_offset, int project_output_offset, "
+    "Tensor project_requantize_multipliers, Tensor project_requantize_shifts, "
+    "int project_activation_min, int project_activation_max"
+    ") -> Tensor"
+)
+
+
+lib.define(
+    "quantized_dwconv2d_conv2d_fused.out("
+    "Tensor input, "
+    "Tensor dw_weight, Tensor? dw_bias, "
+    "int[] dw_stride, int[] dw_padding, "
+    "int dw_input_offset, int dw_output_offset, "
+    "Tensor dw_requantize_multipliers, Tensor dw_requantize_shifts, "
+    "int dw_activation_min, int dw_activation_max, "
+    "Tensor project_weight, Tensor? project_bias, "
+    "int project_input_offset, int project_output_offset, "
+    "Tensor project_requantize_multipliers, Tensor project_requantize_shifts, "
+    "int project_activation_min, int project_activation_max, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+
+
+@register_fake("cortex_m::quantized_dwconv2d_conv2d_fused")  # type: ignore[misc]
+def quantized_dwconv2d_conv2d_fused_meta(
+    input: torch.Tensor,
+    dw_weight: torch.Tensor,
+    dw_bias: torch.Tensor | None,
+    dw_stride: Sequence[int],
+    dw_padding: Sequence[int],
+    dw_input_offset: int,
+    dw_output_offset: int,
+    dw_requantize_multipliers: torch.Tensor,
+    dw_requantize_shifts: torch.Tensor,
+    dw_activation_min: int,
+    dw_activation_max: int,
+    project_weight: torch.Tensor,
+    project_bias: torch.Tensor | None,
+    project_input_offset: int,
+    project_output_offset: int,
+    project_requantize_multipliers: torch.Tensor,
+    project_requantize_shifts: torch.Tensor,
+    project_activation_min: int,
+    project_activation_max: int,
+) -> torch.Tensor:
+    dw_shape = _compute_depthwise_conv2d_output_shape(
+        input.shape, dw_weight.shape, list(dw_stride), list(dw_padding), [1, 1]
+    )
+    output_shape = _compute_conv2d_output_shape(
+        dw_shape, project_weight.shape, (1, 1), (0, 0), (1, 1)
+    )
+    return torch.empty(
+        output_shape,
+        dtype=torch.int8,
+        device=input.device,
+        memory_format=torch.channels_last,
+    )
+
+
+@impl(lib, "quantized_dwconv2d_conv2d_fused", "CompositeExplicitAutograd")  # type: ignore[misc]
+def quantized_dwconv2d_conv2d_fused_impl(
+    input: torch.Tensor,
+    dw_weight: torch.Tensor,
+    dw_bias: torch.Tensor | None,
+    dw_stride: Sequence[int],
+    dw_padding: Sequence[int],
+    dw_input_offset: int,
+    dw_output_offset: int,
+    dw_requantize_multipliers: torch.Tensor,
+    dw_requantize_shifts: torch.Tensor,
+    dw_activation_min: int,
+    dw_activation_max: int,
+    project_weight: torch.Tensor,
+    project_bias: torch.Tensor | None,
+    project_input_offset: int,
+    project_output_offset: int,
+    project_requantize_multipliers: torch.Tensor,
+    project_requantize_shifts: torch.Tensor,
+    project_activation_min: int,
+    project_activation_max: int,
+) -> torch.Tensor:
+    dw_out = quantized_depthwise_conv2d_impl(
+        input, dw_weight, dw_bias,
+        dw_stride, dw_padding, (1, 1), 1,
+        dw_input_offset, dw_output_offset,
+        dw_requantize_multipliers, dw_requantize_shifts,
+        dw_activation_min, dw_activation_max,
+    )
+    return quantized_conv2d_impl(
+        dw_out,
+        project_weight, project_bias,
+        (1, 1), (0, 0), (1, 1),
+        project_input_offset, project_output_offset,
+        project_requantize_multipliers, project_requantize_shifts,
+        project_activation_min, project_activation_max,
+    )
+
+
+# ===================================================================
 # QUANTIZED TRANSPOSE_CONV2D OPERATION DEFINITION
 # ===================================================================
 
