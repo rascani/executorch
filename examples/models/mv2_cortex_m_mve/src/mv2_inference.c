@@ -3734,6 +3734,15 @@ static __attribute__((always_inline)) inline void quantize_stem_inverted_residua
   int b1_e_next_slot = 0;
 
   /* --- qin / stem row producers (same shape as Phase F) ------------------- */
+#if MV2_USE_MVE
+  #define _G_QUANT_ROW(_src, _dst) \
+    _quantize_input_row_mve((_src), (_dst), in_w, in_c, \
+        p->quant_scale, p->quant_zero_point, p->quant_qmin, p->quant_qmax)
+#else
+  #define _G_QUANT_ROW(_src, _dst) \
+    _quantize_input_row_scalar((_src), (_dst), in_w, in_c, \
+        p->quant_scale, p->quant_zero_point, p->quant_qmin, p->quant_qmax)
+#endif
   #define _G_ENSURE_QIN(row_idx) do { \
     if ((int32_t)(row_idx) >= 0 && (uint32_t)(row_idx) < in_h) { \
       int _found = 0; \
@@ -3741,11 +3750,9 @@ static __attribute__((always_inline)) inline void quantize_stem_inverted_residua
         if (qin_cached_row[_i] == (int32_t)(row_idx)) { _found = 1; break; } \
       if (!_found) { \
         qin_cached_row[qin_next_slot] = (int32_t)(row_idx); \
-        _quantize_input_row_scalar( \
+        _G_QUANT_ROW( \
             input_float + (size_t)(row_idx) * in_w * in_c, \
-            qin_rolling[qin_next_slot], in_w, in_c, \
-            p->quant_scale, p->quant_zero_point, \
-            p->quant_qmin, p->quant_qmax); \
+            qin_rolling[qin_next_slot]); \
         qin_next_slot = (qin_next_slot + 1) % 3; \
       } \
     } \
@@ -3758,6 +3765,33 @@ static __attribute__((always_inline)) inline void quantize_stem_inverted_residua
     } \
     _r; \
   })
+#if MV2_USE_MVE
+  #define _G_STEM_FROM_ROWS(_rows, _dst) do { \
+    if (p->stem_weight_packed_32 != (const int8_t*)0 && (stem_out_c & 3u) == 0u) { \
+      _stem_packed_row_mve_from_rows( \
+          (_rows), (_dst), in_w, stem_out_w, stem_out_c, \
+          p->stem_weight_packed_32, p->stem_bias, \
+          p->stem_requant_mults, p->stem_requant_shifts, \
+          p->stem_input_offset, p->stem_output_offset, \
+          p->stem_activation_min, p->stem_activation_max); \
+    } else { \
+      _stem_row_scalar_from_rows( \
+          (_rows), (_dst), in_w, stem_out_w, stem_out_c, \
+          p->stem_weight, p->stem_bias, \
+          p->stem_requant_mults, p->stem_requant_shifts, \
+          p->stem_input_offset, p->stem_output_offset, \
+          p->stem_activation_min, p->stem_activation_max); \
+    } \
+  } while (0)
+#else
+  #define _G_STEM_FROM_ROWS(_rows, _dst) \
+    _stem_row_scalar_from_rows( \
+        (_rows), (_dst), in_w, stem_out_w, stem_out_c, \
+        p->stem_weight, p->stem_bias, \
+        p->stem_requant_mults, p->stem_requant_shifts, \
+        p->stem_input_offset, p->stem_output_offset, \
+        p->stem_activation_min, p->stem_activation_max)
+#endif
   #define _G_COMPUTE_STEM_ROW(stem_oh, dst) do { \
     int32_t _g_stem_oh = (int32_t)(stem_oh); \
     if (_g_stem_oh < 0 || (uint32_t)_g_stem_oh >= stem_out_h) { \
@@ -3773,12 +3807,7 @@ static __attribute__((always_inline)) inline void quantize_stem_inverted_residua
         _G_GET_QIN(_g_stem_ih + 1), \
         _G_GET_QIN(_g_stem_ih + 2), \
       }; \
-      _stem_row_scalar_from_rows( \
-          _rows, (dst), in_w, stem_out_w, stem_out_c, \
-          p->stem_weight, p->stem_bias, \
-          p->stem_requant_mults, p->stem_requant_shifts, \
-          p->stem_input_offset, p->stem_output_offset, \
-          p->stem_activation_min, p->stem_activation_max); \
+      _G_STEM_FROM_ROWS(_rows, (dst)); \
     } \
   } while (0)
   #define _G_ENSURE_STEM(row_idx) do { \
@@ -3797,6 +3826,53 @@ static __attribute__((always_inline)) inline void quantize_stem_inverted_residua
       if (stem_cached_row[_i] == (int32_t)(row_idx)) { _r = stem_rolling[_i]; break; } \
     _r; \
   })
+
+  /* 1x1 row dispatch.  MVE helper requires out_c % 4 == 0 and input_offset
+   * folded into bias (in_off ignored in this fast path).  Falls back to a
+   * generic per-tap-offset scalar loop otherwise. */
+#if MV2_USE_MVE
+  #define _G_CONV1X1_ROW(_in, _dst, _w_in, _ic, _oc, _wt, _bias, _mults, _shifts, _in_off, _out_off, _amin, _amax) do { \
+    if (((_oc) & 3u) == 0u && (_bias) != (const int32_t*)0 && (_in_off) == 0) { \
+      _conv1x1_row_mve_args((_in), (_dst), (_w_in), (_ic), (_oc), \
+          (_wt), (_bias), (_mults), (_shifts), \
+          (_out_off), (_amin), (_amax)); \
+    } else { \
+      for (uint32_t _ow = 0; _ow < (_w_in); ++_ow) { \
+        const int8_t* _xp = (_in) + (size_t)_ow * (_ic); \
+        int8_t* _op = (_dst) + (size_t)_ow * (_oc); \
+        for (uint32_t _oc_i = 0; _oc_i < (_oc); ++_oc_i) { \
+          int32_t _acc = ((_bias) != (const int32_t*)0) ? (_bias)[_oc_i] : 0; \
+          const int8_t* _wo = (_wt) + (size_t)_oc_i * (_ic); \
+          for (uint32_t _ic_i = 0; _ic_i < (_ic); ++_ic_i) \
+            _acc += ((int32_t)_xp[_ic_i] + (_in_off)) * (int32_t)_wo[_ic_i]; \
+          _acc = scalar_requantize(_acc, (_mults)[_oc_i], (_shifts)[_oc_i]); \
+          _acc += (_out_off); \
+          if (_acc < (_amin)) _acc = (_amin); \
+          if (_acc > (_amax)) _acc = (_amax); \
+          _op[_oc_i] = (int8_t)_acc; \
+        } \
+      } \
+    } \
+  } while (0)
+#else
+  #define _G_CONV1X1_ROW(_in, _dst, _w_in, _ic, _oc, _wt, _bias, _mults, _shifts, _in_off, _out_off, _amin, _amax) do { \
+    for (uint32_t _ow = 0; _ow < (_w_in); ++_ow) { \
+      const int8_t* _xp = (_in) + (size_t)_ow * (_ic); \
+      int8_t* _op = (_dst) + (size_t)_ow * (_oc); \
+      for (uint32_t _oc_i = 0; _oc_i < (_oc); ++_oc_i) { \
+        int32_t _acc = ((_bias) != (const int32_t*)0) ? (_bias)[_oc_i] : 0; \
+        const int8_t* _wo = (_wt) + (size_t)_oc_i * (_ic); \
+        for (uint32_t _ic_i = 0; _ic_i < (_ic); ++_ic_i) \
+          _acc += ((int32_t)_xp[_ic_i] + (_in_off)) * (int32_t)_wo[_ic_i]; \
+        _acc = scalar_requantize(_acc, (_mults)[_oc_i], (_shifts)[_oc_i]); \
+        _acc += (_out_off); \
+        if (_acc < (_amin)) _acc = (_amin); \
+        if (_acc > (_amax)) _acc = (_amax); \
+        _op[_oc_i] = (int8_t)_acc; \
+      } \
+    } \
+  } while (0)
+#endif
 
   /* --- compute one B0 project row at b0_oh into dst ----------------------- */
   #define _G_COMPUTE_B0P_ROW(b0_oh, dst) do { \
@@ -3836,22 +3912,10 @@ static __attribute__((always_inline)) inline void quantize_stem_inverted_residua
           b0_dw_row_buf[(size_t)ow * stem_out_c + c] = (int8_t)acc; \
         } \
       } \
-      for (uint32_t ow = 0; ow < b0_out_w; ++ow) { \
-        const int8_t* x_pos = b0_dw_row_buf + (size_t)ow * stem_out_c; \
-        int8_t* out_pos = (dst) + (size_t)ow * b0_p_c; \
-        for (uint32_t oc = 0; oc < b0_p_c; ++oc) { \
-          int32_t acc = (p->b0_project_bias != (const int32_t*)0) ? p->b0_project_bias[oc] : 0; \
-          const int8_t* w_oc = p->b0_project_weight + (size_t)oc * stem_out_c; \
-          for (uint32_t ic = 0; ic < stem_out_c; ++ic) { \
-            acc += ((int32_t)x_pos[ic] + b0_p_in_off) * (int32_t)w_oc[ic]; \
-          } \
-          acc = scalar_requantize(acc, p->b0_project_requant_mults[oc], p->b0_project_requant_shifts[oc]); \
-          acc += b0_p_out_off; \
-          if (acc < b0_p_amin) acc = b0_p_amin; \
-          if (acc > b0_p_amax) acc = b0_p_amax; \
-          out_pos[oc] = (int8_t)acc; \
-        } \
-      } \
+      _G_CONV1X1_ROW(b0_dw_row_buf, (dst), b0_out_w, stem_out_c, b0_p_c, \
+          p->b0_project_weight, p->b0_project_bias, \
+          p->b0_project_requant_mults, p->b0_project_requant_shifts, \
+          b0_p_in_off, b0_p_out_off, b0_p_amin, b0_p_amax); \
     } \
   } while (0)
   #define _G_ENSURE_B0P(row_idx) do { \
@@ -3879,22 +3943,10 @@ static __attribute__((always_inline)) inline void quantize_stem_inverted_residua
     } else { \
       _G_ENSURE_B0P((int32_t)(b1e_oh)); \
       const int8_t* _in = _G_GET_B0P((int32_t)(b1e_oh)); \
-      for (uint32_t ow = 0; ow < b0_out_w; ++ow) { \
-        const int8_t* x_pos = _in + (size_t)ow * b0_p_c; \
-        int8_t* out_pos = (dst) + (size_t)ow * b1_e_c; \
-        for (uint32_t oc = 0; oc < b1_e_c; ++oc) { \
-          int32_t acc = (p->b1_expand_bias != (const int32_t*)0) ? p->b1_expand_bias[oc] : 0; \
-          const int8_t* w_oc = p->b1_expand_weight + (size_t)oc * b0_p_c; \
-          for (uint32_t ic = 0; ic < b0_p_c; ++ic) { \
-            acc += ((int32_t)x_pos[ic] + b1_e_in_off) * (int32_t)w_oc[ic]; \
-          } \
-          acc = scalar_requantize(acc, p->b1_expand_requant_mults[oc], p->b1_expand_requant_shifts[oc]); \
-          acc += b1_e_out_off; \
-          if (acc < b1_e_amin) acc = b1_e_amin; \
-          if (acc > b1_e_amax) acc = b1_e_amax; \
-          out_pos[oc] = (int8_t)acc; \
-        } \
-      } \
+      _G_CONV1X1_ROW(_in, (dst), b0_out_w, b0_p_c, b1_e_c, \
+          p->b1_expand_weight, p->b1_expand_bias, \
+          p->b1_expand_requant_mults, p->b1_expand_requant_shifts, \
+          b1_e_in_off, b1_e_out_off, b1_e_amin, b1_e_amax); \
     } \
   } while (0)
   #define _G_ENSURE_B1E(row_idx) do { \
@@ -3954,29 +4006,20 @@ static __attribute__((always_inline)) inline void quantize_stem_inverted_residua
 
     /* Step D: B1 project 1x1 directly into block output row. */
     int8_t* out_row = output + (size_t)oh * (size_t)out_w * b1_p_c;
-    for (uint32_t ow = 0; ow < out_w; ++ow) {
-      const int8_t* x_pos = b1_dw_row_buf + (size_t)ow * b1_e_c;
-      int8_t* out_pos = out_row + (size_t)ow * b1_p_c;
-      for (uint32_t oc = 0; oc < b1_p_c; ++oc) {
-        int32_t acc = (p->b1_project_bias != (const int32_t*)0) ? p->b1_project_bias[oc] : 0;
-        const int8_t* w_oc = p->b1_project_weight + (size_t)oc * b1_e_c;
-        for (uint32_t ic = 0; ic < b1_e_c; ++ic) {
-          acc += ((int32_t)x_pos[ic] + b1_p_in_off) * (int32_t)w_oc[ic];
-        }
-        acc = scalar_requantize(acc, p->b1_project_requant_mults[oc], p->b1_project_requant_shifts[oc]);
-        acc += b1_p_out_off;
-        if (acc < b1_p_amin) acc = b1_p_amin;
-        if (acc > b1_p_amax) acc = b1_p_amax;
-        out_pos[oc] = (int8_t)acc;
-      }
-    }
+    _G_CONV1X1_ROW(b1_dw_row_buf, out_row, out_w, b1_e_c, b1_p_c,
+        p->b1_project_weight, p->b1_project_bias,
+        p->b1_project_requant_mults, p->b1_project_requant_shifts,
+        b1_p_in_off, b1_p_out_off, b1_p_amin, b1_p_amax);
   }
 
   #undef _G_ENSURE_QIN
   #undef _G_GET_QIN
+  #undef _G_QUANT_ROW
+  #undef _G_STEM_FROM_ROWS
   #undef _G_COMPUTE_STEM_ROW
   #undef _G_ENSURE_STEM
   #undef _G_GET_STEM
+  #undef _G_CONV1X1_ROW
   #undef _G_COMPUTE_B0P_ROW
   #undef _G_ENSURE_B0P
   #undef _G_GET_B0P
