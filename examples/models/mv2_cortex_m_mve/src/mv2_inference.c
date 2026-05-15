@@ -2615,6 +2615,242 @@ static __attribute__((always_inline)) inline void dwconv2d_conv2d_fused_s8(
 
 
 /* ===========================================================================
+ * _dwconv3x3_row_s8 — one output row of a 3x3 depthwise conv, given 3 input
+ * rows (NHWC, in_c channels) and a destination buffer (out_w * in_c bytes).
+ *
+ * Mirrors the MVE-or-scalar dwconv block embedded in Phase F's
+ * inverted_residual_fused_s8.  Factored out so both Phase F (and other
+ * inverted-residual variants) and Phase G (B0 dw, B1 dw inside the
+ * mega-fused kernel) can share one implementation.
+ *
+ * - MVE fast path: stride_w == 1 (4-pixel × 4-OC interior) or stride_w == 2
+ *   (2-pixel × 4-OC interior).  Requires in_c % 4 == 0, pad_h == pad_w == 1,
+ *   and a folded bias_with_offset_full pointer (interior reads load the
+ *   bias once and skip the per-tap input_offset add).  Falls back to a
+ *   pure scalar loop when any precondition fails.
+ * - Boundary pixels (left/right/top/bottom edges of the row) use a
+ *   per-tap-offset scalar (MVE-channel-vectorized in the MVE build) so the
+ *   helper can handle arbitrary boundary cases uniformly.
+ * ===========================================================================
+ */
+static __attribute__((always_inline)) inline void _dwconv3x3_row_s8(
+    const int8_t* row_at[3],
+    int8_t* out_row,
+    int32_t ih_base,
+    uint32_t in_h, uint32_t in_w,
+    uint32_t in_c,
+    uint32_t out_w,
+    uint32_t stride_w,
+    int32_t pad_h, int32_t pad_w,
+    const int8_t*  dw_weight,
+    const int32_t* dw_bias,
+    const int32_t* dw_bias_with_offset_full,
+    const int32_t* requant_mults,
+    const int8_t*  requant_shifts,
+    int32_t in_off, int32_t out_off,
+    int32_t act_min, int32_t act_max) {
+#if MV2_USE_MVE
+  const int can_mve = (in_c & 3u) == 0u
+      && dw_bias_with_offset_full != (const int32_t*)0
+      && pad_h == 1 && pad_w == 1
+      && (stride_w == 1u || stride_w == 2u);
+  if (can_mve) {
+    const int32x4_t v_act_min = vdupq_n_s32(act_min);
+    const int32x4_t v_act_max = vdupq_n_s32(act_max);
+    const int32x4_t v_in_off = vdupq_n_s32(in_off);
+    const size_t w_row_stride = (size_t)3 * in_c;
+
+    uint32_t ow_mve_start, ow_mve_end;
+    if (stride_w == 1u) {
+      ow_mve_start = 1u;
+      ow_mve_end = (out_w >= 5u) ? (out_w - 4u) : 1u;
+    } else {
+      ow_mve_start = 1u;
+      ow_mve_end = (in_w >= 4u) ? ((in_w - 3u) / 2u) : 1u;
+      if (ow_mve_end > out_w) ow_mve_end = out_w;
+      ow_mve_end = ow_mve_start + ((ow_mve_end - ow_mve_start) & ~1u);
+    }
+    if (ow_mve_end <= ow_mve_start) ow_mve_end = ow_mve_start;
+
+    #define _DW_BOUNDARY_PIXEL(ow_val) \
+    do { \
+      const uint32_t _ow = (ow_val); \
+      const int32_t _iw_base = (int32_t)(_ow * stride_w); \
+      for (uint32_t cb = 0; cb < in_c; cb += 4) { \
+        int32x4_t acc = (dw_bias != (const int32_t*)0) \
+            ? vld1q_s32(dw_bias + cb) : vdupq_n_s32(0); \
+        for (int dr = 0; dr < 3; ++dr) { \
+          const int32_t sr = ih_base + dr - pad_h; \
+          if (sr < 0 || (uint32_t)sr >= in_h) continue; \
+          const int8_t* row = row_at[dr]; \
+          const int8_t* w_row = dw_weight + (size_t)dr * w_row_stride + cb; \
+          for (int dc = 0; dc < 3; ++dc) { \
+            const int32_t sc = _iw_base + dc - pad_w; \
+            if (sc < 0 || (uint32_t)sc >= in_w) continue; \
+            int32x4_t x = vldrbq_s32(row + (size_t)sc * in_c + cb); \
+            int32x4_t w = vldrbq_s32(w_row + (size_t)dc * in_c); \
+            x = vaddq_s32(x, v_in_off); \
+            acc = vaddq_s32(acc, vmulq_s32(x, w)); \
+          } \
+        } \
+        int32x4_t mult = vld1q_s32(requant_mults + cb); \
+        int32x4_t shft = vldrbq_s32(requant_shifts + cb); \
+        acc = mve_requantize_per_channel_neg_shift(acc, mult, shft); \
+        acc = vaddq_n_s32(acc, out_off); \
+        acc = vminq_s32(vmaxq_s32(acc, v_act_min), v_act_max); \
+        vstrbq_s32(out_row + (size_t)_ow * in_c + cb, acc); \
+      } \
+    } while (0)
+
+    /* Left boundary */
+    for (uint32_t ow = 0; ow < ow_mve_start && ow < out_w; ++ow) {
+      _DW_BOUNDARY_PIXEL(ow);
+    }
+
+    /* Interior MVE tiles */
+    if (stride_w == 1u) {
+      for (uint32_t ow_base = ow_mve_start;
+           ow_base + 4 <= out_w && ow_base + 4 <= ow_mve_end + 3;
+           ow_base += 4) {
+        for (uint32_t cb = 0; cb < in_c; cb += 4) {
+          int32x4_t bias_v = vld1q_s32(dw_bias_with_offset_full + cb);
+          int32x4_t acc0 = bias_v, acc1 = bias_v, acc2 = bias_v, acc3 = bias_v;
+          for (int dr = 0; dr < 3; ++dr) {
+            const int8_t* x_base = row_at[dr]
+                + (size_t)(ow_base - 1) * in_c + cb;
+            const int8_t* w_base = dw_weight + (size_t)dr * w_row_stride + cb;
+            int32x4_t w0 = vldrbq_s32(w_base + 0 * in_c);
+            int32x4_t w1 = vldrbq_s32(w_base + 1 * in_c);
+            int32x4_t w2 = vldrbq_s32(w_base + 2 * in_c);
+            int32x4_t x0 = vldrbq_s32(x_base + 0 * in_c);
+            int32x4_t x1 = vldrbq_s32(x_base + 1 * in_c);
+            int32x4_t x2 = vldrbq_s32(x_base + 2 * in_c);
+            int32x4_t x3 = vldrbq_s32(x_base + 3 * in_c);
+            int32x4_t x4 = vldrbq_s32(x_base + 4 * in_c);
+            int32x4_t x5 = vldrbq_s32(x_base + 5 * in_c);
+            acc0 = vaddq_s32(acc0, vmulq_s32(x0, w0));
+            acc0 = vaddq_s32(acc0, vmulq_s32(x1, w1));
+            acc0 = vaddq_s32(acc0, vmulq_s32(x2, w2));
+            acc1 = vaddq_s32(acc1, vmulq_s32(x1, w0));
+            acc1 = vaddq_s32(acc1, vmulq_s32(x2, w1));
+            acc1 = vaddq_s32(acc1, vmulq_s32(x3, w2));
+            acc2 = vaddq_s32(acc2, vmulq_s32(x2, w0));
+            acc2 = vaddq_s32(acc2, vmulq_s32(x3, w1));
+            acc2 = vaddq_s32(acc2, vmulq_s32(x4, w2));
+            acc3 = vaddq_s32(acc3, vmulq_s32(x3, w0));
+            acc3 = vaddq_s32(acc3, vmulq_s32(x4, w1));
+            acc3 = vaddq_s32(acc3, vmulq_s32(x5, w2));
+          }
+          int32x4_t mult = vld1q_s32(requant_mults + cb);
+          int32x4_t shft = vldrbq_s32(requant_shifts + cb);
+          acc0 = mve_requantize_per_channel_neg_shift(acc0, mult, shft);
+          acc1 = mve_requantize_per_channel_neg_shift(acc1, mult, shft);
+          acc2 = mve_requantize_per_channel_neg_shift(acc2, mult, shft);
+          acc3 = mve_requantize_per_channel_neg_shift(acc3, mult, shft);
+          acc0 = vaddq_n_s32(acc0, out_off);
+          acc1 = vaddq_n_s32(acc1, out_off);
+          acc2 = vaddq_n_s32(acc2, out_off);
+          acc3 = vaddq_n_s32(acc3, out_off);
+          acc0 = vminq_s32(vmaxq_s32(acc0, v_act_min), v_act_max);
+          acc1 = vminq_s32(vmaxq_s32(acc1, v_act_min), v_act_max);
+          acc2 = vminq_s32(vmaxq_s32(acc2, v_act_min), v_act_max);
+          acc3 = vminq_s32(vmaxq_s32(acc3, v_act_min), v_act_max);
+          int8_t* o = out_row + (size_t)ow_base * in_c + cb;
+          vstrbq_s32(o + 0 * in_c, acc0);
+          vstrbq_s32(o + 1 * in_c, acc1);
+          vstrbq_s32(o + 2 * in_c, acc2);
+          vstrbq_s32(o + 3 * in_c, acc3);
+        }
+      }
+    } else {
+      for (uint32_t ow_base = ow_mve_start;
+           ow_base + 2 <= out_w && ow_base + 2 <= ow_mve_end + 1;
+           ow_base += 2) {
+        if ((int32_t)(ow_base * 2u + 3u) >= (int32_t)in_w) break;
+        for (uint32_t cb = 0; cb < in_c; cb += 4) {
+          int32x4_t bias_v = vld1q_s32(dw_bias_with_offset_full + cb);
+          int32x4_t acc0 = bias_v, acc1 = bias_v;
+          for (int dr = 0; dr < 3; ++dr) {
+            const int8_t* x_base = row_at[dr]
+                + (size_t)(ow_base * 2u - 1u) * in_c + cb;
+            const int8_t* w_base = dw_weight + (size_t)dr * w_row_stride + cb;
+            int32x4_t w0 = vldrbq_s32(w_base + 0 * in_c);
+            int32x4_t w1 = vldrbq_s32(w_base + 1 * in_c);
+            int32x4_t w2 = vldrbq_s32(w_base + 2 * in_c);
+            int32x4_t x0 = vldrbq_s32(x_base + 0 * in_c);
+            int32x4_t x1 = vldrbq_s32(x_base + 1 * in_c);
+            int32x4_t x2 = vldrbq_s32(x_base + 2 * in_c);
+            int32x4_t x3 = vldrbq_s32(x_base + 3 * in_c);
+            int32x4_t x4 = vldrbq_s32(x_base + 4 * in_c);
+            acc0 = vaddq_s32(acc0, vmulq_s32(x0, w0));
+            acc0 = vaddq_s32(acc0, vmulq_s32(x1, w1));
+            acc0 = vaddq_s32(acc0, vmulq_s32(x2, w2));
+            acc1 = vaddq_s32(acc1, vmulq_s32(x2, w0));
+            acc1 = vaddq_s32(acc1, vmulq_s32(x3, w1));
+            acc1 = vaddq_s32(acc1, vmulq_s32(x4, w2));
+          }
+          int32x4_t mult = vld1q_s32(requant_mults + cb);
+          int32x4_t shft = vldrbq_s32(requant_shifts + cb);
+          acc0 = mve_requantize_per_channel_neg_shift(acc0, mult, shft);
+          acc1 = mve_requantize_per_channel_neg_shift(acc1, mult, shft);
+          acc0 = vaddq_n_s32(acc0, out_off);
+          acc1 = vaddq_n_s32(acc1, out_off);
+          acc0 = vminq_s32(vmaxq_s32(acc0, v_act_min), v_act_max);
+          acc1 = vminq_s32(vmaxq_s32(acc1, v_act_min), v_act_max);
+          int8_t* o = out_row + (size_t)ow_base * in_c + cb;
+          vstrbq_s32(o + 0 * in_c, acc0);
+          vstrbq_s32(o + 1 * in_c, acc1);
+        }
+      }
+    }
+
+    /* Right tail */
+    uint32_t ow_tail_start;
+    if (stride_w == 1u) {
+      ow_tail_start = ow_mve_start + ((ow_mve_end > ow_mve_start)
+          ? ((ow_mve_end - ow_mve_start - 1) / 4 + 1) * 4 : 0);
+    } else {
+      ow_tail_start = ow_mve_start + ((ow_mve_end > ow_mve_start)
+          ? ((ow_mve_end - ow_mve_start - 1) / 2 + 1) * 2 : 0);
+    }
+    if (ow_tail_start > out_w) ow_tail_start = out_w;
+    for (uint32_t ow = ow_tail_start; ow < out_w; ++ow) {
+      _DW_BOUNDARY_PIXEL(ow);
+    }
+    #undef _DW_BOUNDARY_PIXEL
+    return;
+  }
+#endif
+
+  /* Scalar fallback (also taken for any MVE-unsuitable channel/padding) */
+  for (uint32_t ow = 0; ow < out_w; ++ow) {
+    const int32_t iw_base = (int32_t)(ow * stride_w);
+    for (uint32_t c = 0; c < in_c; ++c) {
+      int32_t acc = (dw_bias != (const int32_t*)0) ? dw_bias[c] : 0;
+      for (int dr = 0; dr < 3; ++dr) {
+        const int32_t sr = ih_base + dr - pad_h;
+        if (sr < 0 || (uint32_t)sr >= in_h) continue;
+        const int8_t* row = row_at[dr];
+        if (!row) continue;
+        for (int dc = 0; dc < 3; ++dc) {
+          const int32_t sc = iw_base + dc - pad_w;
+          if (sc < 0 || (uint32_t)sc >= in_w) continue;
+          const int32_t x = (int32_t)row[(size_t)sc * in_c + c] + in_off;
+          const int32_t w = (int32_t)dw_weight[((size_t)dr * 3 + dc) * in_c + c];
+          acc += x * w;
+        }
+      }
+      acc = scalar_requantize(acc, requant_mults[c], requant_shifts[c]);
+      acc += out_off;
+      if (acc < act_min) acc = act_min;
+      if (acc > act_max) acc = act_max;
+      out_row[(size_t)ow * in_c + c] = (int8_t)acc;
+    }
+  }
+}
+
+
+/* ===========================================================================
  * inverted_residual_fused_s8 — full MV2 inverted-residual block in one call.
  *
  * Fuses 1x1 expand + 3x3 dwconv + 1x1 project [+ optional int8 residual
@@ -3889,29 +4125,12 @@ static __attribute__((always_inline)) inline void quantize_stem_inverted_residua
         _G_GET_STEM(_g_b0p_oh + 0), \
         _G_GET_STEM(_g_b0p_oh + 1), \
       }; \
-      for (uint32_t ow = 0; ow < b0_out_w; ++ow) { \
-        const int32_t iw_base = (int32_t)(ow * b0_dw_stride_w); \
-        for (uint32_t c = 0; c < stem_out_c; ++c) { \
-          int32_t acc = (p->b0_dw_bias != (const int32_t*)0) ? p->b0_dw_bias[c] : 0; \
-          for (int dr = 0; dr < 3; ++dr) { \
-            const int32_t sr = _g_b0p_oh + dr - b0_dw_pad_h; \
-            if (sr < 0 || (uint32_t)sr >= stem_out_h) continue; \
-            const int8_t* row = _srows[dr]; \
-            for (int dc = 0; dc < 3; ++dc) { \
-              const int32_t sc = iw_base + dc - b0_dw_pad_w; \
-              if (sc < 0 || (uint32_t)sc >= stem_out_w) continue; \
-              const int32_t x = (int32_t)row[(size_t)sc * stem_out_c + c] + b0_dw_in_off; \
-              const int32_t w = (int32_t)p->b0_dw_weight[((size_t)dr * 3 + dc) * stem_out_c + c]; \
-              acc += x * w; \
-            } \
-          } \
-          acc = scalar_requantize(acc, p->b0_dw_requant_mults[c], p->b0_dw_requant_shifts[c]); \
-          acc += b0_dw_out_off; \
-          if (acc < b0_dw_amin) acc = b0_dw_amin; \
-          if (acc > b0_dw_amax) acc = b0_dw_amax; \
-          b0_dw_row_buf[(size_t)ow * stem_out_c + c] = (int8_t)acc; \
-        } \
-      } \
+      _dwconv3x3_row_s8(_srows, b0_dw_row_buf, _g_b0p_oh, \
+          stem_out_h, stem_out_w, stem_out_c, \
+          b0_out_w, b0_dw_stride_w, b0_dw_pad_h, b0_dw_pad_w, \
+          p->b0_dw_weight, p->b0_dw_bias, p->b0_dw_bias_with_offset_full, \
+          p->b0_dw_requant_mults, p->b0_dw_requant_shifts, \
+          b0_dw_in_off, b0_dw_out_off, b0_dw_amin, b0_dw_amax); \
       _G_CONV1X1_ROW(b0_dw_row_buf, (dst), b0_out_w, stem_out_c, b0_p_c, \
           p->b0_project_weight, p->b0_project_bias, \
           p->b0_project_requant_mults, p->b0_project_requant_shifts, \
@@ -3979,30 +4198,12 @@ static __attribute__((always_inline)) inline void quantize_stem_inverted_residua
     };
 
     /* Step C: B1 dwconv row into b1_dw_row_buf. */
-    for (uint32_t ow = 0; ow < b1_dw_out_w; ++ow) {
-      const int32_t iw_base = (int32_t)(ow * b1_dw_stride_w);
-      for (uint32_t c = 0; c < b1_e_c; ++c) {
-        int32_t acc = (p->b1_dw_bias != (const int32_t*)0) ? p->b1_dw_bias[c] : 0;
-        for (int dr = 0; dr < 3; ++dr) {
-          const int32_t sr = ih_base + dr - b1_dw_pad_h;
-          if (sr < 0 || (uint32_t)sr >= b0_out_h) continue;
-          const int8_t* row = row_at[dr];
-          if (!row) continue;
-          for (int dc = 0; dc < 3; ++dc) {
-            const int32_t sc = iw_base + dc - b1_dw_pad_w;
-            if (sc < 0 || (uint32_t)sc >= b0_out_w) continue;
-            const int32_t x = (int32_t)row[(size_t)sc * b1_e_c + c] + b1_dw_in_off;
-            const int32_t w = (int32_t)p->b1_dw_weight[((size_t)dr * 3 + dc) * b1_e_c + c];
-            acc += x * w;
-          }
-        }
-        acc = scalar_requantize(acc, p->b1_dw_requant_mults[c], p->b1_dw_requant_shifts[c]);
-        acc += b1_dw_out_off;
-        if (acc < b1_dw_amin) acc = b1_dw_amin;
-        if (acc > b1_dw_amax) acc = b1_dw_amax;
-        b1_dw_row_buf[(size_t)ow * b1_e_c + c] = (int8_t)acc;
-      }
-    }
+    _dwconv3x3_row_s8(row_at, b1_dw_row_buf, ih_base,
+        b0_out_h, b0_out_w, b1_e_c,
+        b1_dw_out_w, b1_dw_stride_w, b1_dw_pad_h, b1_dw_pad_w,
+        p->b1_dw_weight, p->b1_dw_bias, p->b1_dw_bias_with_offset_full,
+        p->b1_dw_requant_mults, p->b1_dw_requant_shifts,
+        b1_dw_in_off, b1_dw_out_off, b1_dw_amin, b1_dw_amax);
 
     /* Step D: B1 project 1x1 directly into block output row. */
     int8_t* out_row = output + (size_t)oh * (size_t)out_w * b1_p_c;
