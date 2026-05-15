@@ -202,6 +202,51 @@ class FusedInvertedResidualLayer:
 
 
 @dataclass
+class FusedStemDwconv2dConv2dLayer:
+    """MV2 first-stage chain fused: stem conv (3x3 stride-2 pad-1 Cin=3)
+    + B0 dwconv (3x3 stride-1 pad-1) + B0 project (1x1).  Streams stem
+    output rows into a 3-row rolling buffer the dwconv consumes
+    immediately, then a 1-row dwconv-output scratch fed into the
+    project.  Eliminates both the stem output (32ch x 112^2 = 401 KB at
+    1.0/r=224) and the dwconv output from the arena.
+    """
+    kernel: str = "stem_dwconv2d_conv2d_fused_s8"
+    input: TensorSlot = None
+    output: TensorSlot = None
+    # Stem 3x3 stride-2
+    stem_weight: torch.Tensor = None  # OHWI [stem_out_c, 3, 3, 3]
+    stem_bias: Optional[torch.Tensor] = None  # offset-folded
+    stem_weight_packed_32: Optional[torch.Tensor] = None
+    stem_requantize_multipliers: torch.Tensor = None
+    stem_requantize_shifts: torch.Tensor = None
+    stem_input_offset: int = 0  # original (not folded) — needed for pad fill
+    stem_output_offset: int = 0
+    stem_activation_min: int = -128
+    stem_activation_max: int = 127
+    # Dwconv 3x3
+    dw_weight: torch.Tensor = None
+    dw_bias: Optional[torch.Tensor] = None
+    dw_bias_with_offset_full: Optional[torch.Tensor] = None
+    dw_requantize_multipliers: torch.Tensor = None
+    dw_requantize_shifts: torch.Tensor = None
+    dw_stride: tuple = (1, 1)
+    dw_padding: tuple = (1, 1)
+    dw_input_offset: int = 0
+    dw_output_offset: int = 0
+    dw_activation_min: int = -128
+    dw_activation_max: int = 127
+    # Project 1x1
+    project_weight: torch.Tensor = None
+    project_bias: Optional[torch.Tensor] = None
+    project_requantize_multipliers: torch.Tensor = None
+    project_requantize_shifts: torch.Tensor = None
+    project_input_offset: int = 0
+    project_output_offset: int = 0
+    project_activation_min: int = -128
+    project_activation_max: int = 127
+
+
+@dataclass
 class FusedDwconv2dConv2dLayer:
     """MV2 B0-style block (expand_ratio=1): 3x3 dwconv + 1x1 project fused.
 
@@ -740,6 +785,104 @@ def extract_quantized_conv2d_dwconv2d_conv2d_fused(
     )
 
 
+def extract_quantized_stem_dwconv2d_conv2d_fused(
+    node: Node, program: ExportedProgram, offsets, sizes
+) -> FusedStemDwconv2dConv2dLayer:
+    a = _node_args_map(node, [
+        "input",
+        "stem_weight", "stem_bias",
+        "stem_input_offset", "stem_output_offset",
+        "stem_requantize_multipliers", "stem_requantize_shifts",
+        "stem_activation_min", "stem_activation_max",
+        "dw_weight", "dw_bias",
+        "dw_stride", "dw_padding",
+        "dw_input_offset", "dw_output_offset",
+        "dw_requantize_multipliers", "dw_requantize_shifts",
+        "dw_activation_min", "dw_activation_max",
+        "project_weight", "project_bias",
+        "project_input_offset", "project_output_offset",
+        "project_requantize_multipliers", "project_requantize_shifts",
+        "project_activation_min", "project_activation_max",
+    ])
+
+    # Stem 3x3 with packed-32 weight prep + bias_with_offset fold.
+    s_w_t = _resolve_tensor(program, a["stem_weight"])
+    s_b_t = _resolve_tensor(program, a["stem_bias"]) if a["stem_bias"] is not None else None
+    s_w_int32 = s_w_t.detach().to(torch.int32).contiguous()
+    out_c, kh, kw, in_c = s_w_int32.shape
+    # OHWI flatten = (kh, kw, ic) = 27 elements, pad to 32 with zeros.
+    flat = s_w_int32.reshape(out_c, kh * kw * in_c)  # [out_c, 27]
+    pad = torch.zeros((out_c, 32 - flat.shape[1]), dtype=torch.int32)
+    s_w_packed_32 = torch.cat([flat, pad], dim=1).to(torch.int8).contiguous()
+    # Bias-with-offset fold (per OC: bias + stem_input_offset * sum(w)).
+    sum_w_per_oc = s_w_int32.flatten(1).sum(dim=1)
+    s_offset_term = sum_w_per_oc * int(a["stem_input_offset"])
+    if s_b_t is not None:
+        s_bias_folded = (
+            s_b_t.detach().to(torch.int32).flatten() + s_offset_term
+        ).to(torch.int32).contiguous()
+    else:
+        s_bias_folded = s_offset_term.to(torch.int32).contiguous()
+
+    # Dwconv 3x3 (same logic as dwconv-only extractor).
+    d_w_t = _resolve_tensor(program, a["dw_weight"])
+    d_b_t = _resolve_tensor(program, a["dw_bias"]) if a["dw_bias"] is not None else None
+    dw_bias_with_offset_full = None
+    if d_b_t is not None and int(a["dw_input_offset"]) != 0:
+        d_w_int32 = d_w_t.detach().to(torch.int32)
+        sum_dw_per_c = d_w_int32.sum(dim=(0, 1, 2))
+        dw_offset_term = sum_dw_per_c * int(a["dw_input_offset"])
+        dw_bias_with_offset_full = (
+            d_b_t.detach().to(torch.int32).flatten() + dw_offset_term
+        ).to(torch.int32).contiguous()
+
+    # Project 1x1 with offset fold.
+    p_w_t = _resolve_tensor(program, a["project_weight"])
+    p_b_t = _resolve_tensor(program, a["project_bias"]) if a["project_bias"] is not None else None
+    p_w_int32 = p_w_t.detach().to(torch.int32).contiguous()
+    sum_w_per_oc_p = p_w_int32.flatten(1).sum(dim=1)
+    p_offset_term = sum_w_per_oc_p * int(a["project_input_offset"])
+    if p_b_t is not None:
+        p_bias_folded = (
+            p_b_t.detach().to(torch.int32).flatten() + p_offset_term
+        ).to(torch.int32).contiguous()
+    else:
+        p_bias_folded = p_offset_term.to(torch.int32).contiguous()
+
+    return FusedStemDwconv2dConv2dLayer(
+        input=_slot_from_node(a["input"], offsets, sizes),
+        output=_slot_from_node(node, offsets, sizes),
+        stem_weight=s_w_t.detach().to(torch.int8).contiguous(),
+        stem_bias=s_bias_folded,
+        stem_weight_packed_32=s_w_packed_32,
+        stem_requantize_multipliers=_resolve_tensor(program, a["stem_requantize_multipliers"]).detach().to(torch.int32).flatten().contiguous(),
+        stem_requantize_shifts=_resolve_tensor(program, a["stem_requantize_shifts"]).detach().to(torch.int8).flatten().contiguous(),
+        stem_input_offset=int(a["stem_input_offset"]),  # kept for pad-fill (-input_offset)
+        stem_output_offset=int(a["stem_output_offset"]),
+        stem_activation_min=int(a["stem_activation_min"]),
+        stem_activation_max=int(a["stem_activation_max"]),
+        dw_weight=d_w_t.detach().to(torch.int8).contiguous(),
+        dw_bias=d_b_t.detach().to(torch.int32).flatten().contiguous() if d_b_t is not None else None,
+        dw_bias_with_offset_full=dw_bias_with_offset_full,
+        dw_requantize_multipliers=_resolve_tensor(program, a["dw_requantize_multipliers"]).detach().to(torch.int32).flatten().contiguous(),
+        dw_requantize_shifts=_resolve_tensor(program, a["dw_requantize_shifts"]).detach().to(torch.int8).flatten().contiguous(),
+        dw_stride=_coerce_int_pair(a["dw_stride"]),
+        dw_padding=_coerce_int_pair(a["dw_padding"]),
+        dw_input_offset=int(a["dw_input_offset"]),
+        dw_output_offset=int(a["dw_output_offset"]),
+        dw_activation_min=int(a["dw_activation_min"]),
+        dw_activation_max=int(a["dw_activation_max"]),
+        project_weight=p_w_t.detach().to(torch.int8).contiguous(),
+        project_bias=p_bias_folded,
+        project_requantize_multipliers=_resolve_tensor(program, a["project_requantize_multipliers"]).detach().to(torch.int32).flatten().contiguous(),
+        project_requantize_shifts=_resolve_tensor(program, a["project_requantize_shifts"]).detach().to(torch.int8).flatten().contiguous(),
+        project_input_offset=0,  # folded into bias
+        project_output_offset=int(a["project_output_offset"]),
+        project_activation_min=int(a["project_activation_min"]),
+        project_activation_max=int(a["project_activation_max"]),
+    )
+
+
 def extract_quantized_dwconv2d_conv2d_fused(
     node: Node, program: ExportedProgram, offsets, sizes
 ) -> FusedDwconv2dConv2dLayer:
@@ -880,6 +1023,7 @@ EXTRACTORS = {
     "cortex_m.quantized_conv2d_dwconv2d_fused.default": extract_quantized_conv2d_dwconv2d_fused,
     "cortex_m.quantized_conv2d_dwconv2d_conv2d_fused.default": extract_quantized_conv2d_dwconv2d_conv2d_fused,
     "cortex_m.quantized_dwconv2d_conv2d_fused.default": extract_quantized_dwconv2d_conv2d_fused,
+    "cortex_m.quantized_stem_dwconv2d_conv2d_fused.default": extract_quantized_stem_dwconv2d_conv2d_fused,
     "cortex_m.quantized_add.default": extract_quantized_add,
     "cortex_m.pad.default": extract_cortex_m_pad,
     "aten.view_copy.default": _extract_memcpy,

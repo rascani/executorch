@@ -176,6 +176,53 @@ typedef struct {
 } FusedConv2dDwconv2dParams;
 
 typedef struct {
+  /* MV2 first-stage chain: stem 3x3 stride-2 pad-1 Cin=3 -> B0 dwconv 3x3
+   * stride-1 pad-1 -> B0 project 1x1.  Streams stem output rows into a
+   * 3-row rolling buffer the dwconv consumes immediately, then a 1-row
+   * dwconv-output scratch into the project. */
+  uint32_t in_h, in_w, in_c;        /* in_c == 3 */
+  uint32_t stem_out_h, stem_out_w;  /* = in_{h,w}/2 */
+  uint32_t stem_out_c;
+  uint32_t out_h, out_w;            /* project output spatial */
+  uint32_t project_out_c;
+  uint32_t stem_kernel_h, stem_kernel_w;  /* always 3 */
+  uint32_t stem_stride_h, stem_stride_w;  /* always 2 */
+  uint32_t stem_pad_h, stem_pad_w;        /* always 1 */
+  uint32_t dw_kernel_h, dw_kernel_w;      /* always 3 */
+  uint32_t dw_stride_h, dw_stride_w;
+  uint32_t dw_pad_h, dw_pad_w;
+  /* Stem 3x3 with optional packed-32 weight layout. */
+  const int8_t*  stem_weight;
+  const int8_t*  stem_weight_packed_32;
+  const int32_t* stem_bias;
+  const int32_t* stem_requant_mults;
+  const int8_t*  stem_requant_shifts;
+  int32_t stem_input_offset;        /* original, NOT folded — used for pad fill */
+  int32_t stem_output_offset;
+  int8_t  stem_activation_min;
+  int8_t  stem_activation_max;
+  /* Dwconv 3x3 */
+  const int8_t*  dw_weight;
+  const int32_t* dw_bias;
+  const int32_t* dw_bias_with_offset_full;
+  const int32_t* dw_requant_mults;
+  const int8_t*  dw_requant_shifts;
+  int32_t dw_input_offset;
+  int32_t dw_output_offset;
+  int8_t  dw_activation_min;
+  int8_t  dw_activation_max;
+  /* Project 1x1 */
+  const int8_t*  project_weight;
+  const int32_t* project_bias;
+  const int32_t* project_requant_mults;
+  const int8_t*  project_requant_shifts;
+  int32_t project_input_offset;
+  int32_t project_output_offset;
+  int8_t  project_activation_min;
+  int8_t  project_activation_max;
+} FusedStemDwconv2dConv2dParams;
+
+typedef struct {
   /* MV2 B0-style block (expand_ratio=1): 3x3 dwconv -> 1x1 project, no
    * preceding expand conv.  Single rolling-row scratch for the dwconv
    * output that the project conv consumes immediately. */

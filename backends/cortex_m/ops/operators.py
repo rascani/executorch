@@ -1430,6 +1430,158 @@ def quantized_dwconv2d_conv2d_fused_impl(
 
 
 # ===================================================================
+# FUSED STEM + DWCONV + PROJECT — for MV2 first-block chain
+# ===================================================================
+#
+# MV2 starts with: stem conv (3x3 stride-2 pad-1, in_c=3) -> B0 dwconv
+# (3x3 stride-1 pad-1, no expand because B0 has expand_ratio=1) -> B0
+# project (1x1).  At 1.0/r=224 the stem output (32 ch x 112^2 = 401 KB)
+# and B0 dwconv output (same shape) together drive the arena peak.
+# DwconvProjectFusionPass eliminates the dwconv output; this op
+# eliminates the stem output too by streaming it through a 3-row
+# rolling buffer the dwconv consumes immediately.
+
+lib.define(
+    "quantized_stem_dwconv2d_conv2d_fused("
+    "Tensor input, "
+    "Tensor stem_weight, Tensor? stem_bias, "
+    "int stem_input_offset, int stem_output_offset, "
+    "Tensor stem_requantize_multipliers, Tensor stem_requantize_shifts, "
+    "int stem_activation_min, int stem_activation_max, "
+    "Tensor dw_weight, Tensor? dw_bias, "
+    "int[] dw_stride, int[] dw_padding, "
+    "int dw_input_offset, int dw_output_offset, "
+    "Tensor dw_requantize_multipliers, Tensor dw_requantize_shifts, "
+    "int dw_activation_min, int dw_activation_max, "
+    "Tensor project_weight, Tensor? project_bias, "
+    "int project_input_offset, int project_output_offset, "
+    "Tensor project_requantize_multipliers, Tensor project_requantize_shifts, "
+    "int project_activation_min, int project_activation_max"
+    ") -> Tensor"
+)
+
+
+lib.define(
+    "quantized_stem_dwconv2d_conv2d_fused.out("
+    "Tensor input, "
+    "Tensor stem_weight, Tensor? stem_bias, "
+    "int stem_input_offset, int stem_output_offset, "
+    "Tensor stem_requantize_multipliers, Tensor stem_requantize_shifts, "
+    "int stem_activation_min, int stem_activation_max, "
+    "Tensor dw_weight, Tensor? dw_bias, "
+    "int[] dw_stride, int[] dw_padding, "
+    "int dw_input_offset, int dw_output_offset, "
+    "Tensor dw_requantize_multipliers, Tensor dw_requantize_shifts, "
+    "int dw_activation_min, int dw_activation_max, "
+    "Tensor project_weight, Tensor? project_bias, "
+    "int project_input_offset, int project_output_offset, "
+    "Tensor project_requantize_multipliers, Tensor project_requantize_shifts, "
+    "int project_activation_min, int project_activation_max, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+
+
+@register_fake("cortex_m::quantized_stem_dwconv2d_conv2d_fused")  # type: ignore[misc]
+def quantized_stem_dwconv2d_conv2d_fused_meta(
+    input: torch.Tensor,
+    stem_weight: torch.Tensor,
+    stem_bias: torch.Tensor | None,
+    stem_input_offset: int,
+    stem_output_offset: int,
+    stem_requantize_multipliers: torch.Tensor,
+    stem_requantize_shifts: torch.Tensor,
+    stem_activation_min: int,
+    stem_activation_max: int,
+    dw_weight: torch.Tensor,
+    dw_bias: torch.Tensor | None,
+    dw_stride: Sequence[int],
+    dw_padding: Sequence[int],
+    dw_input_offset: int,
+    dw_output_offset: int,
+    dw_requantize_multipliers: torch.Tensor,
+    dw_requantize_shifts: torch.Tensor,
+    dw_activation_min: int,
+    dw_activation_max: int,
+    project_weight: torch.Tensor,
+    project_bias: torch.Tensor | None,
+    project_input_offset: int,
+    project_output_offset: int,
+    project_requantize_multipliers: torch.Tensor,
+    project_requantize_shifts: torch.Tensor,
+    project_activation_min: int,
+    project_activation_max: int,
+) -> torch.Tensor:
+    stem_shape = _compute_conv2d_output_shape(
+        input.shape, stem_weight.shape, (2, 2), (1, 1), (1, 1)
+    )
+    dw_shape = _compute_depthwise_conv2d_output_shape(
+        stem_shape, dw_weight.shape, list(dw_stride), list(dw_padding), [1, 1]
+    )
+    output_shape = _compute_conv2d_output_shape(
+        dw_shape, project_weight.shape, (1, 1), (0, 0), (1, 1)
+    )
+    return torch.empty(
+        output_shape,
+        dtype=torch.int8,
+        device=input.device,
+        memory_format=torch.channels_last,
+    )
+
+
+@impl(lib, "quantized_stem_dwconv2d_conv2d_fused", "CompositeExplicitAutograd")  # type: ignore[misc]
+def quantized_stem_dwconv2d_conv2d_fused_impl(
+    input: torch.Tensor,
+    stem_weight: torch.Tensor,
+    stem_bias: torch.Tensor | None,
+    stem_input_offset: int,
+    stem_output_offset: int,
+    stem_requantize_multipliers: torch.Tensor,
+    stem_requantize_shifts: torch.Tensor,
+    stem_activation_min: int,
+    stem_activation_max: int,
+    dw_weight: torch.Tensor,
+    dw_bias: torch.Tensor | None,
+    dw_stride: Sequence[int],
+    dw_padding: Sequence[int],
+    dw_input_offset: int,
+    dw_output_offset: int,
+    dw_requantize_multipliers: torch.Tensor,
+    dw_requantize_shifts: torch.Tensor,
+    dw_activation_min: int,
+    dw_activation_max: int,
+    project_weight: torch.Tensor,
+    project_bias: torch.Tensor | None,
+    project_input_offset: int,
+    project_output_offset: int,
+    project_requantize_multipliers: torch.Tensor,
+    project_requantize_shifts: torch.Tensor,
+    project_activation_min: int,
+    project_activation_max: int,
+) -> torch.Tensor:
+    stem_out = quantized_conv2d_impl(
+        input,
+        stem_weight, stem_bias,
+        (2, 2), (1, 1), (1, 1),
+        stem_input_offset, stem_output_offset,
+        stem_requantize_multipliers, stem_requantize_shifts,
+        stem_activation_min, stem_activation_max,
+    )
+    return quantized_dwconv2d_conv2d_fused_impl(
+        stem_out,
+        dw_weight, dw_bias,
+        dw_stride, dw_padding,
+        dw_input_offset, dw_output_offset,
+        dw_requantize_multipliers, dw_requantize_shifts,
+        dw_activation_min, dw_activation_max,
+        project_weight, project_bias,
+        project_input_offset, project_output_offset,
+        project_requantize_multipliers, project_requantize_shifts,
+        project_activation_min, project_activation_max,
+    )
+
+
+# ===================================================================
 # QUANTIZED TRANSPOSE_CONV2D OPERATION DEFINITION
 # ===================================================================
 
