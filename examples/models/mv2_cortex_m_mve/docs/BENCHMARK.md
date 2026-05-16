@@ -766,7 +766,51 @@ latency gap to Phase A+B.
 So at the 1.0/224 headline config: **same latency as Phase A+B,
 46% less arena+scratch**.
 
-### Updated deployment sweet spots
+### Phase G pareto sweep across all 20 configs (FVP MVE, bit-exact)
+
+| width \ res | **224** | **192** | **160** | **128** | **96** |
+|---:|---:|---:|---:|---:|---:|
+| **1.00** | 206K / 153.6M (-47%/+1.1%) | 159K / 113.3M (-45%/+0.8%) | 117K / 79.2M (-43%/+1.2%) | 82K / 51.1M (-40%/+0.8%) | 52K / 28.9M (-35%/+1.0%) |
+| **0.75** | 203K / 126.9M (-48%/+1.4%) | 156K / 93.8M (-46%/+1.3%) | 115K / 65.5M (-45%/+1.3%) | 80K / 42.3M (-42%/+1.2%) | 51K / 24.0M (-37%/+1.5%) |
+| **0.50** | 141K / 73.6M (-48%/+2.2%) | 107K / 54.6M (-47%/+2.3%) | 78K / 38.0M (-46%/+2.0%) | 54K / 24.8M (-44%/+2.3%) | 33K / 14.1M (-40%/+1.9%) |
+| **0.35** | 97K / 56.1M (-64%/+2.9%) | 75K / 41.6M (-63%/+3.0%) | 56K / 29.0M (-61%/+2.6%) | 40K / 19.0M (-57%/+3.1%) | 26K / 10.8M (-53%/+2.8%) |
+
+Format: `(arena + scratch) KB / PMU cycles (Δmem% / Δlatency% vs
+Phase A+B)`.  Each cell measured on Corstone-300 FVP with
+pretrained weights at 1.0/224, random-init weights elsewhere
+(same convention as the Phase A+B pareto in the previous section).
+All 20 configs: **0/1000 logit mismatches vs the Python reference**.
+
+The conditional picker chose Phase G at every config tested —
+Phase G wins on memory across the entire pareto, with a uniformly
+small latency cost (+0.8% to +3.1%).  Width-0.35 is the biggest
+winner (-53% to -64% memory) because Phase A+B's picker had been
+falling back to the 2-op pipeline at small widths where the deeper
+3/4-op fusion didn't pay for itself; Phase G's mega-fusion clears
+that threshold and saves an additional 110-170 KB at width-0.35.
+
+### Deployment sweet spots — refreshed for Phase G
+
+| SRAM budget | Best deployable config | Latency @ 300 MHz |
+|---|---|---|
+| ≤256 KB | **1.0 / 224** at 206 KB | 512 ms |
+| ≤192 KB | 1.0 / 192 at 159 KB | 378 ms |
+| ≤128 KB | 1.0 / 160 at 117 KB | 264 ms |
+| ≤96 KB  | 1.0 / 128 at 82 KB  | 170 ms |
+| ≤64 KB  | 1.0 / 96 at 52 KB   |  96 ms |
+| ≤32 KB  | **0.35 / 96** at 26 KB | **36 ms** |
+
+The pareto floor is now **~26 KB / 36 ms** — 58× memory reduction
+and 14× latency reduction vs the unfused MV2-1.0/224 baseline.
+Full-fat MV2-1.0/224 now fits in 256 KB SRAM, a tier we couldn't
+touch before Phase G.
+
+### Phase A+B deployment sweet spots (historical)
+
+The deployment table below reflects the Phase A+B pareto floor.
+**Superseded by the Phase G "Deployment sweet spots — refreshed
+for Phase G" table earlier in this doc**; kept here to document
+the progression.
 
 | SRAM budget | Best deployable config | Latency @ 300 MHz |
 |---|---|---|
@@ -777,11 +821,6 @@ So at the 1.0/224 headline config: **same latency as Phase A+B,
 | ≤128 KB | 0.35 / 128 at 93 KB | 61 ms |
 | ≤96 KB  | 0.5 / 96 at 56 KB | 46 ms |
 | ≤64 KB  | **0.35 / 96** at 54 KB | **35 ms** |
-
-The pareto now reaches **~54 KB / 35 ms** — 28× memory reduction and
-14× latency reduction vs the unfused MV2-1.0/224 baseline.  Real-
-silicon validation on a 256+ KB Cortex-M55 SoC would now be a viable
-deployment target for full-fat ImageNet MobileNetV2.
 
 ### Implementation summary
 
@@ -886,12 +925,26 @@ MV2 specifically.  Items below in roughly descending priority.
   Also previously confirmed negative: `-flto`, `-funroll-loops`,
   fine-grained `-fno-tree-*` flags.  Stay on `-O3
   -ffunction-sections -fdata-sections`.
-- **Phase H — extend mega-fusion past B1.**  MV2 B2 is the obvious
-  next candidate, but it has a residual add whose skip path is the
-  B1 project output (= Phase G's current arena output).  Would
-  need a dual-output kernel shape (one output to the residual buffer,
-  one continues to B3's expand) to be viable.  Memory savings would
-  be the 24 ch × 56² = ~75 KB B2 output.
+- **Phase H — extend mega-fusion past B1 (attempted, deferred).**
+  MV2 B2 is the obvious next candidate, and the residual-source
+  problem turned out to be tractable (3-row B1 project rolling
+  buffer feeds both B2 expand and the B2 residual add).  But
+  `torch.library` caps schemas at 64 args and Phase G is already
+  at 57; Phase H needs ~94 args (Phase G + B2 expand/dw/project +
+  11 residual params).  The path forward is a packed-args op
+  schema (`Tensor[]` for weights/biases/mults/shifts, packed
+  `int[]` for scalar params), which is roughly half a day of
+  rework — Phase G would also need to be converted for
+  consistency.  Worth it iff the trajectory wants to keep
+  extending the mega-fusion past Phase H; standalone Phase H's
+  ~40 KB additional memory savings at 1.0/224 wasn't sufficient
+  to justify the rework on its own.
+- ✅ **FVP pareto sweep across all 20 (width, resolution) configs
+  with Phase G** — completed.  Phase G picked at every config;
+  0/1000 logit mismatches everywhere; memory reductions -35% to
+  -64% vs Phase A+B at +0.8% to +3.1% latency cost.  Table in
+  the "Phase G pareto sweep across all 20 configs" subsection
+  earlier in this doc.
 - **Quantization-level optimization** (int4 weights, mixed-precision
   activations).  Substantial separate project; could halve weight
   memory and selectively compress late-layer activations.
