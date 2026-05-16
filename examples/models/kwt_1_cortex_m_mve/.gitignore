@@ -1,0 +1,7 @@
+# Generated artifacts (re-created by tools/dump_kwt_1_artifacts.py).
+generated/*
+!generated/.gitkeep
+
+# Build trees.
+build/
+build_*/
