@@ -25,6 +25,7 @@ from torch.nn import Module
 
 from .activation_fusion_pass import ActivationFusionPass
 from .clamp_hardswish_pass import ClampHardswishPass
+from .convert_layer_norm_pass import ConvertLayerNormPass
 from .convert_to_cortex_m_pass import ConvertToCortexMPass
 from .decompose_hardswish_pass import DecomposeHardswishPass
 from .decompose_mean_pass import DecomposeMeanPass
@@ -55,6 +56,12 @@ class CortexMPassManager(PassManager):
         DecomposeHardswishPass,
         QuantizedOpFusionPass,
         ConvertToCortexMPass,
+        # Phase 1 (KWT transformer support): pattern-match
+        # cortex_m.dequant → aten.native_layer_norm → getitem → cortex_m.quant
+        # and rewrite to cortex_m::quantized_layer_norm.  Runs *after*
+        # ConvertToCortexMPass so the surrounding quant/dequant ops are
+        # already in the cortex_m namespace.
+        ConvertLayerNormPass,
     ]
 
     # Opt-in extension that fuses MV2 expand+dwconv chains.  Not on the

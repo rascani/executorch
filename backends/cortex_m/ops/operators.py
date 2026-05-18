@@ -545,6 +545,94 @@ def softmax_impl(
 
 
 # ===================================================================
+# QUANTIZED LAYER NORM (Phase 1 of KWT transformer support)
+# ===================================================================
+# Dequantize int8 input to float32, run aten.native_layer_norm with
+# float32 weight/bias and eps, requantize the result to int8.  γ and β
+# stay float — they sit in .rodata; the runtime kernel reads them
+# directly.  Bit-exact reference for the standalone MVE and cortex_m
+# C++ kernels.
+#
+# normalized_shape is implicitly weight.shape (LN's gamma is shaped
+# like the trailing dims being normalized).  KWT-1 uses the standard
+# norm over the last dim of size D=64.
+
+lib.define(
+    "quantized_layer_norm("
+    "Tensor input, "
+    "int input_zero_point, float input_scale, "
+    "Tensor weight, Tensor? bias, "
+    "float eps, "
+    "int output_zero_point, float output_scale"
+    ") -> Tensor"
+)
+lib.define(
+    "quantized_layer_norm.out("
+    "Tensor input, "
+    "int input_zero_point, float input_scale, "
+    "Tensor weight, Tensor? bias, "
+    "float eps, "
+    "int output_zero_point, float output_scale, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+
+
+@register_fake("cortex_m::quantized_layer_norm")  # type: ignore[misc]
+def quantized_layer_norm_meta(
+    input: torch.Tensor,
+    input_zero_point: int,
+    input_scale: float,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    eps: float,
+    output_zero_point: int,
+    output_scale: float,
+) -> torch.Tensor:
+    return torch.empty_like(input, dtype=torch.int8, memory_format=torch.preserve_format)
+
+
+@impl(lib, "quantized_layer_norm", "CompositeExplicitAutograd")  # type: ignore[misc]
+def quantized_layer_norm_impl(
+    input: torch.Tensor,
+    input_zero_point: int,
+    input_scale: float,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    eps: float,
+    output_zero_point: int,
+    output_scale: float,
+) -> torch.Tensor:
+    if input.dtype != torch.int8:
+        raise TypeError(
+            f"cortex_m.quantized_layer_norm: expected int8 input, got {input.dtype}"
+        )
+    if weight.dtype != torch.float32:
+        raise TypeError(
+            f"cortex_m.quantized_layer_norm: weight must be float32, got {weight.dtype}"
+        )
+    if bias is not None and bias.dtype != torch.float32:
+        raise TypeError(
+            f"cortex_m.quantized_layer_norm: bias must be float32, got {bias.dtype}"
+        )
+    if output_scale <= 0.0:
+        raise ValueError(
+            f"cortex_m.quantized_layer_norm: output_scale must be positive, got {output_scale}"
+        )
+
+    # Dequantize -> float32
+    input_fp = (input.to(torch.int32) - int(input_zero_point)).float() * float(input_scale)
+    # Normalize over the trailing dims described by weight.shape (standard LN).
+    normalized_shape = tuple(weight.shape)
+    out_fp = torch.nn.functional.layer_norm(
+        input_fp, normalized_shape, weight=weight, bias=bias, eps=float(eps)
+    )
+    # Requantize -> int8 (round-half-away-from-zero to match the C kernel).
+    out_q = torch.round(out_fp / float(output_scale)) + int(output_zero_point)
+    return out_q.clamp(-128, 127).to(torch.int8)
+
+
+# ===================================================================
 # TRANSPOSE OPERATION DEFINITION
 # ===================================================================
 lib.define("transpose(Tensor input, int[] perm) -> Tensor")

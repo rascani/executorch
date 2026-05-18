@@ -1,0 +1,40 @@
+/*
+ * Copyright 2026 Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ *
+ * Authored with assistance from Claude (claude.ai/code).
+ *
+ * Parameter structs for the standalone KWT-1 (Keyword Spotting
+ * Transformer) inference kernels.  Each struct describes one fused op's
+ * compile-time constants — the AOT artifact dumper emits a static
+ * const instance per op in generated/kwt_1_params.h, and the inference
+ * function passes pointers to those instances into the kernels.
+ *
+ * Phased per docs/PLAN.md.  Phase 1: LayerNormParams.  Future phases
+ * (GELU, BMM, softmax, fused attention, fused FFN) extend this header.
+ */
+
+#ifndef KWT_1_LAYER_PARAMS_H_
+#define KWT_1_LAYER_PARAMS_H_
+
+#include <stdint.h>
+
+typedef struct {
+  /* Phase 1: per-tensor int8 input/output around a float32 LayerNorm.
+   * num_rows is the total number of D-wide rows to normalize
+   * (e.g. batch × seq_len).  γ and β are float32; β may be NULL.
+   * Normalize over the trailing dim of size embed_dim. */
+  uint32_t num_rows;
+  uint32_t embed_dim;
+  int32_t input_zp;
+  float input_scale;
+  int32_t output_zp;
+  float output_scale;
+  float eps;
+  const float* gamma;
+  const float* beta;
+} LayerNormParams;
+
+#endif
