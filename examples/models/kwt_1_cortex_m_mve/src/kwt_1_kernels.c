@@ -236,6 +236,29 @@ void softmax_s8(
 }
 
 
+/* Phase 7: int8 N-D transpose with up to rank-4 perm.  Output is
+ * contiguous; input is read at strides encoded in p->in_stride. */
+void transpose_s8(
+    const int8_t* input, int8_t* output, const TransposeParams* p) {
+  const uint32_t rank = p->rank;
+  uint32_t total = 1;
+  for (uint32_t r = 0; r < rank; ++r) total *= p->shape[r];
+  /* Walk output index in row-major order. */
+  uint32_t idx[4] = {0};
+  for (uint32_t out_i = 0; out_i < total; ++out_i) {
+    size_t in_off = 0;
+    for (uint32_t r = 0; r < rank; ++r) in_off += (size_t)idx[r] * p->in_stride[r];
+    output[out_i] = input[in_off];
+    /* Increment row-major. */
+    for (int r = (int)rank - 1; r >= 0; --r) {
+      idx[r]++;
+      if (idx[r] < p->shape[r]) break;
+      idx[r] = 0;
+    }
+  }
+}
+
+
 /* Phase 6: int8 Linear with CMSIS-NN kernel_sum precomputation.
  * Bit-exact port of cortex_m::quantized_linear (compute_using_kernel_sum=True). */
 void linear_s8(

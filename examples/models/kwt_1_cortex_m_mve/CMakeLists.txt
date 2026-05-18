@@ -51,9 +51,9 @@ endif()
 
 set(KWT_1_INFERENCE_SOURCES
     src/kwt_1_inference.c
+    src/kwt_1_kernels.c
     src/arena.c
 )
-# Phase 1+ will append ${KWT_1_GENERATED_DIR}/kwt_1_weights.c here.
 if(EXISTS "${KWT_1_GENERATED_DIR}/kwt_1_weights.c")
   list(APPEND KWT_1_INFERENCE_SOURCES "${KWT_1_GENERATED_DIR}/kwt_1_weights.c")
 endif()
@@ -73,6 +73,7 @@ if(NOT KWT_1_BUILD_FVP)
   )
   target_include_directories(kwt_1_runner_host PRIVATE ${KWT_1_INCLUDE_DIRS})
   target_compile_options(kwt_1_runner_host PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(kwt_1_runner_host PRIVATE m)
 endif()
 
 # -----------------------------------------------------------------------------

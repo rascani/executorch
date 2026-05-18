@@ -77,6 +77,20 @@ typedef struct {
 } LinearParams;
 
 typedef struct {
+  /* Phase 7: int8 N-D transpose with an arbitrary permutation of dims.
+   * Sized for KWT-1's needs: 3-D transpose of (B, S, D) shapes; the
+   * permutation is encoded as the strides of the input read in
+   * output-major order.  shape[r] is the size of axis r in the
+   * OUTPUT tensor; in_stride[r] is the stride in the INPUT tensor
+   * (in elements) when output axis r increments by 1.  Then
+   *   out[i0,i1,i2] = in[sum_r i_r * in_stride[r]]
+   * Holds for any rank ≤ 4; KWT uses rank-3. */
+  uint32_t rank;
+  uint32_t shape[4];
+  uint32_t in_stride[4];
+} TransposeParams;
+
+typedef struct {
   /* Phase 6: per-element quantized add, matching cortex_m::quantized_add
    * (CMSIS-NN convention).  Each input is rescaled to a shared
    * "internal" int32 domain via `(x - zp) << 20`, requantized to align

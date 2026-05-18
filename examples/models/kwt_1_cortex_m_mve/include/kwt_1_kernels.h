@@ -52,6 +52,10 @@ void add_s8(const int8_t* self, const int8_t* other, int8_t* output,
 void linear_s8(const int8_t* input, const int8_t* weights,
                int8_t* output, const LinearParams* p);
 
+/* Phase 7: int8 N-D transpose (rank ≤ 4). */
+void transpose_s8(const int8_t* input, int8_t* output,
+                  const TransposeParams* p);
+
 #ifdef __cplusplus
 }
 #endif
