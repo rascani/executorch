@@ -52,6 +52,52 @@ typedef struct {
 } GELUParams;
 
 typedef struct {
+  /* Phase 6: int8 Linear, CMSIS-NN kernel_sum form (matches the
+   * cortex_m::quantized_linear op exactly).  Math:
+   *   acc[n] = sum_k (input[m,k] * weights[n,k])
+   *          + row_sum[m] * filter_offset
+   *          + kernel_sum[n]                       (precomputed at AOT)
+   *   out[m,n] = clamp(requantize(acc, mult, shift) + output_offset,
+   *                    act_min, act_max)
+   * kernel_sum bakes in
+   *   kernel_sum[n] = sum_k (w[n,k] + filter_offset) * input_offset
+   *                 + (bias[n] if bias is present else 0).
+   * Requantize is per-tensor (one mult/shift). */
+  uint32_t num_rows;        /* M = prod(input.shape[:-1]) */
+  uint32_t in_features;     /* K */
+  uint32_t out_features;    /* N */
+  int32_t input_offset;     /* -input_zp */
+  int32_t filter_offset;    /* -weight_zp */
+  int32_t output_offset;
+  int32_t output_multiplier;
+  int32_t output_shift;
+  int32_t activation_min;
+  int32_t activation_max;
+  const int32_t* kernel_sum;  /* (N,) */
+} LinearParams;
+
+typedef struct {
+  /* Phase 6: per-element quantized add, matching cortex_m::quantized_add
+   * (CMSIS-NN convention).  Each input is rescaled to a shared
+   * "internal" int32 domain via `(x - zp) << 20`, requantized to align
+   * scales, summed, then requantized to the output spec.  Used for
+   * the two residual adds in each transformer encoder block.  Both
+   * inputs are required to be the same shape (no broadcast for now). */
+  uint32_t num_elements;
+  int32_t self_zp;
+  int32_t self_multiplier;
+  int32_t self_shift;
+  int32_t other_zp;
+  int32_t other_multiplier;
+  int32_t other_shift;
+  int32_t output_zp;
+  int32_t output_multiplier;
+  int32_t output_shift;
+  int32_t activation_min;
+  int32_t activation_max;
+} AddParams;
+
+typedef struct {
   /* Phase 5: streaming fused attention.  Inputs q, k, v all in
    * (B, S, d) layout; per-Q-row we compute S scores via QK^T,
    * softmax them, then produce d outputs via AV — never

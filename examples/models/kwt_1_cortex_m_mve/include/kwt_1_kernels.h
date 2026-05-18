@@ -43,6 +43,15 @@ void softmax_s8(const int8_t* input, int8_t* output,
 void attention_fused_s8(const int8_t* q, const int8_t* k, const int8_t* v,
                         int8_t* output, const AttentionParams* p);
 
+/* Phase 6: int8 quantized add (residual path). */
+void add_s8(const int8_t* self, const int8_t* other, int8_t* output,
+            const AddParams* p);
+
+/* Phase 6: int8 Linear (CMSIS-NN kernel_sum form).  weights is
+ * (out_features, in_features). */
+void linear_s8(const int8_t* input, const int8_t* weights,
+               int8_t* output, const LinearParams* p);
+
 #ifdef __cplusplus
 }
 #endif

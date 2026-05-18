@@ -236,6 +236,70 @@ void softmax_s8(
 }
 
 
+/* Phase 6: int8 Linear with CMSIS-NN kernel_sum precomputation.
+ * Bit-exact port of cortex_m::quantized_linear (compute_using_kernel_sum=True). */
+void linear_s8(
+    const int8_t* input, const int8_t* weights, int8_t* output,
+    const LinearParams* p) {
+  const uint32_t M = p->num_rows;
+  const uint32_t K = p->in_features;
+  const uint32_t N = p->out_features;
+  const int32_t filter_off = p->filter_offset;
+  const int32_t out_off = p->output_offset;
+  const int32_t mult = p->output_multiplier;
+  const int32_t shift = p->output_shift;
+  const int32_t amin = p->activation_min;
+  const int32_t amax = p->activation_max;
+
+  for (uint32_t m = 0; m < M; ++m) {
+    const int8_t* row_in = input + (size_t)m * K;
+    int32_t row_sum = 0;
+    for (uint32_t k = 0; k < K; ++k) row_sum += (int32_t)row_in[k];
+    for (uint32_t n = 0; n < N; ++n) {
+      const int8_t* w_row = weights + (size_t)n * K;
+      int32_t acc = 0;
+      for (uint32_t k = 0; k < K; ++k) acc += (int32_t)row_in[k] * (int32_t)w_row[k];
+      acc += row_sum * filter_off;
+      acc += p->kernel_sum[n];
+      int32_t r = kwt_1_requantize(acc, mult, shift) + out_off;
+      if (r < amin) r = amin;
+      if (r > amax) r = amax;
+      output[(size_t)m * N + n] = (int8_t)r;
+    }
+  }
+}
+
+
+/* Phase 6: int8 quantized add.  Bit-exact port of cortex_m::quantized_add:
+ *   self_shift  = (self  - self_zp)  << 20
+ *   self_fp     = requantize(self_shift, self_mult, self_shift)
+ *   other_shift = (other - other_zp) << 20
+ *   other_fp    = requantize(other_shift, other_mult, other_shift)
+ *   result      = requantize(self_fp + other_fp, out_mult, out_shift) + out_zp
+ *   output      = clamp(result, act_min, act_max)
+ * The 20-bit pre-shift moves both inputs into a common int32 "internal"
+ * domain so subsequent requantizes can align scales without losing
+ * precision on the smaller-scale operand. */
+#define KWT_1_ADD_INTERNAL_SHIFT 20
+
+void add_s8(
+    const int8_t* self_in, const int8_t* other_in, int8_t* output,
+    const AddParams* p) {
+  const uint32_t n = p->num_elements;
+  for (uint32_t i = 0; i < n; ++i) {
+    int32_t s_shift = ((int32_t)self_in[i] - p->self_zp) << KWT_1_ADD_INTERNAL_SHIFT;
+    int32_t o_shift = ((int32_t)other_in[i] - p->other_zp) << KWT_1_ADD_INTERNAL_SHIFT;
+    int32_t s_fp = kwt_1_requantize(s_shift, p->self_multiplier, p->self_shift);
+    int32_t o_fp = kwt_1_requantize(o_shift, p->other_multiplier, p->other_shift);
+    int32_t r = kwt_1_requantize(s_fp + o_fp, p->output_multiplier, p->output_shift)
+              + p->output_zp;
+    if (r < p->activation_min) r = p->activation_min;
+    if (r > p->activation_max) r = p->activation_max;
+    output[i] = (int8_t)r;
+  }
+}
+
+
 /* Phase 5: streaming fused attention.  For each Q row i:
  *   1. Compute S int8 scores  = QK^T row i   → scratch[0..S)
  *   2. softmax_s8 in place on the S scores   → scratch[0..S) (probs)
