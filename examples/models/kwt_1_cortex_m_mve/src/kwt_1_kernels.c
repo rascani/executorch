@@ -236,6 +236,102 @@ void softmax_s8(
 }
 
 
+/* Phase 5: streaming fused attention.  For each Q row i:
+ *   1. Compute S int8 scores  = QK^T row i   → scratch[0..S)
+ *   2. softmax_s8 in place on the S scores   → scratch[0..S) (probs)
+ *   3. Compute d int8 outputs = AV row i, contracting probs against v
+ *
+ * The full (S, S) score matrix never materializes — only S bytes of
+ * scratch live at a time.  All three steps reuse the same per-element
+ * math as batch_matmul_s8 / softmax_s8 above (no duplicate
+ * implementations); we just inline them here so the row-level scratch
+ * stays on the stack.
+ *
+ * Memory: S int8 scores/probs (≤ KWT_1_SOFTMAX_MAX_ROW; the in-place
+ * softmax uses its own internal float scratch as well, but that's
+ * accounted for in softmax_s8).
+ */
+void attention_fused_s8(
+    const int8_t* q, const int8_t* k, const int8_t* v,
+    int8_t* output, const AttentionParams* p) {
+  const uint32_t B = p->batch;
+  const uint32_t S = p->seq_len;
+  const uint32_t D = p->embed_dim;
+  const int32_t q_off = p->q_offset;
+  const int32_t k_off = p->k_offset;
+  const int32_t qk_zp = p->qk_output_zp;
+  const int32_t qk_mult = p->qk_output_multiplier;
+  const int32_t qk_shift = p->qk_output_shift;
+  const int32_t v_off = p->v_offset;
+  const int32_t av_zp = p->av_output_zp;
+  const int32_t av_mult = p->av_output_multiplier;
+  const int32_t av_shift = p->av_output_shift;
+  /* probs come out of softmax_s8 at zero_point = -128, so their
+   * BMM-side offset is -(-128) = 128. */
+  const int32_t probs_off = 128;
+
+  int8_t scores_scratch[KWT_1_SOFTMAX_MAX_ROW];
+  SoftmaxParams sm_p = {
+    .num_rows = 1, .row_len = S,
+    .input_zp = qk_zp,
+    .input_multiplier = p->softmax_input_multiplier,
+    .input_shift = p->softmax_input_shift,
+  };
+
+  for (uint32_t b = 0; b < B; ++b) {
+    const int8_t* q_b = q + (size_t)b * S * D;
+    const int8_t* k_b = k + (size_t)b * S * D;
+    const int8_t* v_b = v + (size_t)b * S * D;
+    int8_t* out_b = output + (size_t)b * S * D;
+
+    for (uint32_t i = 0; i < S; ++i) {
+      const int8_t* q_row = q_b + (size_t)i * D;
+
+      /* Step 1: QK^T row i = sum_k (q[i,k] + q_off) * (k[j,k] + k_off)
+       *                      requantize → int8 score for each j. */
+      for (uint32_t j = 0; j < S; ++j) {
+        const int8_t* k_row = k_b + (size_t)j * D;
+        int32_t acc = 0;
+        for (uint32_t kk = 0; kk < D; ++kk) {
+          int32_t a = (int32_t)q_row[kk] + q_off;
+          int32_t c = (int32_t)k_row[kk] + k_off;
+          acc += a * c;
+        }
+        int32_t r = kwt_1_requantize(acc, qk_mult, qk_shift) + qk_zp;
+        if (r < -128) r = -128;
+        if (r >  127) r =  127;
+        scores_scratch[j] = (int8_t)r;
+      }
+
+      /* Step 2: softmax those S scores in place.  softmax_s8 reads
+       * the int8 input once at the start of each pass; in-place is
+       * safe because it stages everything in its own float scratch
+       * before writing the int8 output. */
+      softmax_s8(scores_scratch, scores_scratch, &sm_p);
+
+      /* Step 3: AV row i = sum_j (probs[j] + probs_off) * (v_t[n,j] + v_off).
+       * v is stored in (B, D, S) BMM rhs_transposed layout, so the inner
+       * loop reads stride-1 along S for fixed n — same layout as probs,
+       * MVE-friendly when the MVE fast path lands. */
+      int8_t* out_row = out_b + (size_t)i * D;
+      for (uint32_t n = 0; n < D; ++n) {
+        const int8_t* v_row = v_b + (size_t)n * S;
+        int32_t acc = 0;
+        for (uint32_t j = 0; j < S; ++j) {
+          int32_t a = (int32_t)scores_scratch[j] + probs_off;
+          int32_t c = (int32_t)v_row[j] + v_off;
+          acc += a * c;
+        }
+        int32_t r = kwt_1_requantize(acc, av_mult, av_shift) + av_zp;
+        if (r < -128) r = -128;
+        if (r >  127) r =  127;
+        out_row[n] = (int8_t)r;
+      }
+    }
+  }
+}
+
+
 void batch_matmul_s8(
     const int8_t* lhs, const int8_t* rhs_transposed,
     int8_t* output, const BMMParams* p) {

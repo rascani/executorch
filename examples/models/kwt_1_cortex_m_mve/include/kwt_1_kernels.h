@@ -38,6 +38,11 @@ void batch_matmul_s8(const int8_t* lhs, const int8_t* rhs_transposed,
 void softmax_s8(const int8_t* input, int8_t* output,
                 const SoftmaxParams* p);
 
+/* Phase 5: streaming fused attention.  Stream-processes one Q row
+ * at a time → never materializes the (S, S) score matrix. */
+void attention_fused_s8(const int8_t* q, const int8_t* k, const int8_t* v,
+                        int8_t* output, const AttentionParams* p);
+
 #ifdef __cplusplus
 }
 #endif

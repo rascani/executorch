@@ -702,6 +702,98 @@ def quantized_gelu_impl(
 
 
 # ===================================================================
+# QUANTIZED FUSED ATTENTION (Phase 5 of KWT transformer support)
+# ===================================================================
+# Fuses the three-op attention chain:
+#
+#   scores = quantized_batch_matmul(q, k_as_rhs_t)     # (B, S, S)
+#   probs  = softmax(scores, dim=-1)                   # (B, S, S)
+#   out    = quantized_batch_matmul(probs, v_as_rhs_t) # (B, S, d)
+#
+# into a single op so the standalone runtime can stream the (S, S)
+# score matrix row-by-row and never materialize it in the arena.
+# The cortex_m runtime side keeps using the unfused chain — this op
+# is consumed by the standalone path; cortex_m sees the op type and
+# delegates to the python impl below for shape inference.
+#
+# Note on tensor layouts:
+#   q is (B, S, d) — passed straight through from the upstream Linear.
+#   k is (B, S, d) — what the convert_to_cortex_m_pass calls
+#                    "rhs_transposed" for the QK^T BMM (it stores k
+#                    with the contraction dim last, matching the
+#                    BMM op's rhs convention).
+#   v is (B, d, S) — the AV BMM's rhs_transposed orientation, i.e.
+#                    `v_actual.transpose(-1, -2)`.  Passing it
+#                    pre-transposed matches what the AOT fusion pass
+#                    already finds in the IR (the convert pass
+#                    inserts the transpose for the AV BMM upstream).
+
+lib.define(
+    "quantized_fused_attention("
+    "Tensor q, Tensor k, Tensor v, "
+    "int q_offset, int k_offset, "
+    "int qk_output_zero_point, int qk_output_multiplier, int qk_output_shift, "
+    "int softmax_input_multiplier, int softmax_input_shift, int softmax_diff_min, "
+    "int v_offset, "
+    "int av_output_zero_point, int av_output_multiplier, int av_output_shift"
+    ") -> Tensor"
+)
+lib.define(
+    "quantized_fused_attention.out("
+    "Tensor q, Tensor k, Tensor v, "
+    "int q_offset, int k_offset, "
+    "int qk_output_zero_point, int qk_output_multiplier, int qk_output_shift, "
+    "int softmax_input_multiplier, int softmax_input_shift, int softmax_diff_min, "
+    "int v_offset, "
+    "int av_output_zero_point, int av_output_multiplier, int av_output_shift, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+
+
+@register_fake("cortex_m::quantized_fused_attention")  # type: ignore[misc]
+def quantized_fused_attention_meta(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    q_offset: int, k_offset: int,
+    qk_output_zero_point: int, qk_output_multiplier: int, qk_output_shift: int,
+    softmax_input_multiplier: int, softmax_input_shift: int, softmax_diff_min: int,
+    v_offset: int,
+    av_output_zero_point: int, av_output_multiplier: int, av_output_shift: int,
+) -> torch.Tensor:
+    B, S, _dq = q.shape
+    _Bv, d, _Sv = v.shape  # v is (B, d, S)
+    return torch.empty((B, S, d), dtype=torch.int8, device=q.device)
+
+
+@impl(lib, "quantized_fused_attention", "CompositeExplicitAutograd")  # type: ignore[misc]
+def quantized_fused_attention_impl(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    q_offset: int, k_offset: int,
+    qk_output_zero_point: int, qk_output_multiplier: int, qk_output_shift: int,
+    softmax_input_multiplier: int, softmax_input_shift: int, softmax_diff_min: int,
+    v_offset: int,
+    av_output_zero_point: int, av_output_multiplier: int, av_output_shift: int,
+) -> torch.Tensor:
+    """Bit-exact reference: compose the three existing cortex_m ops."""
+    if q.dtype != torch.int8 or k.dtype != torch.int8 or v.dtype != torch.int8:
+        raise TypeError("cortex_m.quantized_fused_attention: all inputs must be int8")
+    scores = torch.ops.cortex_m.quantized_batch_matmul(
+        q, int(q_offset), k, int(k_offset),
+        int(qk_output_zero_point), int(qk_output_multiplier), int(qk_output_shift),
+    )
+    probs = torch.ops.cortex_m.softmax(
+        scores, -1, int(qk_output_zero_point), -128,
+        int(softmax_input_multiplier), int(softmax_input_shift), int(softmax_diff_min),
+    )
+    # v is already (B, d, S) = BMM's rhs_transposed layout.
+    # probs_offset = -(softmax output zp) = -(-128) = 128.
+    return torch.ops.cortex_m.quantized_batch_matmul(
+        probs, 128, v, int(v_offset),
+        int(av_output_zero_point), int(av_output_multiplier), int(av_output_shift),
+    )
+
+
+# ===================================================================
 # TRANSPOSE OPERATION DEFINITION
 # ===================================================================
 lib.define("transpose(Tensor input, int[] perm) -> Tensor")

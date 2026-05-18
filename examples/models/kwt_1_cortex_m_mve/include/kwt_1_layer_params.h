@@ -52,6 +52,34 @@ typedef struct {
 } GELUParams;
 
 typedef struct {
+  /* Phase 5: streaming fused attention.  Inputs q, k, v all in
+   * (B, S, d) layout; per-Q-row we compute S scores via QK^T,
+   * softmax them, then produce d outputs via AV — never
+   * materializing the full (S, S) score matrix.
+   *
+   * AV uses v directly (no v^T materialization): inside the kernel
+   * the AV inner loop indexes v[b, j, n] for fixed n / varying j.
+   *
+   * q_offset, k_offset, v_offset are negated quant zero-points
+   * (CMSIS-NN convention, matching BMMParams above).  Three sets of
+   * requantize params for the QK^T BMM, softmax, and AV BMM. */
+  uint32_t batch;
+  uint32_t seq_len;
+  uint32_t embed_dim;
+  int32_t q_offset;
+  int32_t k_offset;
+  int32_t qk_output_zp;
+  int32_t qk_output_multiplier;
+  int32_t qk_output_shift;
+  int32_t softmax_input_multiplier;
+  int32_t softmax_input_shift;
+  int32_t v_offset;
+  int32_t av_output_zp;
+  int32_t av_output_multiplier;
+  int32_t av_output_shift;
+} AttentionParams;
+
+typedef struct {
   /* Phase 4: per-row int8 softmax matching CMSIS-NN convention.
    * Output zero-point is fixed at -128 and output scale at 1/256 by
    * cortex_m::softmax's contract — those are baked into the kernel.

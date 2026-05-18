@@ -24,6 +24,7 @@ from torch.fx.passes.infra.pass_base import PassResult
 from torch.nn import Module
 
 from .activation_fusion_pass import ActivationFusionPass
+from .attention_fusion_pass import AttentionFusionPass
 from .clamp_hardswish_pass import ClampHardswishPass
 from .convert_gelu_pass import ConvertGELUPass
 from .convert_layer_norm_pass import ConvertLayerNormPass
@@ -67,6 +68,11 @@ class CortexMPassManager(PassManager):
         # ConvertToCortexMPass so the surrounding quant/dequant ops are
         # already in the cortex_m namespace.
         ConvertLayerNormPass,
+        # Phase 5: fuse bmm → softmax [→ rezp] → bmm into a single
+        # streaming attention op.  Runs after ConvertToCortexMPass so
+        # the surrounding BMMs and softmax are already in the
+        # cortex_m namespace.
+        AttentionFusionPass,
     ]
 
     # Opt-in extension that fuses MV2 expand+dwconv chains.  Not on the
