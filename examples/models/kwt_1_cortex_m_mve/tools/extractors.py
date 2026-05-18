@@ -183,29 +183,41 @@ def _shape_nbytes(shape: tuple[int, ...]) -> int:
 
 
 class _ArenaAllocator:
-    """Sequential bump allocator.  Allocates a fresh slot per node and
-    never reuses memory.  Worst-case arena = sum of all activation
-    sizes.  Replace with exir.memory_planning.apply_algo(greedy) for
-    multi-block models."""
-    def __init__(self) -> None:
-        self.cursor = 0
+    """Arena slot lookup backed by exir.memory_planning.greedy results.
+
+    The caller plans memory once (see _plan_memory in
+    dump_kwt_1_artifacts.py), then constructs this with the planner's
+    {node_name -> offset} / {node_name -> nbytes} dicts and the total
+    arena bytes.  assign() just materializes a TensorSlot from those
+    dicts; nodes outside the planner's output (placeholders, view-like
+    ops that share storage with another node) get a None offset and
+    are stitched up via _stitch_aliases() before extractors run.
+    """
+    def __init__(self, offsets: dict, sizes: dict, total: int) -> None:
+        self.offsets = dict(offsets)
+        self.sizes = dict(sizes)
+        self._total = int(total)
         self.by_node: dict[str, TensorSlot] = {}
 
     def assign(self, node: Node) -> TensorSlot:
         if node.name in self.by_node:
             return self.by_node[node.name]
         shape = _node_shape(node)
-        nbytes = _shape_nbytes(shape)
-        # 16-byte align so the arena slot stays MVE-friendly.
-        offset = (self.cursor + 15) & ~15
-        slot = TensorSlot(name=node.name, offset=offset, nbytes=nbytes, shape=shape)
-        self.cursor = offset + nbytes
+        nbytes = self.sizes.get(node.name, _shape_nbytes(shape))
+        offset = self.offsets.get(node.name)
+        if offset is None:
+            raise KeyError(
+                f"node {node.name} has no planned mem_offset; either it's a "
+                f"placeholder / view alias not captured by the planner, or "
+                f"the memory plan didn't run."
+            )
+        slot = TensorSlot(name=node.name, offset=int(offset), nbytes=int(nbytes), shape=shape)
         self.by_node[node.name] = slot
         return slot
 
     @property
     def total(self) -> int:
-        return (self.cursor + 15) & ~15
+        return self._total
 
 
 # ---------------------------------------------------------------------------
@@ -379,9 +391,19 @@ def _op_key(node: Node) -> str:
     return str(t)
 
 
-def extract_program(prog: ExportedProgram) -> tuple[list[Layer], int]:
-    """Walk topologically and produce (layers, arena_bytes)."""
-    alloc = _ArenaAllocator()
+def extract_program(
+    prog: ExportedProgram,
+    offsets: dict,
+    sizes: dict,
+    arena_bytes: int,
+) -> tuple[list[Layer], int]:
+    """Walk topologically and produce (layers, arena_bytes).
+
+    `offsets`, `sizes`, `arena_bytes` come from exir.memory_planning.greedy
+    (see dump_kwt_1_artifacts._plan_memory).  Every cortex_m call-function
+    node referenced by the schedule must have an entry in `offsets`.
+    """
+    alloc = _ArenaAllocator(offsets, sizes, arena_bytes)
     layers: list[Layer] = []
     for node in prog.graph_module.graph.nodes:
         if node.op != "call_function":

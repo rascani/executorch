@@ -22,15 +22,57 @@ import struct
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.export import export
+from torch.export import export, ExportedProgram
+from torch.utils import _pytree as pytree
 from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e, convert_pt2e
 from executorch.exir import to_edge_transform_and_lower, EdgeCompileConfig
+from executorch.exir.memory_planning import MemoryPlanningAlgorithmSuite, apply_algo, greedy
+from executorch.exir.passes.spec_prop_pass import make_spec
 from executorch.backends.cortex_m.quantizer.quantizer import CortexMQuantizer
 from executorch.backends.cortex_m.passes.cortex_m_pass_manager import CortexMPassManager
 import executorch.backends.cortex_m.ops.operators  # noqa
 
 from .extractors import extract_program
 from .emitters import emit_arena, emit_inference_body, emit_params, emit_weights
+
+
+def _populate_specs(gm: torch.fx.GraphModule) -> None:
+    """Populate node.meta['spec'] for every node in the graph (in-place
+    SpecPropPass equivalent that preserves node identities)."""
+    for module in gm.modules():
+        if not isinstance(module, torch.fx.GraphModule):
+            continue
+        for node in module.graph.nodes:
+            meta_val = node.meta.get("val", None)
+            if node.op == "output":
+                node.meta["spec"] = pytree.tree_map(
+                    lambda x: x.meta.get("spec", None) if hasattr(x, "meta") else None,
+                    node.args[0],
+                )
+            else:
+                node.meta["spec"] = pytree.tree_map(make_spec, meta_val)
+
+
+def _plan_memory(prog: ExportedProgram, alignment: int = 16) -> tuple[dict, dict, int]:
+    """Run exir.memory_planning greedy and return
+    ({node_name: offset}, {node_name: nbytes}, arena_bytes)."""
+    gm = prog.graph_module
+    _populate_specs(gm)
+    suite = MemoryPlanningAlgorithmSuite([greedy])
+    bufsizes = apply_algo(
+        suite, gm, alignment, prog.graph_signature,
+        alloc_graph_input=False, alloc_graph_output=False,
+    )
+    offsets: dict[str, int] = {}
+    sizes: dict[str, int] = {}
+    for node in gm.graph.nodes:
+        spec = node.meta.get("spec", None)
+        if spec is None or not hasattr(spec, "mem_offset") or spec.mem_offset is None:
+            continue
+        offsets[node.name] = int(spec.mem_offset)
+        sizes[node.name] = int(spec.allocated_memory)
+    arena = int(bufsizes[1]) if len(bufsizes) > 1 else 0
+    return offsets, sizes, arena
 
 
 class OneBlockKWT(nn.Module):
@@ -54,6 +96,22 @@ class OneBlockKWT(nn.Module):
         h = self.ln2(x)
         h = self.ff2(F.gelu(self.ff1(h)))
         x = x + h
+        return x
+
+
+class KWT1Encoder(nn.Module):
+    """Stack of N transformer encoder blocks.  Each block matches
+    OneBlockKWT's structure (KWT-1 single-head, d_model=64, d_ff=256
+    are the defaults).  N=12 gives the canonical KWT-1 encoder."""
+    def __init__(self, num_blocks: int = 12, d: int = 64, d_ff: int = 256):
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            [OneBlockKWT(d=d, d_ff=d_ff) for _ in range(num_blocks)]
+        )
+
+    def forward(self, x):
+        for blk in self.blocks:
+            x = blk(x)
         return x
 
 
@@ -110,18 +168,26 @@ def main() -> int:
     parser.add_argument("--seq-len", type=int, default=8,
                         help="Sequence length S.  Smaller than KWT-1's 99 by "
                              "default to keep host-build smoke tests fast.")
+    parser.add_argument("--num-blocks", type=int, default=1,
+                        help="Number of stacked transformer encoder blocks. "
+                             "1 = OneBlockKWT (Phase 0-8 validation unit); "
+                             "12 = canonical KWT-1 encoder.")
     parser.add_argument("--save-ref", action="store_true",
                         help="Also save the python-reference int8 output for "
                              "bit-exact validation.")
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    model = OneBlockKWT(args.d_model, args.d_ff).eval()
+    if args.num_blocks == 1:
+        model = OneBlockKWT(args.d_model, args.d_ff).eval()
+    else:
+        model = KWT1Encoder(args.num_blocks, args.d_model, args.d_ff).eval()
     torch.manual_seed(1)
     sample = (torch.randn(1, args.seq_len, args.d_model),)
     prog = lower_to_cortex_m(model, sample)
 
-    layers, arena_bytes = extract_program(prog)
+    offsets, sizes, arena_bytes = _plan_memory(prog)
+    layers, arena_bytes = extract_program(prog, offsets, sizes, arena_bytes)
 
     # I/O slot info from first/last layers.
     in_layer = layers[0]
