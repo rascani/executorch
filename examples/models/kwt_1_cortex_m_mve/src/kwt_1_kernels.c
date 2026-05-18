@@ -57,6 +57,39 @@ static inline int32_t kwt_1_requantize(
 }
 
 
+#if KWT_1_USE_MVE
+/* Bit-exact MVE version of kwt_1_requantize for the common shift<=0 case,
+ * which is what add_s8 and the linears use.  Implements CMSIS-NN's
+ * round-away-from-zero tie-break by hand because the architectural
+ * vrshlq_s32 rounds ties to positive infinity.
+ *
+ * For shift==0, this is just vqrdmulhq_n_s32.  For shift<0, we do
+ *   rdmh = vqrdmulhq_n_s32(acc, mult)        (a*b round /2^31)
+ *   shifted = rdmh >> right (arithmetic, NO rounding)
+ *   remainder = rdmh & ((1<<right)-1)
+ *   threshold = ((1<<right)-1) >> 1 + (rdmh < 0 ? 1 : 0)
+ *   increment shifted by 1 wherever remainder > threshold
+ */
+static inline int32x4_t kwt_1_mve_requantize_nonpos(
+    int32x4_t acc, int32_t multiplier, int32_t shift) {
+  int32x4_t rdmh = vqrdmulhq_n_s32(acc, multiplier);
+  if (shift == 0) return rdmh;
+  const int32_t right = -shift;
+  const int32_t mask_s = (1 << right) - 1;
+  const int32_t half = mask_s >> 1;
+  int32x4_t shifted = vshlq_s32(rdmh, vdupq_n_s32(-right));
+  int32x4_t remainder = vandq_s32(rdmh, vdupq_n_s32(mask_s));
+  /* is_neg lane mask: -1 where rdmh<0, 0 elsewhere (arithmetic shift by 31). */
+  int32x4_t is_neg = vshrq_n_s32(rdmh, 31);
+  /* threshold = half - is_neg  ⇒ half+1 when neg, half when non-neg. */
+  int32x4_t threshold = vsubq_s32(vdupq_n_s32(half), is_neg);
+  /* increment lane by 1 where remainder > threshold. */
+  mve_pred16_t pred = vcmpgtq_s32(remainder, threshold);
+  return vaddq_m_n_s32(shifted, shifted, 1, pred);
+}
+#endif
+
+
 /* Per-row int8 → float dequant → torch-style two-pass LayerNorm → γβ
  * affine → int8 requant.  Scalar reference; the MVE fast path lives
  * below this in the same file.
@@ -118,11 +151,97 @@ static void layer_norm_s8_scalar(
 }
 
 
+#if KWT_1_USE_MVE
+/* MVE LayerNorm: three-pass like the scalar version, but with the
+ * inner loops over D vectorized 4 float lanes at a time.  D must be a
+ * multiple of 4; for KWT-1 D=64 is comfortably aligned.  Bit-exactness
+ * vs the scalar reference depends on the summation order, since
+ * torch's LN doesn't guarantee left-to-right reduction either.
+ * Empirically with D=64 the saved reference produced by torch's LN
+ * matches both the pairwise-vector and strict-scalar accumulations.
+ */
+static void layer_norm_s8_mve(
+    const int8_t* input, int8_t* output, const LayerNormParams* p) {
+  const uint32_t D = p->embed_dim;
+  const float in_scale = p->input_scale;
+  const float inv_out_scale = 1.0f / p->output_scale;
+  const float out_zp_f = (float)p->output_zp;
+  const float eps = p->eps;
+  const float inv_D = 1.0f / (float)D;
+  const int32_t in_zp_i = p->input_zp;
+
+  for (uint32_t r = 0; r < p->num_rows; ++r) {
+    const int8_t* row_in = input + (size_t)r * D;
+    int8_t* row_out = output + (size_t)r * D;
+
+    /* Pass 1: dequant + mean. */
+    float32x4_t sum_v = vdupq_n_f32(0.0f);
+    for (uint32_t c = 0; c < D; c += 4) {
+      int32x4_t i_v = vldrbq_s32(row_in + c);
+      i_v = vsubq_n_s32(i_v, in_zp_i);
+      float32x4_t fv = vmulq_n_f32(vcvtq_f32_s32(i_v), in_scale);
+      sum_v = vaddq_f32(sum_v, fv);
+    }
+    /* MVE doesn't expose a float horizontal-sum intrinsic in this
+     * toolchain; reduce the 4 lanes via vgetq_lane. */
+    const float mean = (vgetq_lane_f32(sum_v, 0) + vgetq_lane_f32(sum_v, 1)
+                      + vgetq_lane_f32(sum_v, 2) + vgetq_lane_f32(sum_v, 3))
+                     * inv_D;
+
+    /* Pass 2: sum of squared deviations. */
+    float32x4_t sumsq_v = vdupq_n_f32(0.0f);
+    const float32x4_t mean_v = vdupq_n_f32(mean);
+    for (uint32_t c = 0; c < D; c += 4) {
+      int32x4_t i_v = vldrbq_s32(row_in + c);
+      i_v = vsubq_n_s32(i_v, in_zp_i);
+      float32x4_t fv = vmulq_n_f32(vcvtq_f32_s32(i_v), in_scale);
+      float32x4_t dv = vsubq_f32(fv, mean_v);
+      sumsq_v = vfmaq_f32(sumsq_v, dv, dv);
+    }
+    const float var = (vgetq_lane_f32(sumsq_v, 0) + vgetq_lane_f32(sumsq_v, 1)
+                     + vgetq_lane_f32(sumsq_v, 2) + vgetq_lane_f32(sumsq_v, 3))
+                    * inv_D;
+    const float rstd = 1.0f / sqrtf(var + eps);
+
+    /* Pass 3: normalize + γβ + requant.  γ and β are float32. */
+    const float32x4_t rstd_v = vdupq_n_f32(rstd);
+    const float32x4_t inv_os_v = vdupq_n_f32(inv_out_scale);
+    const float32x4_t out_zp_v = vdupq_n_f32(out_zp_f);
+    const int32x4_t v_neg128 = vdupq_n_s32(-128);
+    const int32x4_t v_pos127 = vdupq_n_s32(127);
+    const int has_beta = (p->beta != (const float*)0);
+    for (uint32_t c = 0; c < D; c += 4) {
+      int32x4_t i_v = vldrbq_s32(row_in + c);
+      i_v = vsubq_n_s32(i_v, in_zp_i);
+      float32x4_t x = vmulq_n_f32(vcvtq_f32_s32(i_v), in_scale);
+      float32x4_t norm = vmulq_f32(vsubq_f32(x, mean_v), rstd_v);
+      float32x4_t g = vldrwq_f32(p->gamma + c);
+      float32x4_t y = vmulq_f32(norm, g);
+      if (has_beta) y = vaddq_f32(y, vldrwq_f32(p->beta + c));
+      float32x4_t qf = vaddq_f32(vmulq_f32(y, inv_os_v), out_zp_v);
+      /* round-half-away-from-zero: rint with ties-to-nearest is the
+       * MVE default and matches torch.round for the magnitudes we hit.
+       * For exact-tie handling matching the scalar `(qf + (qf>=0?0.5:-0.5))`
+       * cast we use vcvtaq_s32_f32 (away-from-zero round). */
+      int32x4_t qi = vcvtaq_s32_f32(qf);
+      qi = vminq_s32(vmaxq_s32(qi, v_neg128), v_pos127);
+      vstrbq_s32(row_out + c, qi);
+    }
+  }
+}
+#endif
+
 /* Public entry point — dispatches scalar vs MVE based on shape and
- * build flags.  Phase 1 ships scalar only; MVE variant follows once
- * the scalar path is bit-exact end-to-end. */
+ * build flags.  Phase 1 shipped scalar only; Phase 8 adds the MVE
+ * fast path when D is a multiple of 4 (always true for KWT-1's D=64). */
 void layer_norm_s8(
     const int8_t* input, int8_t* output, const LayerNormParams* p) {
+#if KWT_1_USE_MVE
+  if ((p->embed_dim & 3u) == 0u) {
+    layer_norm_s8_mve(input, output, p);
+    return;
+  }
+#endif
   layer_norm_s8_scalar(input, output, p);
 }
 
@@ -237,19 +356,41 @@ void softmax_s8(
 
 
 /* Phase 7: int8 N-D transpose with up to rank-4 perm.  Output is
- * contiguous; input is read at strides encoded in p->in_stride. */
+ * contiguous; input is read at strides encoded in p->in_stride.
+ *
+ * Phase 8: rank-3 fast path that drops the per-element idx-array walk
+ * (which dominated runtime — the rank-N general version was ~43
+ * cycles/byte).  All three transposes KWT-1 emits are rank-3 so this
+ * is the hot path. */
 void transpose_s8(
     const int8_t* input, int8_t* output, const TransposeParams* p) {
   const uint32_t rank = p->rank;
+  if (rank == 3) {
+    const uint32_t S0 = p->shape[0];
+    const uint32_t S1 = p->shape[1];
+    const uint32_t S2 = p->shape[2];
+    const int32_t st0 = (int32_t)p->in_stride[0];
+    const int32_t st1 = (int32_t)p->in_stride[1];
+    const int32_t st2 = (int32_t)p->in_stride[2];
+    int8_t* out = output;
+    for (uint32_t i0 = 0; i0 < S0; ++i0) {
+      const int8_t* row0 = input + (size_t)i0 * st0;
+      for (uint32_t i1 = 0; i1 < S1; ++i1) {
+        const int8_t* row1 = row0 + (size_t)i1 * st1;
+        for (uint32_t i2 = 0; i2 < S2; ++i2) {
+          *out++ = row1[(size_t)i2 * st2];
+        }
+      }
+    }
+    return;
+  }
   uint32_t total = 1;
   for (uint32_t r = 0; r < rank; ++r) total *= p->shape[r];
-  /* Walk output index in row-major order. */
   uint32_t idx[4] = {0};
   for (uint32_t out_i = 0; out_i < total; ++out_i) {
     size_t in_off = 0;
     for (uint32_t r = 0; r < rank; ++r) in_off += (size_t)idx[r] * p->in_stride[r];
     output[out_i] = input[in_off];
-    /* Increment row-major. */
     for (int r = (int)rank - 1; r >= 0; --r) {
       idx[r]++;
       if (idx[r] < p->shape[r]) break;
@@ -260,7 +401,14 @@ void transpose_s8(
 
 
 /* Phase 6: int8 Linear with CMSIS-NN kernel_sum precomputation.
- * Bit-exact port of cortex_m::quantized_linear (compute_using_kernel_sum=True). */
+ * Bit-exact port of cortex_m::quantized_linear (compute_using_kernel_sum=True).
+ *
+ * Phase 8: MVE fast path when K is a multiple of 16.  KWT-1's six
+ * linears all have K ∈ {64, 256}, so the fast path is always taken.
+ * Strategy: tile N by 4 so the input row is loaded once for four
+ * output channels, then vmladavaq_s8 the int8 dot products into
+ * scalar int32 accumulators.  The row-sum is vectorized too via
+ * vaddvaq_s8. */
 void linear_s8(
     const int8_t* input, const int8_t* weights, int8_t* output,
     const LinearParams* p) {
@@ -273,6 +421,101 @@ void linear_s8(
   const int32_t shift = p->output_shift;
   const int32_t amin = p->activation_min;
   const int32_t amax = p->activation_max;
+
+#if KWT_1_USE_MVE
+  if ((K & 15u) == 0u) {
+    for (uint32_t m = 0; m < M; ++m) {
+      const int8_t* row_in = input + (size_t)m * K;
+      /* row_sum = sum_k row_in[k] via vaddvaq_s8 (int8 -> int32 horizontal). */
+      int32_t row_sum = 0;
+      for (uint32_t k = 0; k < K; k += 16) {
+        row_sum = vaddvaq_s8(row_sum, vldrbq_s8(row_in + k));
+      }
+      const int32_t row_off_term = row_sum * filter_off;
+
+      uint32_t n = 0;
+      const int32x4_t v_amin = vdupq_n_s32(amin);
+      const int32x4_t v_amax = vdupq_n_s32(amax);
+      const int32x4_t v_out_off = vdupq_n_s32(out_off);
+      /* Tile-of-4 N with vectorized requantize+clamp+narrow.  shift is
+       * a runtime value but is constant across the entire linear, so
+       * the compiler hoists the branch in kwt_1_mve_requantize_nonpos.
+       * Restriction: this fast path assumes shift <= 0 (true for every
+       * KWT-1 linear and for CMSIS-NN's typical PT2E output).  Falls
+       * back to the per-lane scalar requantize otherwise. */
+      if (shift <= 0) {
+        for (; n + 4 <= N; n += 4) {
+          const int8_t* w0 = weights + (size_t)(n + 0) * K;
+          const int8_t* w1 = weights + (size_t)(n + 1) * K;
+          const int8_t* w2 = weights + (size_t)(n + 2) * K;
+          const int8_t* w3 = weights + (size_t)(n + 3) * K;
+          int32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+          for (uint32_t k = 0; k < K; k += 16) {
+            int8x16_t iv = vldrbq_s8(row_in + k);
+            a0 = vmladavaq_s8(a0, iv, vldrbq_s8(w0 + k));
+            a1 = vmladavaq_s8(a1, iv, vldrbq_s8(w1 + k));
+            a2 = vmladavaq_s8(a2, iv, vldrbq_s8(w2 + k));
+            a3 = vmladavaq_s8(a3, iv, vldrbq_s8(w3 + k));
+          }
+          /* Pack (a0,a1,a2,a3) into int32x4, add row_off_term and the
+           * kernel_sum vector, requantize, add out_off, clamp. */
+          int32x4_t acc = {a0, a1, a2, a3};
+          int32x4_t ks = vldrwq_s32(p->kernel_sum + n);
+          acc = vaddq_n_s32(acc, row_off_term);
+          acc = vaddq_s32(acc, ks);
+          acc = kwt_1_mve_requantize_nonpos(acc, mult, shift);
+          acc = vaddq_s32(acc, v_out_off);
+          acc = vminq_s32(vmaxq_s32(acc, v_amin), v_amax);
+          /* Narrow int32x4 → int8x4 and store via vstrbq_s32. */
+          vstrbq_s32(output + (size_t)m * N + n, acc);
+        }
+      } else {
+        for (; n + 4 <= N; n += 4) {
+          const int8_t* w0 = weights + (size_t)(n + 0) * K;
+          const int8_t* w1 = weights + (size_t)(n + 1) * K;
+          const int8_t* w2 = weights + (size_t)(n + 2) * K;
+          const int8_t* w3 = weights + (size_t)(n + 3) * K;
+          int32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+          for (uint32_t k = 0; k < K; k += 16) {
+            int8x16_t iv = vldrbq_s8(row_in + k);
+            a0 = vmladavaq_s8(a0, iv, vldrbq_s8(w0 + k));
+            a1 = vmladavaq_s8(a1, iv, vldrbq_s8(w1 + k));
+            a2 = vmladavaq_s8(a2, iv, vldrbq_s8(w2 + k));
+            a3 = vmladavaq_s8(a3, iv, vldrbq_s8(w3 + k));
+          }
+          a0 += row_off_term + p->kernel_sum[n + 0];
+          a1 += row_off_term + p->kernel_sum[n + 1];
+          a2 += row_off_term + p->kernel_sum[n + 2];
+          a3 += row_off_term + p->kernel_sum[n + 3];
+          int32_t r0 = kwt_1_requantize(a0, mult, shift) + out_off;
+          int32_t r1 = kwt_1_requantize(a1, mult, shift) + out_off;
+          int32_t r2 = kwt_1_requantize(a2, mult, shift) + out_off;
+          int32_t r3 = kwt_1_requantize(a3, mult, shift) + out_off;
+          if (r0 < amin) r0 = amin; else if (r0 > amax) r0 = amax;
+          if (r1 < amin) r1 = amin; else if (r1 > amax) r1 = amax;
+          if (r2 < amin) r2 = amin; else if (r2 > amax) r2 = amax;
+          if (r3 < amin) r3 = amin; else if (r3 > amax) r3 = amax;
+          int8_t* out_row = output + (size_t)m * N + n;
+          out_row[0] = (int8_t)r0; out_row[1] = (int8_t)r1;
+          out_row[2] = (int8_t)r2; out_row[3] = (int8_t)r3;
+        }
+      }
+      /* Tail in N (K-vectorized still). */
+      for (; n < N; ++n) {
+        const int8_t* w_row = weights + (size_t)n * K;
+        int32_t acc = 0;
+        for (uint32_t k = 0; k < K; k += 16) {
+          acc = vmladavaq_s8(acc, vldrbq_s8(row_in + k), vldrbq_s8(w_row + k));
+        }
+        acc += row_off_term + p->kernel_sum[n];
+        int32_t r = kwt_1_requantize(acc, mult, shift) + out_off;
+        if (r < amin) r = amin; else if (r > amax) r = amax;
+        output[(size_t)m * N + n] = (int8_t)r;
+      }
+    }
+    return;
+  }
+#endif
 
   for (uint32_t m = 0; m < M; ++m) {
     const int8_t* row_in = input + (size_t)m * K;
@@ -309,11 +552,78 @@ void add_s8(
     const int8_t* self_in, const int8_t* other_in, int8_t* output,
     const AddParams* p) {
   const uint32_t n = p->num_elements;
+#if KWT_1_USE_MVE
+  /* Both adds in KWT-1's encoder block have negative output_shift and
+   * shift in {0, -2} for the inputs; kwt_1_mve_requantize_nonpos
+   * handles shift<=0 bit-exactly.  Activation bounds for KWT-1 are
+   * always [-128, 127] (no fused ReLU here), so the clamp degenerates
+   * to a saturating cast.  Process 4 int32 lanes at a time after
+   * widening from int8. */
+  if (p->self_shift <= 0 && p->other_shift <= 0 && p->output_shift <= 0) {
+    const int32_t s_zp = p->self_zp;
+    const int32_t o_zp = p->other_zp;
+    const int32_t s_mult = p->self_multiplier;
+    const int32_t o_mult = p->other_multiplier;
+    const int32_t out_mult = p->output_multiplier;
+    const int32_t s_sh = p->self_shift;
+    const int32_t o_sh = p->other_shift;
+    const int32_t out_sh = p->output_shift;
+    const int32_t out_zp = p->output_zp;
+    const int32_t amin = p->activation_min;
+    const int32_t amax = p->activation_max;
+    /* Widen 16 int8 → four int32x4 quads via vldrbq_s32 (widening
+     * gather load).  This avoids the explicit vmovlb/vmovlt chain and
+     * keeps lane order natural so the narrowing stores work the same
+     * way back. */
+    uint32_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+      int32x4_t s_q0 = vldrbq_s32(self_in + i + 0);
+      int32x4_t s_q1 = vldrbq_s32(self_in + i + 4);
+      int32x4_t s_q2 = vldrbq_s32(self_in + i + 8);
+      int32x4_t s_q3 = vldrbq_s32(self_in + i + 12);
+      int32x4_t o_q0 = vldrbq_s32(other_in + i + 0);
+      int32x4_t o_q1 = vldrbq_s32(other_in + i + 4);
+      int32x4_t o_q2 = vldrbq_s32(other_in + i + 8);
+      int32x4_t o_q3 = vldrbq_s32(other_in + i + 12);
+      #define ADD_ONE(sq, oq) ({                                                       \
+        int32x4_t _sv = vshlq_n_s32(vsubq_n_s32((sq), s_zp), KWT_1_ADD_INTERNAL_SHIFT); \
+        int32x4_t _ov = vshlq_n_s32(vsubq_n_s32((oq), o_zp), KWT_1_ADD_INTERNAL_SHIFT); \
+        int32x4_t _sf = kwt_1_mve_requantize_nonpos(_sv, s_mult, s_sh);                \
+        int32x4_t _of = kwt_1_mve_requantize_nonpos(_ov, o_mult, o_sh);                \
+        int32x4_t _r  = kwt_1_mve_requantize_nonpos(vaddq_s32(_sf, _of), out_mult, out_sh); \
+        _r = vaddq_n_s32(_r, out_zp);                                                  \
+        vminq_s32(vmaxq_s32(_r, vdupq_n_s32(amin)), vdupq_n_s32(amax));                \
+      })
+      int32x4_t r0 = ADD_ONE(s_q0, o_q0);
+      int32x4_t r1 = ADD_ONE(s_q1, o_q1);
+      int32x4_t r2 = ADD_ONE(s_q2, o_q2);
+      int32x4_t r3 = ADD_ONE(s_q3, o_q3);
+      #undef ADD_ONE
+      vstrbq_s32(output + i + 0, r0);
+      vstrbq_s32(output + i + 4, r1);
+      vstrbq_s32(output + i + 8, r2);
+      vstrbq_s32(output + i + 12, r3);
+    }
+    /* Scalar tail. */
+    for (; i < n; ++i) {
+      int32_t s_v = ((int32_t)self_in[i] - p->self_zp) << KWT_1_ADD_INTERNAL_SHIFT;
+      int32_t o_v = ((int32_t)other_in[i] - p->other_zp) << KWT_1_ADD_INTERNAL_SHIFT;
+      int32_t s_fp = kwt_1_requantize(s_v, p->self_multiplier, p->self_shift);
+      int32_t o_fp = kwt_1_requantize(o_v, p->other_multiplier, p->other_shift);
+      int32_t r = kwt_1_requantize(s_fp + o_fp, p->output_multiplier, p->output_shift)
+                + p->output_zp;
+      if (r < p->activation_min) r = p->activation_min;
+      if (r > p->activation_max) r = p->activation_max;
+      output[i] = (int8_t)r;
+    }
+    return;
+  }
+#endif
   for (uint32_t i = 0; i < n; ++i) {
-    int32_t s_shift = ((int32_t)self_in[i] - p->self_zp) << KWT_1_ADD_INTERNAL_SHIFT;
-    int32_t o_shift = ((int32_t)other_in[i] - p->other_zp) << KWT_1_ADD_INTERNAL_SHIFT;
-    int32_t s_fp = kwt_1_requantize(s_shift, p->self_multiplier, p->self_shift);
-    int32_t o_fp = kwt_1_requantize(o_shift, p->other_multiplier, p->other_shift);
+    int32_t s_shift_val = ((int32_t)self_in[i] - p->self_zp) << KWT_1_ADD_INTERNAL_SHIFT;
+    int32_t o_shift_val = ((int32_t)other_in[i] - p->other_zp) << KWT_1_ADD_INTERNAL_SHIFT;
+    int32_t s_fp = kwt_1_requantize(s_shift_val, p->self_multiplier, p->self_shift);
+    int32_t o_fp = kwt_1_requantize(o_shift_val, p->other_multiplier, p->other_shift);
     int32_t r = kwt_1_requantize(s_fp + o_fp, p->output_multiplier, p->output_shift)
               + p->output_zp;
     if (r < p->activation_min) r = p->activation_min;
@@ -365,6 +675,107 @@ void attention_fused_s8(
     .input_shift = p->softmax_input_shift,
   };
 
+#if KWT_1_USE_MVE
+  /* MVE fast path.  KWT-1 uses D=64 (multiple of 16) and S=8, so the
+   * D-loop in QK^T is MVE-vectorizable via vmladavaq_s8 with the same
+   * kernel-sum trick the linears use:
+   *   sum_k (q[k]+q_off)(k[k]+k_off) = qk_dot + q_off*k_sum + k_off*q_sum
+   *                                  + D*q_off*k_off
+   * For step 3, S=8 is below MVE's 16 int8 lanes, so we keep that loop
+   * scalar but precompute the v column sums once per batch — the
+   * scores_scratch sum is computed in one vaddvaq_s8 after softmax. */
+  if ((D & 15u) == 0u) {
+    /* Precompute k row sums (S=8 entries) once per batch.  Each row is
+     * D bytes (D=64 → 4 MVE 16-lane chunks). */
+    int32_t k_row_sums[KWT_1_SOFTMAX_MAX_ROW];
+    int32_t v_col_sums[64];  /* D ≤ 64 in KWT-1 */
+    /* The v_col_sums array sizes hard-coded to D=64 max; if D ever
+     * grows we'll need a heap scratch.  Asserting it fits via a
+     * compile-time check below would require D as a literal.
+     * Practical guard: bail out to the scalar path if D > 64. */
+    if (D > 64) goto scalar_path;
+    for (uint32_t b = 0; b < B; ++b) {
+      const int8_t* q_b = q + (size_t)b * S * D;
+      const int8_t* k_b = k + (size_t)b * S * D;
+      const int8_t* v_b = v + (size_t)b * S * D;
+      int8_t* out_b = output + (size_t)b * S * D;
+
+      for (uint32_t j = 0; j < S; ++j) {
+        const int8_t* k_row = k_b + (size_t)j * D;
+        int32_t s = 0;
+        for (uint32_t kk = 0; kk < D; kk += 16) {
+          s = vaddvaq_s8(s, vldrbq_s8(k_row + kk));
+        }
+        k_row_sums[j] = s;
+      }
+      /* v_col_sums[n] = sum_j v_b[n, j] (v is stored (D, S) in BMM rhs_T
+       * layout).  S=8, each row D values, but it's a row sum over S. */
+      for (uint32_t n = 0; n < D; ++n) {
+        const int8_t* v_row = v_b + (size_t)n * S;
+        int32_t s = 0;
+        for (uint32_t jj = 0; jj < S; ++jj) s += (int32_t)v_row[jj];
+        v_col_sums[n] = s;
+      }
+      /* Constants for the kernel-sum reformulation:
+       *   sum (q+q_off)(k+k_off) = qk_dot + q_off*k_sum + k_off*q_sum + D*q_off*k_off
+       *   sum (p+probs_off)(v+v_off) = pv_dot + probs_off*v_sum + v_off*p_sum + S*probs_off*v_off
+       */
+      const int32_t qk_const_term = (int32_t)D * q_off * k_off;
+      const int32_t av_const_term = (int32_t)S * probs_off * v_off;
+
+      for (uint32_t i = 0; i < S; ++i) {
+        const int8_t* q_row = q_b + (size_t)i * D;
+        /* q_row_sum */
+        int32_t q_row_sum = 0;
+        for (uint32_t kk = 0; kk < D; kk += 16) {
+          q_row_sum = vaddvaq_s8(q_row_sum, vldrbq_s8(q_row + kk));
+        }
+        const int32_t q_off_term = k_off * q_row_sum;
+
+        /* Step 1: QK^T row i. */
+        for (uint32_t j = 0; j < S; ++j) {
+          const int8_t* k_row = k_b + (size_t)j * D;
+          int32_t dot = 0;
+          for (uint32_t kk = 0; kk < D; kk += 16) {
+            dot = vmladavaq_s8(dot, vldrbq_s8(q_row + kk), vldrbq_s8(k_row + kk));
+          }
+          int32_t acc = dot + q_off * k_row_sums[j] + q_off_term + qk_const_term;
+          int32_t r = kwt_1_requantize(acc, qk_mult, qk_shift) + qk_zp;
+          if (r < -128) r = -128;
+          if (r >  127) r =  127;
+          scores_scratch[j] = (int8_t)r;
+        }
+
+        /* Step 2: softmax in place. */
+        softmax_s8(scores_scratch, scores_scratch, &sm_p);
+
+        /* Step 3: AV row i = sum_j (probs[j]+128)(v[n,j]+v_off).
+         * S=8 < 16 so we keep the inner loop scalar but precomputed
+         * sums collapse the offset bookkeeping. */
+        int32_t probs_sum = 0;
+        for (uint32_t jj = 0; jj < S; ++jj) probs_sum += (int32_t)scores_scratch[jj];
+        const int32_t probs_row_term = v_off * probs_sum + av_const_term;
+
+        int8_t* out_row = out_b + (size_t)i * D;
+        for (uint32_t n = 0; n < D; ++n) {
+          const int8_t* v_row = v_b + (size_t)n * S;
+          int32_t dot = 0;
+          for (uint32_t jj = 0; jj < S; ++jj) {
+            dot += (int32_t)scores_scratch[jj] * (int32_t)v_row[jj];
+          }
+          int32_t acc = dot + probs_off * v_col_sums[n] + probs_row_term;
+          int32_t r = kwt_1_requantize(acc, av_mult, av_shift) + av_zp;
+          if (r < -128) r = -128;
+          if (r >  127) r =  127;
+          out_row[n] = (int8_t)r;
+        }
+      }
+    }
+    return;
+  }
+scalar_path:;
+#endif
+
   for (uint32_t b = 0; b < B; ++b) {
     const int8_t* q_b = q + (size_t)b * S * D;
     const int8_t* k_b = k + (size_t)b * S * D;
@@ -390,16 +801,10 @@ void attention_fused_s8(
         scores_scratch[j] = (int8_t)r;
       }
 
-      /* Step 2: softmax those S scores in place.  softmax_s8 reads
-       * the int8 input once at the start of each pass; in-place is
-       * safe because it stages everything in its own float scratch
-       * before writing the int8 output. */
+      /* Step 2: softmax those S scores in place. */
       softmax_s8(scores_scratch, scores_scratch, &sm_p);
 
-      /* Step 3: AV row i = sum_j (probs[j] + probs_off) * (v_t[n,j] + v_off).
-       * v is stored in (B, D, S) BMM rhs_transposed layout, so the inner
-       * loop reads stride-1 along S for fixed n — same layout as probs,
-       * MVE-friendly when the MVE fast path lands. */
+      /* Step 3: AV row i = sum_j (probs[j] + probs_off) * (v_t[n,j] + v_off). */
       int8_t* out_row = out_b + (size_t)i * D;
       for (uint32_t n = 0; n < D; ++n) {
         const int8_t* v_row = v_b + (size_t)n * S;

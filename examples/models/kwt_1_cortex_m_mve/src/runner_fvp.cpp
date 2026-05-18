@@ -23,7 +23,32 @@
 
 #include "kwt_1_inference.h"
 #include "kwt_1_arena.h"
+#include "kwt_1_profile.h"
 #include "input_fixture.h"
+
+#if KWT_1_PROFILE
+extern "C" uint32_t kwt_1_profile_now(void) {
+  return ARM_PMU_Get_CCNTR();
+}
+extern "C" void kwt_1_profile_dump(void) {
+  extern uint32_t kwt_1_profile_cycles[];
+  extern const char* kwt_1_profile_names[];
+  extern uint32_t kwt_1_profile_count;
+  uint32_t total = 0;
+  for (uint32_t i = 0; i < kwt_1_profile_count; ++i) total += kwt_1_profile_cycles[i];
+  printf("PROFILE_BEGIN\n");
+  for (uint32_t i = 0; i < kwt_1_profile_count; ++i) {
+    uint32_t c = kwt_1_profile_cycles[i];
+    uint32_t pct = total ? (uint32_t)((uint64_t)c * 1000u / total) : 0u;
+    printf("%2u %-24s %10u %u.%u%%\n",
+           (unsigned)i,
+           kwt_1_profile_names[i] ? kwt_1_profile_names[i] : "(null)",
+           (unsigned)c, (unsigned)(pct / 10), (unsigned)(pct % 10));
+  }
+  printf("PROFILE_TOTAL %u\n", (unsigned)total);
+  printf("PROFILE_END\n");
+}
+#endif
 
 /* DWT cycle counter registers — Cortex-M55 implements both DWT and the
  * cycle counter (CYCCNT).  Read alongside the PMU CCNTR for cross-check;
@@ -60,6 +85,8 @@ int main(void) {
   printf("CYCLES %u\n", (unsigned)pmu_elapsed);
   printf("CYCLES_DWT %u\n", (unsigned)dwt_elapsed);
   printf("CYCLES_PMU %u\n", (unsigned)pmu_elapsed);
+
+  kwt_1_profile_dump();
 
   printf("RESULT_BEGIN\n");
   for (unsigned i = 0; i < KWT_1_OUTPUT_NUM_ELEMENTS; ++i) {

@@ -22,8 +22,18 @@
 #include "kwt_1_arena.h"
 #include "kwt_1_kernels.h"
 #include "kwt_1_params.h"
+#include "kwt_1_profile.h"
 
 extern uint8_t kwt_1_arena[];
+
+#if KWT_1_PROFILE
+/* Storage for the per-kernel profile.  The PMU read (kwt_1_profile_now)
+ * and the dump function are defined alongside the runner because
+ * ARM_PMU_Get_CCNTR is a static-inline in CMSIS and not linkable. */
+uint32_t kwt_1_profile_cycles[KWT_1_PROFILE_MAX_KERNELS];
+const char* kwt_1_profile_names[KWT_1_PROFILE_MAX_KERNELS];
+uint32_t kwt_1_profile_count;
+#endif
 
 
 /* Float → int8 per-tensor quantize, matching cortex_m.quantize_per_tensor.

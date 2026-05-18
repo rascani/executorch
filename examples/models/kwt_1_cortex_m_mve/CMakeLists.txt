@@ -32,6 +32,10 @@ cmake_minimum_required(VERSION 3.20)
 project(kwt_1_cortex_m_mve C CXX ASM)
 
 option(KWT_1_BUILD_FVP "Cross-compile for Corstone-300 FVP" OFF)
+option(KWT_1_PROFILE "Wrap each kernel call with per-kernel cycle counters" OFF)
+if(KWT_1_PROFILE)
+  add_compile_definitions(KWT_1_PROFILE=1)
+endif()
 
 set(KWT_1_GENERATED_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/generated"
