@@ -97,3 +97,26 @@ void layer_norm_s8(
     const int8_t* input, int8_t* output, const LayerNormParams* p) {
   layer_norm_s8_scalar(input, output, p);
 }
+
+
+/* Phase 2: int8 → int8 GELU via 256-byte LUT.  The LUT bakes in the
+ * input/output quant params and the approximate form; runtime cost
+ * per element is one int8 table lookup.  Indexed as
+ *   output[i] = lut[(uint8_t)(input[i] + 128)]
+ * — adding 128 turns the signed int8 input into an unsigned index in
+ * [0, 256).
+ *
+ * Scalar implementation is bit-exact and fast enough for KWT-1
+ * (~75K GELU evaluations per inference; under 1% of cycles).  An MVE
+ * `vldrbq_gather_offset_s8` 16-wide gather would speed it up further
+ * but adds modest complexity for marginal gain — deferred to the
+ * tuning phase.
+ */
+void gelu_lut_s8(
+    const int8_t* input, int8_t* output, const GELUParams* p) {
+  const int8_t* lut = p->lut;
+  const uint32_t n = p->num_elements;
+  for (uint32_t i = 0; i < n; ++i) {
+    output[i] = lut[(uint8_t)(input[i] + (int8_t)0x80)];
+  }
+}

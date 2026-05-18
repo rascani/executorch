@@ -25,6 +25,7 @@ from torch.nn import Module
 
 from .activation_fusion_pass import ActivationFusionPass
 from .clamp_hardswish_pass import ClampHardswishPass
+from .convert_gelu_pass import ConvertGELUPass
 from .convert_layer_norm_pass import ConvertLayerNormPass
 from .convert_to_cortex_m_pass import ConvertToCortexMPass
 from .decompose_hardswish_pass import DecomposeHardswishPass
@@ -51,6 +52,10 @@ class CortexMPassManager(PassManager):
         FoldAndAnnotateQParamsPass,
         ReplaceScalarWithTensorArgPass,
         ReplaceQuantNodesPass,
+        # Phase 2: ConvertGELUPass must run before QuantizedOpFusionPass,
+        # which strips the `approximate` kwarg from aten.gelu and would
+        # otherwise lose the erf/tanh distinction.
+        ConvertGELUPass,
         ActivationFusionPass,
         QuantizedClampActivationPass,
         DecomposeHardswishPass,

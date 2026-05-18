@@ -25,6 +25,10 @@ extern "C" {
 void layer_norm_s8(const int8_t* input, int8_t* output,
                    const LayerNormParams* p);
 
+/* Phase 2: int8 in / int8 out GELU via a 256-byte LUT. */
+void gelu_lut_s8(const int8_t* input, int8_t* output,
+                 const GELUParams* p);
+
 #ifdef __cplusplus
 }
 #endif

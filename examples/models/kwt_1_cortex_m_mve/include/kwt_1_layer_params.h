@@ -37,4 +37,18 @@ typedef struct {
   const float* beta;
 } LayerNormParams;
 
+typedef struct {
+  /* Phase 2: int8 -> int8 GELU via a 256-byte LUT.  The LUT is
+   * precomputed at AOT time as
+   *   lut[x + 128] = clamp(round(gelu((x - in_zp) * in_scale) / out_scale)
+   *                        + out_zp, -128, 127)
+   * for x in [-128, 127], baking the input/output quant params and the
+   * approximate form (erf or tanh) into the table.  Per-element
+   * runtime cost: one int8 gather.  All other quant params are
+   * implicit in the LUT; the kernel needs only num_elements and the
+   * LUT pointer. */
+  uint32_t num_elements;
+  const int8_t* lut;
+} GELUParams;
+
 #endif

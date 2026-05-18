@@ -633,6 +633,75 @@ def quantized_layer_norm_impl(
 
 
 # ===================================================================
+# QUANTIZED GELU (Phase 2 of KWT transformer support)
+# ===================================================================
+# Pointwise, stateless activation.  Input is int8, output is int8; the
+# math inside is float (dequant → torch.nn.functional.gelu → requant).
+# The standalone runtime kernel uses a 256-byte LUT precomputed at AOT
+# time from the (in_zp, in_scale, out_zp, out_scale, approximate)
+# tuple, so the per-element runtime cost is one int8 gather.
+#
+# `approximate_tanh` mirrors `torch.nn.functional.gelu`'s `approximate`
+# kwarg: True → tanh form, False → erf form.  Default False to match
+# nn.TransformerEncoderLayer(activation='gelu'); the AOT pass picks up
+# whatever the source model uses.
+
+lib.define(
+    "quantized_gelu("
+    "Tensor input, "
+    "int input_zero_point, float input_scale, "
+    "int output_zero_point, float output_scale, "
+    "bool approximate_tanh"
+    ") -> Tensor"
+)
+lib.define(
+    "quantized_gelu.out("
+    "Tensor input, "
+    "int input_zero_point, float input_scale, "
+    "int output_zero_point, float output_scale, "
+    "bool approximate_tanh, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+
+
+@register_fake("cortex_m::quantized_gelu")  # type: ignore[misc]
+def quantized_gelu_meta(
+    input: torch.Tensor,
+    input_zero_point: int,
+    input_scale: float,
+    output_zero_point: int,
+    output_scale: float,
+    approximate_tanh: bool,
+) -> torch.Tensor:
+    return torch.empty_like(input, dtype=torch.int8, memory_format=torch.preserve_format)
+
+
+@impl(lib, "quantized_gelu", "CompositeExplicitAutograd")  # type: ignore[misc]
+def quantized_gelu_impl(
+    input: torch.Tensor,
+    input_zero_point: int,
+    input_scale: float,
+    output_zero_point: int,
+    output_scale: float,
+    approximate_tanh: bool,
+) -> torch.Tensor:
+    if input.dtype != torch.int8:
+        raise TypeError(
+            f"cortex_m.quantized_gelu: expected int8 input, got {input.dtype}"
+        )
+    if output_scale <= 0.0:
+        raise ValueError(
+            f"cortex_m.quantized_gelu: output_scale must be positive, got {output_scale}"
+        )
+    input_fp = (input.to(torch.int32) - int(input_zero_point)).float() * float(input_scale)
+    approx = "tanh" if bool(approximate_tanh) else "none"
+    out_fp = torch.nn.functional.gelu(input_fp, approximate=approx)
+    out_q = torch.round(out_fp / float(output_scale)) + int(output_zero_point)
+    return out_q.clamp(-128, 127).to(torch.int8)
+
+
+# ===================================================================
 # TRANSPOSE OPERATION DEFINITION
 # ===================================================================
 lib.define("transpose(Tensor input, int[] perm) -> Tensor")
