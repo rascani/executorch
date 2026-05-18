@@ -29,6 +29,10 @@ void layer_norm_s8(const int8_t* input, int8_t* output,
 void gelu_lut_s8(const int8_t* input, int8_t* output,
                  const GELUParams* p);
 
+/* Phase 3: int8 batched matmul (B, M, K) × (B, N, K)^T → (B, M, N). */
+void batch_matmul_s8(const int8_t* lhs, const int8_t* rhs_transposed,
+                     int8_t* output, const BMMParams* p);
+
 #ifdef __cplusplus
 }
 #endif

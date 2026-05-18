@@ -29,6 +29,34 @@
 #include "kwt_1_kernels.h"
 
 
+/* Bit-exact match to backends/cortex_m/passes/passes_utils.py
+ * `requantize_cmsis`: tie-away-from-zero on the final right shift, as
+ * used by CMSIS-NN's `arm_nn_requantize`.  Shared by BMM, fused
+ * attention, and any other kernel that requantizes an int32
+ * accumulator. */
+static inline int32_t kwt_1_requantize(
+    int32_t acc, int32_t multiplier, int32_t shift) {
+  int64_t value = (int64_t)acc << (shift > 0 ? shift : 0);
+  int64_t product = value * (int64_t)multiplier + (1LL << 30);
+  int32_t result = (int32_t)(product >> 31);
+  if (shift < 0) {
+    int32_t right = -shift;
+    int32_t mask = (1 << right) - 1;
+    int32_t remainder = result & mask;
+    int32_t shifted_down = result >> right;
+    int32_t threshold = mask >> 1;
+    if (result < 0) {
+      threshold += 1;
+    }
+    if (remainder > threshold) {
+      shifted_down += 1;
+    }
+    result = shifted_down;
+  }
+  return result;
+}
+
+
 /* Per-row int8 → float dequant → torch-style two-pass LayerNorm → γβ
  * affine → int8 requant.  Scalar reference; the MVE fast path lives
  * below this in the same file.
@@ -118,5 +146,59 @@ void gelu_lut_s8(
   const uint32_t n = p->num_elements;
   for (uint32_t i = 0; i < n; ++i) {
     output[i] = lut[(uint8_t)(input[i] + (int8_t)0x80)];
+  }
+}
+
+
+/* Phase 3: int8 batched matmul.  Computes
+ *     output[b, m, n] = requantize(
+ *         sum_k (lhs[b,m,k] + lhs_offset) * (rhs_transposed[b,n,k] + rhs_offset),
+ *         mult, shift) + output_zp
+ *     clamp to [-128, 127]
+ *
+ * Layout matches cortex_m::quantized_batch_matmul: rhs is stored with
+ * the contraction dim last, so both lhs and rhs inner loops are
+ * stride-1 along K — MVE-friendly.
+ *
+ * For KWT-1 attention with nhead=1:
+ *   - QK^T: lhs = Q(1,99,64), rhs_transposed = K(1,99,64), out (1,99,99)
+ *           (B=1, M=99, K=64, N=99)
+ *   - AV:   lhs = scores(1,99,99), rhs_transposed = V^T(1,64,99), out (1,99,64)
+ *           (B=1, M=99, K=99, N=64) — V is transposed at AOT (constant)
+ *
+ * Scalar reference; MVE fast path follows once bit-exactness is gated. */
+void batch_matmul_s8(
+    const int8_t* lhs, const int8_t* rhs_transposed,
+    int8_t* output, const BMMParams* p) {
+  const uint32_t B = p->batch;
+  const uint32_t M = p->M;
+  const uint32_t K = p->K;
+  const uint32_t N = p->N;
+  const int32_t lhs_off = p->lhs_offset;
+  const int32_t rhs_off = p->rhs_offset;
+  const int32_t out_zp = p->output_zp;
+  const int32_t mult = p->output_multiplier;
+  const int32_t shift = p->output_shift;
+
+  for (uint32_t b = 0; b < B; ++b) {
+    const int8_t* lhs_b = lhs + (size_t)b * M * K;
+    const int8_t* rhs_b = rhs_transposed + (size_t)b * N * K;
+    int8_t* out_b = output + (size_t)b * M * N;
+    for (uint32_t m = 0; m < M; ++m) {
+      const int8_t* lhs_row = lhs_b + (size_t)m * K;
+      for (uint32_t n = 0; n < N; ++n) {
+        const int8_t* rhs_row = rhs_b + (size_t)n * K;
+        int32_t acc = 0;
+        for (uint32_t k = 0; k < K; ++k) {
+          int32_t a = (int32_t)lhs_row[k] + lhs_off;
+          int32_t c = (int32_t)rhs_row[k] + rhs_off;
+          acc += a * c;
+        }
+        int32_t r = kwt_1_requantize(acc, mult, shift) + out_zp;
+        if (r < -128) r = -128;
+        if (r >  127) r =  127;
+        out_b[(size_t)m * N + n] = (int8_t)r;
+      }
+    }
   }
 }

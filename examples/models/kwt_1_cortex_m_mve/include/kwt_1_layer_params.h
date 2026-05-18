@@ -51,4 +51,26 @@ typedef struct {
   const int8_t* lut;
 } GELUParams;
 
+typedef struct {
+  /* Phase 3: int8 (B, M, K) × int8 (B, N, K) → int8 (B, M, N) batched
+   * matmul.  rhs is stored *transposed* (i.e. the second matrix's
+   * contraction dim is last, same as cortex_m::quantized_batch_matmul),
+   * so the kernel's inner loop reads along the last dim of both lhs
+   * and rhs — friendly to MVE row-major loads.
+   *
+   * lhs_offset / rhs_offset are the negated quant zero-points (CMSIS-NN
+   * convention): the inner loop adds them to the raw int8 values
+   * before multiplying.  output_zp / output_multiplier / output_shift
+   * implement arm_nn_requantize on the int32 accumulator. */
+  uint32_t batch;
+  uint32_t M;
+  uint32_t K;
+  uint32_t N;
+  int32_t lhs_offset;
+  int32_t rhs_offset;
+  int32_t output_zp;
+  int32_t output_multiplier;
+  int32_t output_shift;
+} BMMParams;
+
 #endif
