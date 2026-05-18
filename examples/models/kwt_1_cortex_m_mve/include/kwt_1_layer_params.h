@@ -52,6 +52,23 @@ typedef struct {
 } GELUParams;
 
 typedef struct {
+  /* Phase 4: per-row int8 softmax matching CMSIS-NN convention.
+   * Output zero-point is fixed at -128 and output scale at 1/256 by
+   * cortex_m::softmax's contract — those are baked into the kernel.
+   * input_multiplier and input_shift encode the input scale per
+   *   real_scale = (multiplier / 2^31) * 2^shift / 2^(31 - 5)
+   *             = multiplier * 2^(shift - 57)
+   * (the 5 is SOFTMAX_INPUT_INTEGER_BITS from operators.py — number
+   * of bits reserved for the integer part of the fixed-point exp
+   * argument; matches CMSIS-NN's arm_softmax_s8 convention). */
+  uint32_t num_rows;
+  uint32_t row_len;
+  int32_t input_zp;
+  int32_t input_multiplier;
+  int32_t input_shift;
+} SoftmaxParams;
+
+typedef struct {
   /* Phase 3: int8 (B, M, K) × int8 (B, N, K) → int8 (B, M, N) batched
    * matmul.  rhs is stored *transposed* (i.e. the second matrix's
    * contraction dim is last, same as cortex_m::quantized_batch_matmul),

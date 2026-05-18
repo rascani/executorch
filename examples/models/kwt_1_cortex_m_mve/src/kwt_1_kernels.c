@@ -167,6 +167,75 @@ void gelu_lut_s8(
  *           (B=1, M=99, K=99, N=64) — V is transposed at AOT (constant)
  *
  * Scalar reference; MVE fast path follows once bit-exactness is gated. */
+/* Phase 4: per-row int8 softmax matching cortex_m::softmax's python
+ * impl bit-for-bit.  CMSIS-NN's actual arm_softmax_s8 uses a
+ * fixed-point exp polynomial that can differ from this float-domain
+ * implementation by ±1 LSB at individual output positions; the
+ * python impl uses torch.softmax in float and that's the reference
+ * the rest of the project gates on, so we match that here.
+ *
+ *   real_scale     = multiplier * 2^(shift - 57)
+ *   x_fp[i]        = (input[i] - input_zp) * real_scale
+ *   row_max        = max_i x_fp[i]
+ *   exp_diffs[i]   = expf(x_fp[i] - row_max)
+ *   probs[i]       = exp_diffs[i] / sum_i exp_diffs[i]
+ *   output[i]      = clamp(round(probs[i] * 256) - 128, -128, 127)
+ *
+ * For KWT-1 attention, row_len is the sequence length (99); for
+ * conformer stretch the row scratch sizing here is the load-bearing
+ * piece (S~1000 needs more stack than we should commit to).  Today
+ * we use a fixed 1024-element stack scratch; raise if a future model
+ * exceeds it. */
+#define KWT_1_SOFTMAX_MAX_ROW 1024
+
+void softmax_s8(
+    const int8_t* input, int8_t* output, const SoftmaxParams* p) {
+  const uint32_t R = p->num_rows;
+  const uint32_t N = p->row_len;
+  const float in_zp = (float)p->input_zp;
+  const float real_scale = (float)p->input_multiplier
+      * ldexpf(1.0f, p->input_shift - 57);
+
+  float scratch[KWT_1_SOFTMAX_MAX_ROW];
+
+  for (uint32_t r = 0; r < R; ++r) {
+    const int8_t* row_in = input + (size_t)r * N;
+    int8_t* row_out = output + (size_t)r * N;
+
+    /* Pass 1: dequant + row max. */
+    float row_max = -INFINITY;
+    for (uint32_t i = 0; i < N; ++i) {
+      float x = ((float)row_in[i] - in_zp) * real_scale;
+      scratch[i] = x;
+      if (x > row_max) row_max = x;
+    }
+
+    /* Pass 2: shifted exp + row sum. */
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < N; ++i) {
+      float e = expf(scratch[i] - row_max);
+      scratch[i] = e;
+      sum += e;
+    }
+
+    /* Pass 3: normalize + quantize at CMSIS-NN's fixed (scale=1/256,
+     * zp=-128).  probs * 256 has range [0, 256], round and subtract
+     * 128 — final clamp guards against a probability of 1.0
+     * mapping to 128 (above int8 max). */
+    const float inv_sum = 1.0f / sum;
+    for (uint32_t i = 0; i < N; ++i) {
+      float prob = scratch[i] * inv_sum;
+      float qf = prob * 256.0f;
+      int32_t q = (int32_t)(qf + (qf >= 0.0f ? 0.5f : -0.5f));
+      q -= 128;
+      if (q < -128) q = -128;
+      if (q >  127) q =  127;
+      row_out[i] = (int8_t)q;
+    }
+  }
+}
+
+
 void batch_matmul_s8(
     const int8_t* lhs, const int8_t* rhs_transposed,
     int8_t* output, const BMMParams* p) {
