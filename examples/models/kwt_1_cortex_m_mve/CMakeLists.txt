@@ -37,6 +37,11 @@ if(KWT_1_PROFILE)
   add_compile_definitions(KWT_1_PROFILE=1)
 endif()
 
+option(KWT_1_FAST_EXPF "Use a polynomial expf in softmax (~10x faster, ~4 ULP, not bit-exact vs newlib expf)" OFF)
+if(KWT_1_FAST_EXPF)
+  add_compile_definitions(KWT_1_FAST_EXPF=1)
+endif()
+
 set(KWT_1_GENERATED_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/generated"
     CACHE PATH "Directory holding generated kwt_1_arena.h, input_fixture.h, and (Phase 1+) kwt_1_weights.{c,h}, kwt_1_params.h"

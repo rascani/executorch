@@ -33,10 +33,10 @@ void gelu_lut_s8(const int8_t* input, int8_t* output,
 void batch_matmul_s8(const int8_t* lhs, const int8_t* rhs_transposed,
                      int8_t* output, const BMMParams* p);
 
-/* Phase 4: per-row int8 softmax.  Output uses CMSIS-NN's fixed
- * (scale=1/256, zp=-128) — those values are not in SoftmaxParams. */
-void softmax_s8(const int8_t* input, int8_t* output,
-                const SoftmaxParams* p);
+/* Phase 4: per-row int8 softmax — used only inside attention_fused_s8
+ * today, kept as a `static inline` in kwt_1_kernels.c so it can hoist
+ * its float scratch into the attention frame.  Re-expose here when a
+ * non-attention caller appears. */
 
 /* Phase 5: streaming fused attention.  Stream-processes one Q row
  * at a time → never materializes the (S, S) score matrix. */
