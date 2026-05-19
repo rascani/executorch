@@ -76,8 +76,8 @@ def _plan_memory(prog: ExportedProgram, alignment: int = 16) -> tuple[dict, dict
 
 
 class OneBlockKWT(nn.Module):
-    """Single transformer encoder block at KWT-1 dims (d=64, d_ff=256)."""
-    def __init__(self, d=64, d_ff=256):
+    """Single transformer encoder block at KWT-1 dims (d=64, d_ff=128)."""
+    def __init__(self, d=64, d_ff=128):
         super().__init__()
         self.ln1 = nn.LayerNorm(d)
         self.lq = nn.Linear(d, d); self.lk = nn.Linear(d, d); self.lv = nn.Linear(d, d)
@@ -101,9 +101,9 @@ class OneBlockKWT(nn.Module):
 
 class KWT1Encoder(nn.Module):
     """Stack of N transformer encoder blocks.  Each block matches
-    OneBlockKWT's structure (KWT-1 single-head, d_model=64, d_ff=256
+    OneBlockKWT's structure (KWT-1 single-head, d_model=64, d_ff=128
     are the defaults).  N=12 gives the canonical KWT-1 encoder."""
-    def __init__(self, num_blocks: int = 12, d: int = 64, d_ff: int = 256):
+    def __init__(self, num_blocks: int = 12, d: int = 64, d_ff: int = 128):
         super().__init__()
         self.blocks = nn.ModuleList(
             [OneBlockKWT(d=d, d_ff=d_ff) for _ in range(num_blocks)]
@@ -146,9 +146,10 @@ class KWT1(nn.Module):
         seq_len: int = 98,
         num_blocks: int = 12,
         d: int = 64,
-        d_ff: int = 256,
+        d_ff: int = 128,
         num_classes: int = 35,
         use_pos_enc: bool = False,
+        use_final_ln: bool = False,
     ):
         super().__init__()
         self.embed = nn.Linear(mfcc_dim, d)
@@ -158,6 +159,7 @@ class KWT1(nn.Module):
         else:
             self.pos = None
         self.encoder = KWT1Encoder(num_blocks=num_blocks, d=d, d_ff=d_ff)
+        self.final_ln = nn.LayerNorm(d) if use_final_ln else None
         self.head = nn.Linear(d, num_classes)
 
     def forward(self, x):
@@ -166,7 +168,9 @@ class KWT1(nn.Module):
         if self.pos is not None:
             h = h + self.pos
         h = self.encoder(h)                          # (B, S, d)
-        pooled = h.mean(dim=1)                       # (B, d)
+        if self.final_ln is not None:
+            h = self.final_ln(h)                     # (B, S, d)
+        pooled = h.mean(dim=1)                       # (B, d) — see class docstring
         return self.head(pooled)                     # (B, num_classes)
 
 

@@ -22,11 +22,32 @@ ground for the cortex_m backend as a whole:
 | `attention_fused_s8`    | Streaming fusion of QK^T → softmax → AV (no S×S score matrix materialized) |
 | `add_s8`, `linear_s8`, `transpose_s8`, `kwt_1_quantize_input` | Standalone counterparts of the cortex_m ops |
 
-Phase 0-8 status: single transformer encoder block (`OneBlockKWT`,
-d=64, d_ff=256, seq_len=8) lowered → MVE-tuned → validated bit-exact
-on both host and Corstone-300 FVP.  Scaling to the full 12-encoder
-KWT-1 is the next phase and will swap the dumper's bump allocator for
-`exir.memory_planning.greedy` to keep the arena bounded.
+Phase 0-10 status: full canonical KWT-1 architecture (`KWT1(seq_len=98,
+mfcc_dim=40, d=64, d_ff=128, num_blocks=12, num_classes=35)`) lowered
+→ MVE-tuned → validated bit-exact on host with the dumper's
+`--full-kwt1 --seq-len 98` flag.  The `OneBlockKWT` unit used for
+Phase 0-8 bring-up is the same module stacked 12× by `KWT1Encoder`.
+
+### Architectural caveats
+
+The standalone path implements a subset of the published KWT-1
+architecture today; gaps that affect parity with the
+ARM-software/keyword-transformer published checkpoints:
+
+| Piece | Published KWT-1 | This directory |
+|---|---|---|
+| Sequence pooling | `[CLS]` token + slice | Mean over the sequence dim |
+| Final pre-head LayerNorm | Yes | Skipped (CortexMQuantizer doesn't currently annotate it) |
+| Learned positional encoding | Yes | Plumbed (`AddLayer.{self,other}_const`, see `kwt_1_kernels.c`) but disabled — PT2E flags an annotator warning when an Add has a parameter input |
+
+Encoder body (12 stacked blocks with 1-head attention, d=64,
+d_ff=128, GELU activation) matches bit-for-bit, so a published
+checkpoint's encoder weights transfer cleanly via
+`tools/load_arm_kwt1.py`.  The classification head was trained
+against CLS-pooled features rather than mean-pooled, so it needs a
+short fine-tune on Speech Commands v2 to recover most of the
+published top-1.  See `tools/load_arm_kwt1.py`'s module docstring
+for the full weight-mapping table.
 
 See [`docs/BENCHMARK.md`](docs/BENCHMARK.md) for the cycle progression
 through Phase 8 (1.81 M → 327 k PMU cycles, 5.52×, bit-exact at every
