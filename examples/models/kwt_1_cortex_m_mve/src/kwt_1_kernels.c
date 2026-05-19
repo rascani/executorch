@@ -798,9 +798,12 @@ void attention_fused_s8(
    * For step 3, S=8 is below MVE's 16 int8 lanes, so we keep that loop
    * scalar but precompute the v column sums once per batch — the
    * scores_scratch sum is computed in one vaddvaq_s8 after softmax. */
-  if ((D & 15u) == 0u) {
-    /* Precompute k row sums (S=8 entries) once per batch.  Each row is
-     * D bytes (D=64 → 4 MVE 16-lane chunks). */
+  if ((D & 15u) == 0u && S <= 16) {
+    /* MVE fast path scope: D multiple of 16 (KWT-1's d=64), S ≤ 16
+     * (KWT-1 OneBlock test uses S=8; canonical seq_len=98 falls
+     * through to the scalar path until the K-vectorized long-S
+     * variant lands).  Precompute k row sums (S entries) once per
+     * batch and v column sums (D entries). */
     int32_t k_row_sums[KWT_1_SOFTMAX_MAX_ROW];
     int32_t v_col_sums[64];  /* D ≤ 64 in KWT-1 */
     /* The v_col_sums array sizes hard-coded to D=64 max; if D ever
