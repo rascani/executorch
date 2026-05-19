@@ -859,14 +859,46 @@ void attention_fused_s8(
         }
         const int32_t q_off_term = k_off * q_row_sum;
 
-        /* Step 1: QK^T row i. */
-        for (uint32_t j = 0; j < S; ++j) {
+        /* Step 1: QK^T row i.  Tile by 4 j's so the per-score
+         * requantize-clamp-store runs once per 4 scores via the
+         * vector requantize path. */
+        const int32_t qk_row_const = q_off_term + qk_const_term;
+        uint32_t j = 0;
+        if (qk_shift <= 0) {
+          const int32x4_t v_neg128 = vdupq_n_s32(-128);
+          const int32x4_t v_pos127 = vdupq_n_s32(127);
+          const int32x4_t v_qk_zp = vdupq_n_s32(qk_zp);
+          const int32x4_t v_qk_row_const = vdupq_n_s32(qk_row_const);
+          for (; j + 4 <= S; j += 4) {
+            const int8_t* k0 = k_b + (size_t)(j + 0) * D;
+            const int8_t* k1 = k_b + (size_t)(j + 1) * D;
+            const int8_t* k2 = k_b + (size_t)(j + 2) * D;
+            const int8_t* k3 = k_b + (size_t)(j + 3) * D;
+            int32_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+            for (uint32_t kk = 0; kk < D; kk += 16) {
+              int8x16_t qv = vldrbq_s8(q_row + kk);
+              d0 = vmladavaq_s8(d0, qv, vldrbq_s8(k0 + kk));
+              d1 = vmladavaq_s8(d1, qv, vldrbq_s8(k1 + kk));
+              d2 = vmladavaq_s8(d2, qv, vldrbq_s8(k2 + kk));
+              d3 = vmladavaq_s8(d3, qv, vldrbq_s8(k3 + kk));
+            }
+            int32x4_t dots = {d0, d1, d2, d3};
+            int32x4_t ks_v = vldrwq_s32(k_row_sums + j);
+            int32x4_t acc = vaddq_s32(dots, vmulq_n_s32(ks_v, q_off));
+            acc = vaddq_s32(acc, v_qk_row_const);
+            acc = kwt_1_mve_requantize_nonpos(acc, qk_mult, qk_shift);
+            acc = vaddq_s32(acc, v_qk_zp);
+            acc = vminq_s32(vmaxq_s32(acc, v_neg128), v_pos127);
+            vstrbq_s32(scores_scratch + j, acc);
+          }
+        }
+        for (; j < S; ++j) {
           const int8_t* k_row = k_b + (size_t)j * D;
           int32_t dot = 0;
           for (uint32_t kk = 0; kk < D; kk += 16) {
             dot = vmladavaq_s8(dot, vldrbq_s8(q_row + kk), vldrbq_s8(k_row + kk));
           }
-          int32_t acc = dot + q_off * k_row_sums[j] + q_off_term + qk_const_term;
+          int32_t acc = dot + q_off * k_row_sums[j] + qk_row_const;
           int32_t r = kwt_1_requantize(acc, qk_mult, qk_shift) + qk_zp;
           if (r < -128) r = -128;
           if (r >  127) r =  127;
