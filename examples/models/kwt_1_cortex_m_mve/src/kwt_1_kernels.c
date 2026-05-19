@@ -793,6 +793,19 @@ void attention_fused_s8(
         for (uint32_t jj = 0; jj < S; ++jj) s += (int32_t)v_row[jj];
         v_col_sums[n] = s;
       }
+      /* Build a (D, 16) zero-padded copy of v for the AV step's
+       * vmladavaq_s8 inner.  S=8 fits in MVE's 16 lanes once padded;
+       * sidesteps the predicated-load gotcha seen on this gcc+M55
+       * combo (predicate-zero lanes leaked nonzero junk through the
+       * vmladavaq sum).  Stack cost = D*16 bytes = 1 KB at D=64. */
+      int8_t v_padded[64 * 16];
+      const uint32_t S_pad = 16;
+      for (uint32_t n = 0; n < D; ++n) {
+        const int8_t* v_row = v_b + (size_t)n * S;
+        int8_t* dst = v_padded + (size_t)n * S_pad;
+        for (uint32_t jj = 0; jj < S; ++jj) dst[jj] = v_row[jj];
+        for (uint32_t jj = S; jj < S_pad; ++jj) dst[jj] = 0;
+      }
       /* Constants for the kernel-sum reformulation:
        *   sum (q+q_off)(k+k_off) = qk_dot + q_off*k_sum + k_off*q_sum + D*q_off*k_off
        *   sum (p+probs_off)(v+v_off) = pv_dot + probs_off*v_sum + v_off*p_sum + S*probs_off*v_off
@@ -827,19 +840,18 @@ void attention_fused_s8(
         softmax_s8(scores_scratch, scores_scratch, &sm_p);
 
         /* Step 3: AV row i = sum_j (probs[j]+128)(v[n,j]+v_off).
-         * S=8 < 16 so we keep the inner loop scalar but precomputed
-         * sums collapse the offset bookkeeping. */
-        int32_t probs_sum = 0;
-        for (uint32_t jj = 0; jj < S; ++jj) probs_sum += (int32_t)scores_scratch[jj];
+         * Use kernel-sum reformulation so vmladavaq_s8 handles the
+         * int8 dot directly; pad probs to 16 lanes via scores_scratch's
+         * tail bytes (zeroed below), and use v_padded for v rows. */
+        for (uint32_t jj = S; jj < S_pad; ++jj) scores_scratch[jj] = 0;
+        int8x16_t probs_v = vldrbq_s8(scores_scratch);
+        const int32_t probs_sum = vaddvq_s8(probs_v);
         const int32_t probs_row_term = v_off * probs_sum + av_const_term;
 
         int8_t* out_row = out_b + (size_t)i * D;
         for (uint32_t n = 0; n < D; ++n) {
-          const int8_t* v_row = v_b + (size_t)n * S;
-          int32_t dot = 0;
-          for (uint32_t jj = 0; jj < S; ++jj) {
-            dot += (int32_t)scores_scratch[jj] * (int32_t)v_row[jj];
-          }
+          int8x16_t v_v = vldrbq_s8(v_padded + (size_t)n * S_pad);
+          int32_t dot = vmladavaq_s8(0, probs_v, v_v);
           int32_t acc = dot + probs_off * v_col_sums[n] + probs_row_term;
           int32_t r = kwt_1_requantize(acc, av_mult, av_shift) + av_zp;
           if (r < -128) r = -128;
