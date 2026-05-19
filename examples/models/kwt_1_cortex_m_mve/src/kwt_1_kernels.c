@@ -477,6 +477,49 @@ void linear_s8(
        * KWT-1 linear and for CMSIS-NN's typical PT2E output).  Falls
        * back to the per-lane scalar requantize otherwise. */
       if (shift <= 0) {
+        /* K=64 specialization: hoist the 4 input vectors out of the N
+         * loop so the same 64 bytes of input stay resident in MVE Q
+         * registers across all 16 (=N/4) tile iterations.  Cuts input
+         * loads by 16× vs reloading them per tile.  The compiler picks
+         * registers for iv0..iv3 and the 4 weight vectors (vldrbq the
+         * w pointers); 8 Q regs available, all 8 in use, no spill. */
+        if (K == 64) {
+          int8x16_t iv0 = vldrbq_s8(row_in +  0);
+          int8x16_t iv1 = vldrbq_s8(row_in + 16);
+          int8x16_t iv2 = vldrbq_s8(row_in + 32);
+          int8x16_t iv3 = vldrbq_s8(row_in + 48);
+          for (; n + 4 <= N; n += 4) {
+            const int8_t* w0 = weights + (size_t)(n + 0) * K;
+            const int8_t* w1 = weights + (size_t)(n + 1) * K;
+            const int8_t* w2 = weights + (size_t)(n + 2) * K;
+            const int8_t* w3 = weights + (size_t)(n + 3) * K;
+            int32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            a0 = vmladavaq_s8(a0, iv0, vldrbq_s8(w0 +  0));
+            a1 = vmladavaq_s8(a1, iv0, vldrbq_s8(w1 +  0));
+            a2 = vmladavaq_s8(a2, iv0, vldrbq_s8(w2 +  0));
+            a3 = vmladavaq_s8(a3, iv0, vldrbq_s8(w3 +  0));
+            a0 = vmladavaq_s8(a0, iv1, vldrbq_s8(w0 + 16));
+            a1 = vmladavaq_s8(a1, iv1, vldrbq_s8(w1 + 16));
+            a2 = vmladavaq_s8(a2, iv1, vldrbq_s8(w2 + 16));
+            a3 = vmladavaq_s8(a3, iv1, vldrbq_s8(w3 + 16));
+            a0 = vmladavaq_s8(a0, iv2, vldrbq_s8(w0 + 32));
+            a1 = vmladavaq_s8(a1, iv2, vldrbq_s8(w1 + 32));
+            a2 = vmladavaq_s8(a2, iv2, vldrbq_s8(w2 + 32));
+            a3 = vmladavaq_s8(a3, iv2, vldrbq_s8(w3 + 32));
+            a0 = vmladavaq_s8(a0, iv3, vldrbq_s8(w0 + 48));
+            a1 = vmladavaq_s8(a1, iv3, vldrbq_s8(w1 + 48));
+            a2 = vmladavaq_s8(a2, iv3, vldrbq_s8(w2 + 48));
+            a3 = vmladavaq_s8(a3, iv3, vldrbq_s8(w3 + 48));
+            int32x4_t acc = {a0, a1, a2, a3};
+            int32x4_t ks = vldrwq_s32(p->kernel_sum + n);
+            acc = vaddq_n_s32(acc, row_off_term);
+            acc = vaddq_s32(acc, ks);
+            acc = kwt_1_mve_requantize_nonpos(acc, mult, shift);
+            acc = vaddq_s32(acc, v_out_off);
+            acc = vminq_s32(vmaxq_s32(acc, v_amin), v_amax);
+            vstrbq_s32(output + (size_t)m * N + n, acc);
+          }
+        } else {
         for (; n + 4 <= N; n += 4) {
           const int8_t* w0 = weights + (size_t)(n + 0) * K;
           const int8_t* w1 = weights + (size_t)(n + 1) * K;
@@ -501,6 +544,7 @@ void linear_s8(
           acc = vminq_s32(vmaxq_s32(acc, v_amin), v_amax);
           /* Narrow int32x4 → int8x4 and store via vstrbq_s32. */
           vstrbq_s32(output + (size_t)m * N + n, acc);
+        }
         }
       } else {
         for (; n + 4 <= N; n += 4) {

@@ -223,7 +223,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out_dir", type=pathlib.Path)
     parser.add_argument("--d-model", type=int, default=64)
-    parser.add_argument("--d-ff", type=int, default=256)
+    parser.add_argument("--d-ff", type=int, default=128)
     parser.add_argument("--seq-len", type=int, default=8,
                         help="Sequence length S.  Smaller than KWT-1's 99 by "
                              "default to keep host-build smoke tests fast.")
