@@ -115,6 +115,61 @@ class KWT1Encoder(nn.Module):
         return x
 
 
+class KWT1(nn.Module):
+    """Full KWT-1 / Keyword Transformer.
+
+    Input is (B, S, mfcc_dim) post-MFCC features (e.g. (1, 98, 40) for
+    Speech Commands v2 at 1s/16kHz with 25ms windows / 10ms hop / 40
+    mel bands).  Architecture:
+
+      x = mfcc_input
+      e = Linear(mfcc_dim -> d_model) per timestep  (the "patch embed")
+      e = e + learned positional encoding
+      h = N encoder blocks
+      pooled = mean over the sequence dimension      (no class token; mean
+                                                       pooling sidesteps the
+                                                       slice op that the
+                                                       cortex_m backend does
+                                                       not currently lower)
+      logits = Linear(d_model -> num_classes)
+
+    The canonical KWT-1 paper uses a learned class token + slice; we
+    substitute mean pooling because (a) the cortex_m backend does not
+    currently lower a 1-d slice in this PT2E shape and (b) the
+    architecture is otherwise unchanged.  When real KWT-1 checkpoints
+    land we can fold the [CLS] token + slice into a learned-weighted
+    mean instead — same matmul, no slice.
+    """
+    def __init__(
+        self,
+        mfcc_dim: int = 40,
+        seq_len: int = 98,
+        num_blocks: int = 12,
+        d: int = 64,
+        d_ff: int = 256,
+        num_classes: int = 35,
+        use_pos_enc: bool = False,
+    ):
+        super().__init__()
+        self.embed = nn.Linear(mfcc_dim, d)
+        if use_pos_enc:
+            self.pos = nn.Parameter(torch.zeros(1, seq_len, d))
+            nn.init.normal_(self.pos, std=0.02)
+        else:
+            self.pos = None
+        self.encoder = KWT1Encoder(num_blocks=num_blocks, d=d, d_ff=d_ff)
+        self.head = nn.Linear(d, num_classes)
+
+    def forward(self, x):
+        # x: (B, S, mfcc_dim)
+        h = self.embed(x)                            # (B, S, d)
+        if self.pos is not None:
+            h = h + self.pos
+        h = self.encoder(h)                          # (B, S, d)
+        pooled = h.mean(dim=1)                       # (B, d)
+        return self.head(pooled)                     # (B, num_classes)
+
+
 def lower_to_cortex_m(model: nn.Module, sample_inputs: tuple[torch.Tensor, ...]):
     torch.manual_seed(0)
     captured = export(model, sample_inputs).module()
@@ -172,18 +227,40 @@ def main() -> int:
                         help="Number of stacked transformer encoder blocks. "
                              "1 = OneBlockKWT (Phase 0-8 validation unit); "
                              "12 = canonical KWT-1 encoder.")
+    parser.add_argument("--full-kwt1", action="store_true",
+                        help="Use the full KWT-1 model (input embed + pos enc + "
+                             "12 encoder blocks + mean pool + classification "
+                             "head).  Input shape becomes (1, --seq-len, --mfcc-dim); "
+                             "output is (1, --num-classes).")
+    parser.add_argument("--mfcc-dim", type=int, default=40,
+                        help="MFCC feature dimension (only used with --full-kwt1).")
+    parser.add_argument("--num-classes", type=int, default=35,
+                        help="Classification output dimension (only used with --full-kwt1).")
     parser.add_argument("--save-ref", action="store_true",
                         help="Also save the python-reference int8 output for "
                              "bit-exact validation.")
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.num_blocks == 1:
+    if args.full_kwt1:
+        model = KWT1(
+            mfcc_dim=args.mfcc_dim,
+            seq_len=args.seq_len,
+            num_blocks=args.num_blocks if args.num_blocks > 1 else 12,
+            d=args.d_model,
+            d_ff=args.d_ff,
+            num_classes=args.num_classes,
+        ).eval()
+        torch.manual_seed(1)
+        sample = (torch.randn(1, args.seq_len, args.mfcc_dim),)
+    elif args.num_blocks == 1:
         model = OneBlockKWT(args.d_model, args.d_ff).eval()
+        torch.manual_seed(1)
+        sample = (torch.randn(1, args.seq_len, args.d_model),)
     else:
         model = KWT1Encoder(args.num_blocks, args.d_model, args.d_ff).eval()
-    torch.manual_seed(1)
-    sample = (torch.randn(1, args.seq_len, args.d_model),)
+        torch.manual_seed(1)
+        sample = (torch.randn(1, args.seq_len, args.d_model),)
     prog = lower_to_cortex_m(model, sample)
 
     offsets, sizes, arena_bytes = _plan_memory(prog)

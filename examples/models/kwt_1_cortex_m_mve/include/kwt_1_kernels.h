@@ -56,6 +56,10 @@ void linear_s8(const int8_t* input, const int8_t* weights,
 void transpose_s8(const int8_t* input, int8_t* output,
                   const TransposeParams* p);
 
+/* Phase 10: int8 mean across one axis with fused dequant + requant. */
+void mean_dim_s8(const int8_t* input, int8_t* output,
+                 const MeanDimParams* p);
+
 #ifdef __cplusplus
 }
 #endif

@@ -77,6 +77,22 @@ typedef struct {
 } LinearParams;
 
 typedef struct {
+  /* Phase 10: int8 mean across one axis with fused dequant + requant.
+   * Used for KWT-1's sequence-mean pooling: input (outer, reduce, inner)
+   * → output (outer, inner) via mean over the middle axis.  The kernel
+   * works in int32 accumulation then rescales by
+   *   ratio = input_scale / (reduce * output_scale)
+   * The +output_zp / -input_zp shift folds into the sum. */
+  uint32_t outer;
+  uint32_t reduce;
+  uint32_t inner;
+  int32_t input_zp;
+  float    input_scale;
+  int32_t output_zp;
+  float    output_scale;
+} MeanDimParams;
+
+typedef struct {
   /* Phase 7: int8 N-D transpose with an arbitrary permutation of dims.
    * Sized for KWT-1's needs: 3-D transpose of (B, S, D) shapes; the
    * permutation is encoded as the strides of the input read in

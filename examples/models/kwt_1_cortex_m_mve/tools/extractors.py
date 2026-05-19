@@ -110,6 +110,12 @@ class AddLayer:
     self_in: Optional[TensorSlot] = None
     other_in: Optional[TensorSlot] = None
     output: Optional[TensorSlot] = None
+    # When self_in or other_in is None, the corresponding *_const holds
+    # the flash-resident int8 tensor that the kernel should read in
+    # place of the arena slot.  Used for the positional-encoding add in
+    # KWT-1, where one operand is a graph-signature BUFFER.
+    self_const: Optional[torch.Tensor] = None
+    other_const: Optional[torch.Tensor] = None
     num_elements: int = 0
     self_zp: int = 0
     self_multiplier: int = 0
@@ -159,10 +165,28 @@ class TransposeLayer:
     in_stride: tuple[int, ...] = ()
 
 
+@dataclass
+class MeanDimLayer:
+    """int8 mean across one axis with fused dequant + requant.  Used
+    for KWT-1's sequence-mean pooling (h.mean(dim=1) on (B, S, D));
+    subsumes the dequant→aten.mean.dim→quant trio the lowering pass
+    inserts around the float mean op."""
+    kernel: str = "mean_dim_s8"
+    input: Optional[TensorSlot] = None
+    output: Optional[TensorSlot] = None
+    outer: int = 0       # product of dims before the reduced one (B)
+    reduce: int = 0      # size of the reduced dim (S)
+    inner: int = 0       # product of dims after the reduced one (D)
+    input_zp: int = 0
+    input_scale: float = 0.0
+    output_zp: int = 0
+    output_scale: float = 0.0
+
+
 Layer = Union[
     QuantInputLayer, DequantOutputLayer,
     LayerNormLayer, GELULayer, LinearLayer, AddLayer,
-    FusedAttentionLayer, TransposeLayer,
+    FusedAttentionLayer, TransposeLayer, MeanDimLayer,
 ]
 
 
@@ -296,13 +320,25 @@ def _extract_linear(node: Node, prog: ExportedProgram, alloc: _ArenaAllocator) -
     )
 
 
+def _slot_or_const(node: Node, prog: ExportedProgram, alloc: _ArenaAllocator):
+    """For an Add input: if the node is a placeholder/buffer, return
+    (None, tensor) so the emitter can stamp it as a flash const; if it's
+    a regular activation, return (slot, None) and let the planner own
+    the arena slot."""
+    if node.op == "placeholder":
+        return None, _resolve_tensor(prog, node).detach().contiguous()
+    return alloc.assign(node), None
+
+
 def _extract_add(node: Node, prog: ExportedProgram, alloc: _ArenaAllocator) -> AddLayer:
     (a_node, s_zp, s_m, s_s, b_node, o_zp, o_m, o_s,
      out_zp, out_m, out_s, amin, amax) = node.args
-    a_slot = alloc.assign(a_node); b_slot = alloc.assign(b_node)
+    a_slot, a_const = _slot_or_const(a_node, prog, alloc)
+    b_slot, b_const = _slot_or_const(b_node, prog, alloc)
     out_slot = alloc.assign(node)
     return AddLayer(
         self_in=a_slot, other_in=b_slot, output=out_slot,
+        self_const=a_const, other_const=b_const,
         num_elements=_shape_nbytes(_node_shape(node)),
         self_zp=int(s_zp), self_multiplier=int(s_m), self_shift=int(s_s),
         other_zp=int(o_zp), other_multiplier=int(o_m), other_shift=int(o_s),
@@ -391,6 +427,72 @@ def _op_key(node: Node) -> str:
     return str(t)
 
 
+def _find_mean_patterns(gm) -> tuple[set, dict]:
+    """Scan for dequant → aten.mean.dim → quant chains.  For each, return
+    (absorbed_nodes, {mean_node: (dequant_node, quant_node)}).  Other
+    dequant / quant nodes stay as model-boundary ops.
+
+    _op_key drops overload names (returns 'aten.mean' for both
+    'mean.dim' and 'mean.default') so we filter on the EdgeOpOverload
+    string representation instead."""
+    absorbed = set()
+    patterns = {}
+    for node in gm.graph.nodes:
+        if node.op != "call_function":
+            continue
+        if "aten.mean.dim" not in str(node.target):
+            continue
+        deq = node.args[0]
+        if not (hasattr(deq, "op") and deq.op == "call_function"
+                and _op_key(deq) == "cortex_m.dequantize_per_tensor"):
+            continue
+        users = list(node.users)
+        if len(users) != 1:
+            continue
+        q = users[0]
+        if not (hasattr(q, "op") and q.op == "call_function"
+                and _op_key(q) == "cortex_m.quantize_per_tensor"):
+            continue
+        patterns[node] = (deq, q)
+        absorbed.add(deq)
+        absorbed.add(q)
+    return absorbed, patterns
+
+
+def _extract_mean_dim(node, deq, q, prog, alloc):
+    """Build a MeanDimLayer from a dequant → mean(dim=[r]) → quant trio.
+    The quant is the layer's output slot; the dequant's input is the
+    int8 source.  Caller is responsible for assigning offsets via alloc."""
+    deq_in, in_scale, in_zp, _, _, _ = deq.args
+    _, out_scale, out_zp, _, _, _ = q.args
+    mean_args = node.args
+    if len(mean_args) < 2:
+        raise ValueError(f"unexpected aten.mean.dim args: {mean_args}")
+    dim_arg = mean_args[1]
+    if not isinstance(dim_arg, (list, tuple)) or len(dim_arg) != 1:
+        raise NotImplementedError(
+            f"mean over multiple/no dims not supported: dim={dim_arg}")
+    dim = int(dim_arg[0])
+    in_shape = _node_shape(deq_in)
+    if dim < 0:
+        dim += len(in_shape)
+    outer = 1
+    for d in in_shape[:dim]:
+        outer *= int(d)
+    reduce = int(in_shape[dim])
+    inner = 1
+    for d in in_shape[dim + 1:]:
+        inner *= int(d)
+    in_slot = alloc.assign(deq_in)
+    out_slot = alloc.assign(q)
+    return MeanDimLayer(
+        input=in_slot, output=out_slot,
+        outer=outer, reduce=reduce, inner=inner,
+        input_zp=int(in_zp), input_scale=float(in_scale),
+        output_zp=int(out_zp), output_scale=float(out_scale),
+    )
+
+
 def extract_program(
     prog: ExportedProgram,
     offsets: dict,
@@ -405,10 +507,17 @@ def extract_program(
     """
     alloc = _ArenaAllocator(offsets, sizes, arena_bytes)
     layers: list[Layer] = []
+    absorbed, mean_patterns = _find_mean_patterns(prog.graph_module)
     for node in prog.graph_module.graph.nodes:
         if node.op != "call_function":
             continue
+        if node in absorbed:
+            continue
         target = _op_key(node)
+        if "aten.mean.dim" in str(node.target) and node in mean_patterns:
+            deq, q = mean_patterns[node]
+            layers.append(_extract_mean_dim(node, deq, q, prog, alloc))
+            continue
         if target == "cortex_m.quantize_per_tensor":
             layers.append(_extract_quantize_input(node, alloc))
         elif target == "cortex_m.dequantize_per_tensor":

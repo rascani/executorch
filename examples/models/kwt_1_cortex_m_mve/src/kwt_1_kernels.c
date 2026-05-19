@@ -400,6 +400,39 @@ void transpose_s8(
 }
 
 
+/* Phase 10: int8 mean across one axis with fused dequant + requant.
+ * Matches the dequant → aten.mean.dim → quant trio the lowering pass
+ * inserts around a float mean op.  For each (o, n) in outer × inner,
+ * sums `reduce` int8 lanes into an int32, then rescales via
+ *   ratio = input_scale / (reduce * output_scale)
+ * to land back in int8.  Bit-exact with the python reference (round
+ * half away from zero, clamp to int8). */
+void mean_dim_s8(
+    const int8_t* input, int8_t* output, const MeanDimParams* p) {
+  const uint32_t O = p->outer;
+  const uint32_t R = p->reduce;
+  const uint32_t I = p->inner;
+  const int32_t in_zp = p->input_zp;
+  const float ratio = p->input_scale / ((float)R * p->output_scale);
+  const float out_zp_f = (float)p->output_zp;
+  for (uint32_t o = 0; o < O; ++o) {
+    const int8_t* in_outer = input + (size_t)o * R * I;
+    int8_t* out_outer = output + (size_t)o * I;
+    for (uint32_t n = 0; n < I; ++n) {
+      int32_t sum = 0;
+      for (uint32_t r = 0; r < R; ++r) {
+        sum += (int32_t)in_outer[(size_t)r * I + n] - in_zp;
+      }
+      float qf = (float)sum * ratio + out_zp_f;
+      int32_t q = (int32_t)(qf + (qf >= 0.0f ? 0.5f : -0.5f));
+      if (q < -128) q = -128;
+      if (q >  127) q =  127;
+      out_outer[n] = (int8_t)q;
+    }
+  }
+}
+
+
 /* Phase 6: int8 Linear with CMSIS-NN kernel_sum precomputation.
  * Bit-exact port of cortex_m::quantized_linear (compute_using_kernel_sum=True).
  *
