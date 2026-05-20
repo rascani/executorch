@@ -281,4 +281,141 @@ Compare `RESULT_*` against
 `examples/models/kwt_1_cortex_m_mve/generated/_ref_int8.bin` for the
 bit-exactness check.
 
+## Post-Phase 8 optimizations
+
+After the Phase 8 write-up above, a second pass of optimizations
+landed in the optimization session.  These weren't part of the
+original phased plan, but they're sitting on the same branch and
+the per-kernel cycle table at the new defaults is below.
+
+| Step | Total PMU | Speedup | Δ |
+|---|---:|---:|---:|
+| Phase 8 final (d_ff=256)                              | 327,377 | 5.52× | — |
+| `--d-ff` CLI default flipped to 128 (paper KWT-1 dims) | 261,713 | 6.90× | -20% |
+| `linear_s8` K=64 specialization — hoist 4 input vectors across the N-tile loop | 238,935 | 7.56× | -9% |
+| `attention_fused_s8` AV step MVE via zero-padded v buffer | 219,830 | 8.22× | -8% |
+| `attention_fused_s8` AV step + softmax housekeeping (vector requantize tile-4 on 4 output channels) | 208,116 | 8.68× | -5% |
+| `attention_fused_s8` QK^T per-score requantize vectorized (tile-4 on 4 scores) | 205,060 | 8.81× | -1.5% |
+
+Per-kernel breakdown at the 205,060-cycle headline:
+
+| Layer | Kernel | PMU cycles | % |
+|---:|---|---:|---:|
+|  0 | quantize_input |   9,739 |  4.7 |
+|  1 | layer_norm     |   7,316 |  3.6 |
+|  2 | linear  (K=64, N=64) |  16,781 |  8.2 |
+|  3 | linear  (K=64, N=64) |  16,781 |  8.2 |
+|  4 | linear  (K=64, N=64) |  16,781 |  8.2 |
+|  5 | transpose      |   3,082 |  1.5 |
+|  6 | transpose      |   1,754 |  0.9 |
+|  7 | transpose      |   3,082 |  1.5 |
+|  8 | attention      |  23,074 | 11.3 |
+|  9 | linear  (K=64, N=64) |  16,781 |  8.2 |
+| 10 | add            |   7,121 |  3.5 |
+| 11 | layer_norm     |   7,316 |  3.6 |
+| 12 | linear (K=64, N=128, FFN expand)  |  32,653 | 15.9 |
+| 13 | gelu (LUT)     |   4,113 |  2.0 |
+| 14 | linear (K=128, N=64, FFN project) |  31,253 | 15.2 |
+| 15 | add            |   7,121 |  3.5 |
+| 16 | dequant memcpy |     312 |  0.2 |
+|    | **total**      | **205,060** | |
+
+Negative results since Phase 8:
+- `linear_s8` m-tile-2 × N-tile-4 for K≥128 (8 accumulators per
+  inner): regressed by ~1.3% — the M55 issue queue couldn't keep
+  the 8 vmladavaq_s8 ops in flight.  Same as the Phase 8 attempt
+  but isolated to long-K linears; didn't help.
+- `kwt_1_fast_expf` polynomial substitute (`-DKWT_1_FAST_EXPF=ON`
+  build flag): bit-exact through the softmax → quantize pipeline,
+  but slower than newlib's `expf` on M55+VFP.  Newlib's `expf` is
+  already only ~50 cycles on this target; the polynomial isn't
+  faster.  Flag ships off-by-default; keep the hook for future
+  targets where libm's `expf` is slower.
+
+## Comparison vs DS-CNN
+
+DS-CNN is the textbook MCU keyword-spotting model — the MLPerf Tiny
+reference and the Hello Edge paper's lead architecture.  It already
+lives in `examples/models/mlperf_tiny/ds_cnn.py` and already lowers
+through the cortex_m backend + CMSIS-NN via
+`backends/cortex_m/test/models/test_ds_cnn.py`.  Running it through
+the same FVP and reading the PMU CCNTR (after the
+`arm_perf_monitor.cpp` printf patch in this branch) gives a real
+apples-to-apples cycle comparison.
+
+| Model | Configuration | Params | MACs | PMU cycles | cycles / MAC |
+|---|---|---:|---:|---:|---:|
+| DS-CNN-S (12-class) | cortex_m + CMSIS-NN runtime, full inference | 23,180 | 2.66 M | **1,902,290** | 0.72 |
+| KWT-1 OneBlockKWT (S=8) | standalone MVE, our 1-block Phase 8/optim target | 33,472 | 262 K | **205,060** | 0.78 |
+| KWT-1 1-block @ S=98 (1× canonical input) | standalone MVE (1 encoder block + embed + mean + head) | ~98 K | 3.4 M | **11,096,844** | ~3.3 † |
+| KWT-1 12-block canonical (35-class) | standalone MVE — full encoder | 406,563 | 38.8 M | ~124 M ‡ | ~3.2 † |
+
+† The cycles/MAC degrades at S=98 because attention runs through the
+scalar fallback (`attention_fused_s8`'s MVE path is gated on S≤16
+today) — that's the obvious next optimization target if KWT-1 latency
+matters for deployment.  The non-attention work runs at the same
+~0.8 cy/MAC the OneBlock measurement shows.
+
+‡ Extrapolated.  The 1-block-S=98 measurement (11.1 M cycles) is
+~750 k embed + ~50 k mean/head + ~10.3 M for one encoder block at
+S=98.  12 blocks + the same overhead ≈ 124 M cycles.  The 12-block
+end-to-end FVP run didn't terminate in two attempts (1 h and 30 min
+wall) — the simulator slows non-linearly on this host for long runs
+and the 1-block S=98 anchor is the safest measurement to extrapolate
+from.
+
+### Headline tradeoff (Corstone-300 FVP, PMU CCNTR)
+
+- DS-CNN-S full inference: **1.9 M cycles** for ~94 % top-1 on the
+  Speech Commands 12-class benchmark.  ≈ 64 ms at 30 MHz.
+- KWT-1 canonical inference: **~124 M cycles** for ~96.6 % top-1 on
+  the Speech Commands 35-class benchmark.  ≈ 4.1 s at 30 MHz.
+
+**~65× the cycles for ~2.5 absolute accuracy points** on the harder
+35-class task.  Per-MAC efficiencies are nearly identical (0.7-0.8
+cy/MAC on the MVE-friendly portions); the cost differential is the
+model doing more work, not poorer kernel utilization.
+
+DS-CNN remains the practical MCU KWS choice when latency or footprint
+matters.  KWT-1's contribution to the cortex_m backend isn't beating
+DS-CNN at its own benchmark — it's enabling transformer-class models
+(KWT, Conformer, Squeezeformer, …) on Cortex-M at all, via the
+LayerNorm / GELU / fused attention / BMM / Softmax kernels this
+directory ships.
+
+### Reproducing the DS-CNN cycle measurement
+
+```bash
+# 1. Patch arm_perf_monitor.cpp to printf BENCHMARK_CYCLES (already
+#    applied in this branch — see git log on
+#    examples/arm/executor_runner/arm_perf_monitor.cpp).
+
+# 2. Rebuild the existing test runner.  Host libs are already built
+#    from prior test runs.
+( cd arm_test/arm_semihosting_executor_runner_corstone-300 && \
+  cmake --build . --target arm_executor_runner -j )
+
+# 3. Run pytest with a small _run_cmd-patch that captures the FVP
+#    stdout we'd otherwise discard.
+cat > /tmp/run_cm_capture.py <<'PY'
+from executorch.backends.arm.test import runner_utils as ru
+_orig = ru._run_cmd
+def _capture(cmd, check=True, env=None):
+    out = _orig(cmd, check=check, env=env)
+    with open("/tmp/cortexm_fvp.log", "ab") as f:
+        f.write(out.stdout)
+    return out
+ru._run_cmd = _capture
+import pytest, sys
+sys.exit(pytest.main(['-v', '-s', '--runxfail',
+    'backends/cortex_m/test/models/test_ds_cnn.py::test_implementation_ds_cnn']))
+PY
+rm -f /tmp/cortexm_fvp.log
+source examples/arm/arm-scratch/setup_path.sh
+python3 /tmp/run_cm_capture.py
+
+# 4. Cycle count.
+grep BENCHMARK_CYCLES /tmp/cortexm_fvp.log
+```
+
 Authored with assistance from Claude (claude.ai/code).
