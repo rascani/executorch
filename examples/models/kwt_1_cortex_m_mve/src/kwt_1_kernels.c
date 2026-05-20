@@ -493,14 +493,20 @@ void linear_s8(
   const int32_t amax = p->activation_max;
 
 #if KWT_1_USE_MVE
-  if ((K & 15u) == 0u) {
+  /* Accept any K ≥ 16; the MVE bulk loop handles K_full = K & ~15u
+   * lanes via vmladavaq_s8 and a scalar tail handles the last K % 16.
+   * The K=64 hoist specialization (further down) still applies only
+   * to that exact width. */
+  if (K >= 16) {
+    const uint32_t K_full = K & ~15u;
     for (uint32_t m = 0; m < M; ++m) {
       const int8_t* row_in = input + (size_t)m * K;
-      /* row_sum = sum_k row_in[k] via vaddvaq_s8 (int8 -> int32 horizontal). */
+      /* row_sum = sum_k row_in[k] via vaddvaq_s8 + scalar tail. */
       int32_t row_sum = 0;
-      for (uint32_t k = 0; k < K; k += 16) {
+      for (uint32_t k = 0; k < K_full; k += 16) {
         row_sum = vaddvaq_s8(row_sum, vldrbq_s8(row_in + k));
       }
+      for (uint32_t k = K_full; k < K; ++k) row_sum += (int32_t)row_in[k];
       const int32_t row_off_term = row_sum * filter_off;
 
       uint32_t n = 0;
@@ -563,12 +569,19 @@ void linear_s8(
           const int8_t* w2 = weights + (size_t)(n + 2) * K;
           const int8_t* w3 = weights + (size_t)(n + 3) * K;
           int32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
-          for (uint32_t k = 0; k < K; k += 16) {
+          for (uint32_t k = 0; k < K_full; k += 16) {
             int8x16_t iv = vldrbq_s8(row_in + k);
             a0 = vmladavaq_s8(a0, iv, vldrbq_s8(w0 + k));
             a1 = vmladavaq_s8(a1, iv, vldrbq_s8(w1 + k));
             a2 = vmladavaq_s8(a2, iv, vldrbq_s8(w2 + k));
             a3 = vmladavaq_s8(a3, iv, vldrbq_s8(w3 + k));
+          }
+          for (uint32_t k = K_full; k < K; ++k) {
+            int32_t r = (int32_t)row_in[k];
+            a0 += r * (int32_t)w0[k];
+            a1 += r * (int32_t)w1[k];
+            a2 += r * (int32_t)w2[k];
+            a3 += r * (int32_t)w3[k];
           }
           /* Pack (a0,a1,a2,a3) into int32x4, add row_off_term and the
            * kernel_sum vector, requantize, add out_off, clamp. */
@@ -590,12 +603,19 @@ void linear_s8(
           const int8_t* w2 = weights + (size_t)(n + 2) * K;
           const int8_t* w3 = weights + (size_t)(n + 3) * K;
           int32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
-          for (uint32_t k = 0; k < K; k += 16) {
+          for (uint32_t k = 0; k < K_full; k += 16) {
             int8x16_t iv = vldrbq_s8(row_in + k);
             a0 = vmladavaq_s8(a0, iv, vldrbq_s8(w0 + k));
             a1 = vmladavaq_s8(a1, iv, vldrbq_s8(w1 + k));
             a2 = vmladavaq_s8(a2, iv, vldrbq_s8(w2 + k));
             a3 = vmladavaq_s8(a3, iv, vldrbq_s8(w3 + k));
+          }
+          for (uint32_t k = K_full; k < K; ++k) {
+            int32_t r = (int32_t)row_in[k];
+            a0 += r * (int32_t)w0[k];
+            a1 += r * (int32_t)w1[k];
+            a2 += r * (int32_t)w2[k];
+            a3 += r * (int32_t)w3[k];
           }
           a0 += row_off_term + p->kernel_sum[n + 0];
           a1 += row_off_term + p->kernel_sum[n + 1];
@@ -618,8 +638,11 @@ void linear_s8(
       for (; n < N; ++n) {
         const int8_t* w_row = weights + (size_t)n * K;
         int32_t acc = 0;
-        for (uint32_t k = 0; k < K; k += 16) {
+        for (uint32_t k = 0; k < K_full; k += 16) {
           acc = vmladavaq_s8(acc, vldrbq_s8(row_in + k), vldrbq_s8(w_row + k));
+        }
+        for (uint32_t k = K_full; k < K; ++k) {
+          acc += (int32_t)row_in[k] * (int32_t)w_row[k];
         }
         acc += row_off_term + p->kernel_sum[n];
         int32_t r = kwt_1_requantize(acc, mult, shift) + out_off;
