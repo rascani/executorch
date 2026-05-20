@@ -493,6 +493,162 @@ void linear_s8(
   const int32_t amax = p->activation_max;
 
 #if KWT_1_USE_MVE
+  /* M-tile-2 fast path for large M (canonical KWT-1's S=98 rows).
+   * Halves weight-load traffic by sharing the 4 N-tile weight vectors
+   * across two input rows.  Earlier attempts regressed on M=8 (the
+   * OneBlock test) because the 8-acc inner blew through the M55
+   * issue queue; at M=98 the 49 m-pair iterations amortize that
+   * cost.  Guarded on M >= 32; handles odd M with a single-row tail. */
+  /* Skip when K=64: that case has its own better fast path (input
+   * hoist + N-tile-4) further down.  For K=40 (canonical KWT-1's
+   * embed Linear) and K=128 (FFN project) at M=98 this commit
+   * tightens both significantly. */
+  if (K >= 16 && K != 64 && M >= 32 && shift <= 0) {
+    const uint32_t K_full = K & ~15u;
+    const uint32_t M_pairs = M & ~1u;
+    const int32x4_t v_amin = vdupq_n_s32(amin);
+    const int32x4_t v_amax = vdupq_n_s32(amax);
+    const int32x4_t v_out_off = vdupq_n_s32(out_off);
+    for (uint32_t m = 0; m < M_pairs; m += 2) {
+      const int8_t* row0 = input + (size_t)(m + 0) * K;
+      const int8_t* row1 = input + (size_t)(m + 1) * K;
+      int32_t rs0 = 0, rs1 = 0;
+      for (uint32_t k = 0; k < K_full; k += 16) {
+        rs0 = vaddvaq_s8(rs0, vldrbq_s8(row0 + k));
+        rs1 = vaddvaq_s8(rs1, vldrbq_s8(row1 + k));
+      }
+      for (uint32_t k = K_full; k < K; ++k) {
+        rs0 += (int32_t)row0[k];
+        rs1 += (int32_t)row1[k];
+      }
+      const int32_t off0 = rs0 * filter_off;
+      const int32_t off1 = rs1 * filter_off;
+      uint32_t n = 0;
+      for (; n + 4 <= N; n += 4) {
+        const int8_t* w0 = weights + (size_t)(n + 0) * K;
+        const int8_t* w1 = weights + (size_t)(n + 1) * K;
+        const int8_t* w2 = weights + (size_t)(n + 2) * K;
+        const int8_t* w3 = weights + (size_t)(n + 3) * K;
+        int32_t a00=0, a01=0, a02=0, a03=0;
+        int32_t a10=0, a11=0, a12=0, a13=0;
+        for (uint32_t k = 0; k < K_full; k += 16) {
+          int8x16_t iv0 = vldrbq_s8(row0 + k);
+          int8x16_t iv1 = vldrbq_s8(row1 + k);
+          int8x16_t wv0 = vldrbq_s8(w0 + k);
+          int8x16_t wv1 = vldrbq_s8(w1 + k);
+          int8x16_t wv2 = vldrbq_s8(w2 + k);
+          int8x16_t wv3 = vldrbq_s8(w3 + k);
+          a00 = vmladavaq_s8(a00, iv0, wv0);
+          a01 = vmladavaq_s8(a01, iv0, wv1);
+          a02 = vmladavaq_s8(a02, iv0, wv2);
+          a03 = vmladavaq_s8(a03, iv0, wv3);
+          a10 = vmladavaq_s8(a10, iv1, wv0);
+          a11 = vmladavaq_s8(a11, iv1, wv1);
+          a12 = vmladavaq_s8(a12, iv1, wv2);
+          a13 = vmladavaq_s8(a13, iv1, wv3);
+        }
+        for (uint32_t k = K_full; k < K; ++k) {
+          int32_t r0 = (int32_t)row0[k];
+          int32_t r1 = (int32_t)row1[k];
+          int32_t s0 = (int32_t)w0[k], s1 = (int32_t)w1[k];
+          int32_t s2 = (int32_t)w2[k], s3 = (int32_t)w3[k];
+          a00 += r0 * s0; a01 += r0 * s1; a02 += r0 * s2; a03 += r0 * s3;
+          a10 += r1 * s0; a11 += r1 * s1; a12 += r1 * s2; a13 += r1 * s3;
+        }
+        int32x4_t ks = vldrwq_s32(p->kernel_sum + n);
+        int32x4_t acc0 = {a00, a01, a02, a03};
+        int32x4_t acc1 = {a10, a11, a12, a13};
+        acc0 = vaddq_s32(vaddq_n_s32(acc0, off0), ks);
+        acc1 = vaddq_s32(vaddq_n_s32(acc1, off1), ks);
+        acc0 = kwt_1_mve_requantize_nonpos(acc0, mult, shift);
+        acc1 = kwt_1_mve_requantize_nonpos(acc1, mult, shift);
+        acc0 = vminq_s32(vmaxq_s32(vaddq_s32(acc0, v_out_off), v_amin), v_amax);
+        acc1 = vminq_s32(vmaxq_s32(vaddq_s32(acc1, v_out_off), v_amin), v_amax);
+        vstrbq_s32(output + (size_t)(m + 0) * N + n, acc0);
+        vstrbq_s32(output + (size_t)(m + 1) * N + n, acc1);
+      }
+      for (; n < N; ++n) {
+        const int8_t* w_row = weights + (size_t)n * K;
+        int32_t a0 = 0, a1 = 0;
+        for (uint32_t k = 0; k < K_full; k += 16) {
+          int8x16_t wv = vldrbq_s8(w_row + k);
+          a0 = vmladavaq_s8(a0, vldrbq_s8(row0 + k), wv);
+          a1 = vmladavaq_s8(a1, vldrbq_s8(row1 + k), wv);
+        }
+        for (uint32_t k = K_full; k < K; ++k) {
+          int32_t w = (int32_t)w_row[k];
+          a0 += (int32_t)row0[k] * w;
+          a1 += (int32_t)row1[k] * w;
+        }
+        int32_t ks_n = p->kernel_sum[n];
+        int32_t r0 = kwt_1_requantize(a0 + off0 + ks_n, mult, shift) + out_off;
+        int32_t r1 = kwt_1_requantize(a1 + off1 + ks_n, mult, shift) + out_off;
+        if (r0 < amin) r0 = amin; else if (r0 > amax) r0 = amax;
+        if (r1 < amin) r1 = amin; else if (r1 > amax) r1 = amax;
+        output[(size_t)(m + 0) * N + n] = (int8_t)r0;
+        output[(size_t)(m + 1) * N + n] = (int8_t)r1;
+      }
+    }
+    /* Odd-M tail: one trailing row processed via tile-of-4 N (same
+     * structure as the K >= 16 single-row path below, minus the
+     * K=64-specific hoist). */
+    if (M_pairs != M) {
+      const uint32_t m = M_pairs;
+      const int8_t* row_in = input + (size_t)m * K;
+      int32_t rs = 0;
+      for (uint32_t k = 0; k < K_full; k += 16) {
+        rs = vaddvaq_s8(rs, vldrbq_s8(row_in + k));
+      }
+      for (uint32_t k = K_full; k < K; ++k) rs += (int32_t)row_in[k];
+      const int32_t off = rs * filter_off;
+      uint32_t n = 0;
+      for (; n + 4 <= N; n += 4) {
+        const int8_t* w0 = weights + (size_t)(n + 0) * K;
+        const int8_t* w1 = weights + (size_t)(n + 1) * K;
+        const int8_t* w2 = weights + (size_t)(n + 2) * K;
+        const int8_t* w3 = weights + (size_t)(n + 3) * K;
+        int32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        for (uint32_t k = 0; k < K_full; k += 16) {
+          int8x16_t iv = vldrbq_s8(row_in + k);
+          a0 = vmladavaq_s8(a0, iv, vldrbq_s8(w0 + k));
+          a1 = vmladavaq_s8(a1, iv, vldrbq_s8(w1 + k));
+          a2 = vmladavaq_s8(a2, iv, vldrbq_s8(w2 + k));
+          a3 = vmladavaq_s8(a3, iv, vldrbq_s8(w3 + k));
+        }
+        for (uint32_t k = K_full; k < K; ++k) {
+          int32_t r = (int32_t)row_in[k];
+          a0 += r * (int32_t)w0[k];
+          a1 += r * (int32_t)w1[k];
+          a2 += r * (int32_t)w2[k];
+          a3 += r * (int32_t)w3[k];
+        }
+        int32x4_t acc = {a0, a1, a2, a3};
+        int32x4_t ks = vldrwq_s32(p->kernel_sum + n);
+        acc = vaddq_n_s32(acc, off);
+        acc = vaddq_s32(acc, ks);
+        acc = kwt_1_mve_requantize_nonpos(acc, mult, shift);
+        acc = vaddq_s32(acc, v_out_off);
+        acc = vminq_s32(vmaxq_s32(acc, v_amin), v_amax);
+        vstrbq_s32(output + (size_t)m * N + n, acc);
+      }
+      for (; n < N; ++n) {
+        const int8_t* w_row = weights + (size_t)n * K;
+        int32_t acc = 0;
+        for (uint32_t k = 0; k < K_full; k += 16) {
+          acc = vmladavaq_s8(acc, vldrbq_s8(row_in + k), vldrbq_s8(w_row + k));
+        }
+        for (uint32_t k = K_full; k < K; ++k) {
+          acc += (int32_t)row_in[k] * (int32_t)w_row[k];
+        }
+        acc += off + p->kernel_sum[n];
+        int32_t r = kwt_1_requantize(acc, mult, shift) + out_off;
+        if (r < amin) r = amin; else if (r > amax) r = amax;
+        output[(size_t)m * N + n] = (int8_t)r;
+      }
+    }
+    return;
+  }
+
   /* Accept any K ≥ 16; the MVE bulk loop handles K_full = K & ~15u
    * lanes via vmladavaq_s8 and a scalar tail handles the last K % 16.
    * The K=64 hoist specialization (further down) still applies only
