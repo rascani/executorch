@@ -302,6 +302,7 @@ the per-kernel cycle table at the new defaults is below.
 | `attention_fused_s8` QK^T D=64 q_row hoist across all S/4 j-tiles | 212,246 | 8.51× | unchanged OneBlock; **-0.5% canonical (3.93 M → 3.91 M)** |
 | `softmax_s8` MVE FP for passes 1 and 3 (dequant + max; normalize + quantize) | 211,469 | 8.54× | OneBlock improved; **-5% canonical (3.91 M → 3.71 M)** |
 | MVE v_col_sums + v_padded build in attention | 211,469 | 8.54× | OneBlock unchanged; **-0.3% canonical (3.71 M → 3.70 M)** |
+| Tighten `kwt_1_fast_expf` (floorf + fmaf), opt-in `-DKWT_1_FAST_EXPF=ON` | (no change at default) | 8.54× | with FAST_EXPF=ON: **-7% canonical attention (1.22 M → 1.13 M), -2.4% canonical total (3.70 M → 3.62 M)** |
 
 Per-kernel breakdown at the 205,060-cycle headline:
 
@@ -332,11 +333,15 @@ Negative results since Phase 8:
   the 8 vmladavaq_s8 ops in flight.  Same as the Phase 8 attempt
   but isolated to long-K linears; didn't help.
 - `kwt_1_fast_expf` polynomial substitute (`-DKWT_1_FAST_EXPF=ON`
-  build flag): bit-exact through the softmax → quantize pipeline,
-  but slower than newlib's `expf` on M55+VFP.  Newlib's `expf` is
-  already only ~50 cycles on this target; the polynomial isn't
-  faster.  Flag ships off-by-default; keep the hook for future
-  targets where libm's `expf` is slower.
+  build flag): originally landed as a small regression (branches +
+  no FMA in the polynomial); rewrote with `floorf` for branchless
+  range reduction and explicit `fmaf` Horner.  Now strictly beats
+  newlib's expf on M55+VFP — -7% canonical attention, -2.4%
+  canonical 1-block-S=98 total.  Still ships off-by-default because
+  the ~4 ULP polynomial accuracy may eventually drift through the
+  softmax → int8-quantize pipeline on trained-weight inputs (random-
+  weight verification was bit-exact, but bit-exactness isn't
+  algorithmically guaranteed).
 
 ## Comparison vs DS-CNN
 
