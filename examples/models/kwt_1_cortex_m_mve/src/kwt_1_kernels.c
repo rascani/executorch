@@ -1046,12 +1046,16 @@ void attention_fused_s8(
         }
         k_row_sums[j] = s;
       }
-      /* v_col_sums[n] = sum_j v_b[n, j] (v is stored (D, S) in BMM rhs_T
-       * layout).  S=8, each row D values, but it's a row sum over S. */
+      /* v_col_sums[n] = sum_j v_b[n, j].  v is stored (D, S) in BMM
+       * rhs_T layout; row sum over S via vaddvaq_s8 bulk + scalar tail. */
+      const uint32_t S_full = S & ~15u;
       for (uint32_t n = 0; n < D; ++n) {
         const int8_t* v_row = v_b + (size_t)n * S;
         int32_t s = 0;
-        for (uint32_t jj = 0; jj < S; ++jj) s += (int32_t)v_row[jj];
+        for (uint32_t jj = 0; jj < S_full; jj += 16) {
+          s = vaddvaq_s8(s, vldrbq_s8(v_row + jj));
+        }
+        for (uint32_t jj = S_full; jj < S; ++jj) s += (int32_t)v_row[jj];
         v_col_sums[n] = s;
       }
       /* Build a (D, S_pad) zero-padded copy of v for the AV step's
@@ -1059,12 +1063,20 @@ void attention_fused_s8(
        * single 16-lane vmladavaq_s8 sweep the contraction without a
        * predicated tail (the predicated-load path leaked nonzero
        * junk through the sum on this gcc+M55 combo).  Stack cost
-       * = D * S_pad bytes; e.g. 1 KB at S=8 or ~7 KB at S=98. */
+       * = D * S_pad bytes; e.g. 1 KB at S=8 or ~7 KB at S=98.
+       *
+       * Bulk copy via MVE byte load/store (16 B/iter), scalar tail
+       * for the last S % 16 bytes, then explicit zero-fill for the
+       * S..S_pad bytes. */
       for (uint32_t n = 0; n < D; ++n) {
         const int8_t* v_row = v_b + (size_t)n * S;
         int8_t* dst = v_padded + (size_t)n * S_pad;
-        for (uint32_t jj = 0; jj < S; ++jj) dst[jj] = v_row[jj];
-        for (uint32_t jj = S; jj < S_pad; ++jj) dst[jj] = 0;
+        uint32_t jj = 0;
+        for (; jj < S_full; jj += 16) {
+          vstrbq_s8(dst + jj, vldrbq_s8(v_row + jj));
+        }
+        for (; jj < S; ++jj) dst[jj] = v_row[jj];
+        for (; jj < S_pad; ++jj) dst[jj] = 0;
       }
       /* Constants for the kernel-sum reformulation:
        *   sum (q+q_off)(k+k_off) = qk_dot + q_off*k_sum + k_off*q_sum + D*q_off*k_off
