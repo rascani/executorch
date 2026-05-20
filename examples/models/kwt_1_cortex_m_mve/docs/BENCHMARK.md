@@ -296,6 +296,7 @@ the per-kernel cycle table at the new defaults is below.
 | `attention_fused_s8` AV step MVE via zero-padded v buffer | 219,830 | 8.22× | -8% |
 | `attention_fused_s8` AV step + softmax housekeeping (vector requantize tile-4 on 4 output channels) | 208,116 | 8.68× | -5% |
 | `attention_fused_s8` QK^T per-score requantize vectorized (tile-4 on 4 scores) | 205,060 | 8.81× | -1.5% |
+| `attention_fused_s8` MVE path generalized for S>16 (chunked vmladavaq_s8 over padded contraction) | 208,529 | 8.66× | +1.7% on OneBlock — but unlocks **-57% on canonical KWT-1 1-block-S=98 (11.1 M → 4.81 M)** |
 
 Per-kernel breakdown at the 205,060-cycle headline:
 
@@ -347,31 +348,26 @@ apples-to-apples cycle comparison.
 |---|---|---:|---:|---:|---:|
 | DS-CNN-S (12-class) | cortex_m + CMSIS-NN runtime, full inference | 23,180 | 2.66 M | **1,902,290** | 0.72 |
 | KWT-1 OneBlockKWT (S=8) | standalone MVE, our 1-block Phase 8/optim target | 33,472 | 262 K | **205,060** | 0.78 |
-| KWT-1 1-block @ S=98 (1× canonical input) | standalone MVE (1 encoder block + embed + mean + head) | ~98 K | 3.4 M | **11,096,844** | ~3.3 † |
-| KWT-1 12-block canonical (35-class) | standalone MVE — full encoder | 406,563 | 38.8 M | ~124 M ‡ | ~3.2 † |
+| KWT-1 1-block @ S=98 (1× canonical input), scalar attention | standalone, attention via scalar fallback (pre long-S MVE) | ~98 K | 3.4 M | 11,096,844 | ~3.3 |
+| **KWT-1 1-block @ S=98**, MVE long-S attention | standalone MVE, post long-S attention | ~98 K | 3.4 M | **4,806,835** | ~1.4 |
+| KWT-1 12-block canonical (35-class) | standalone MVE — full encoder | 406,563 | 38.8 M | **~58 M †** | ~1.5 |
 
-† The cycles/MAC degrades at S=98 because attention runs through the
-scalar fallback (`attention_fused_s8`'s MVE path is gated on S≤16
-today) — that's the obvious next optimization target if KWT-1 latency
-matters for deployment.  The non-attention work runs at the same
-~0.8 cy/MAC the OneBlock measurement shows.
-
-‡ Extrapolated.  The 1-block-S=98 measurement (11.1 M cycles) is
-~750 k embed + ~50 k mean/head + ~10.3 M for one encoder block at
-S=98.  12 blocks + the same overhead ≈ 124 M cycles.  The 12-block
-end-to-end FVP run didn't terminate in two attempts (1 h and 30 min
-wall) — the simulator slows non-linearly on this host for long runs
-and the 1-block S=98 anchor is the safest measurement to extrapolate
-from.
+† Extrapolated.  The 1-block-S=98 measurement (4.81 M cycles) is
+~750 k embed + ~50 k mean/head + ~4.0 M for one encoder block at
+S=98.  12 blocks + the same overhead ≈ 58 M cycles.  The 12-block
+end-to-end FVP run didn't terminate in three attempts (1 h, 30 min,
+50 min CPU) — the simulator slows non-linearly on this host for
+long-running workloads.  The 1-block S=98 anchor is the safest
+measurement to extrapolate from.
 
 ### Headline tradeoff (Corstone-300 FVP, PMU CCNTR)
 
 - DS-CNN-S full inference: **1.9 M cycles** for ~94 % top-1 on the
   Speech Commands 12-class benchmark.  ≈ 64 ms at 30 MHz.
-- KWT-1 canonical inference: **~124 M cycles** for ~96.6 % top-1 on
-  the Speech Commands 35-class benchmark.  ≈ 4.1 s at 30 MHz.
+- KWT-1 canonical inference: **~58 M cycles** for ~96.6 % top-1 on
+  the Speech Commands 35-class benchmark.  ≈ 1.9 s at 30 MHz.
 
-**~65× the cycles for ~2.5 absolute accuracy points** on the harder
+**~30× the cycles for ~2.5 absolute accuracy points** on the harder
 35-class task.  Per-MAC efficiencies are nearly identical (0.7-0.8
 cy/MAC on the MVE-friendly portions); the cost differential is the
 model doing more work, not poorer kernel utilization.
