@@ -320,20 +320,25 @@ void gelu_lut_s8(
 
 #if KWT_1_FAST_EXPF
 static inline float kwt_1_fast_expf(float x) {
+  /* Softmax always feeds (x - row_max) ≤ 0; the lower clamp guards
+   * against IEEE-754 exponent underflow.  No upper clamp — input
+   * range is bounded above by 0 by the softmax contract. */
   if (x < -16.0f) return 0.0f;
-  if (x >  16.0f) x = 16.0f;
   const float log2e = 1.44269504088896341f;
   float y = x * log2e;
-  /* floor(y) for arbitrary sign — (int) truncates toward zero, so
-   * subtract 1 for negative non-integer y. */
-  int32_t i = (int32_t)y;
-  float fi = (float)i;
-  if (y < fi) { i -= 1; fi -= 1.0f; }
+  /* Branchless floor via VFP `vrintm.f32` (round toward -inf). */
+  float fi = floorf(y);
+  int32_t i = (int32_t)fi;
   float f = y - fi;
-  /* Minimax polynomial for 2^f on [0, 1]: ~4 ULP. */
-  float p = 1.0f + f * (0.6931472f + f * (0.2402265f + f * (
-            0.0555041f + f * (0.0096180f + f * 0.0013357f))));
-  /* 2^i by direct IEEE-754 exponent injection. */
+  /* Minimax polynomial for 2^f on [0, 1], Horner via fmaf so the
+   * compiler emits vfma.f32 instructions on M55+VFP rather than
+   * separate vmul + vadd. */
+  float p = 0.0013357f;
+  p = fmaf(p, f, 0.0096180f);
+  p = fmaf(p, f, 0.0555041f);
+  p = fmaf(p, f, 0.2402265f);
+  p = fmaf(p, f, 0.6931472f);
+  p = fmaf(p, f, 1.0f);
   union { float f; int32_t i; } u;
   u.i = (i + 127) << 23;
   return p * u.f;
