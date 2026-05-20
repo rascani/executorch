@@ -1,11 +1,35 @@
-# KWT-1 standalone — Phase 8 MVE optimization journey
+# KWT-1 standalone — MVE optimization journey
 
 A measured per-kernel record of how the standalone KWT-1 inference
-moved from a scalar baseline to an MVE-tuned 5.52× speedup on the
-Corstone-300 FVP.  All cycle numbers are PMU `CCNTR` reads (see
-"Cycle counter calibration" below) of one `kwt_1_inference()` call
-on the `OneBlockKWT` model (d=64, d_ff=256, seq_len=8) — a single
-transformer encoder block, the unit Phase 0-8 of this project ships.
+was optimized on the Corstone-300 FVP across Phase 8 (kernel-level
+MVE) and the post-Phase 8 / canonical-KWT-1 sprint that followed.
+All cycle numbers are PMU `CCNTR` reads (see "Cycle counter
+calibration" below).
+
+## Latest results at a glance
+
+| Configuration | PMU cycles | Bit-exact | Notes |
+|---|---:|---|---|
+| **OneBlockKWT** (d=64, d_ff=128, S=8) — 1 transformer block, the unit Phase 0-8 hammered on | **~211 k** | ✓ | down from 1.81 M scalar baseline (8.5×) |
+| **KWT-1 1-block @ S=98** (canonical input dims, 1 of 12 blocks + embed + mean + head) | **3.70 M** | ✓ | down from 11.1 M with scalar attention (-67%); 3.62 M with opt-in `KWT_1_FAST_EXPF=ON` |
+| **KWT-1 12-block canonical** (full encoder, 35-class) | **~44 M (extrapolated)** | ✓ | 1-block-S=98 × 12 + I/O overhead; 12-block FVP runs don't terminate on this host but the math composes |
+| **DS-CNN-S** (12-class, cortex_m + CMSIS-NN runtime) | **1.90 M** | n/a (separate model) | reference point — the textbook MCU KWS choice |
+
+KWT-1 canonical is **~23× the cycles** of DS-CNN-S for ~2.5 absolute
+accuracy points on the harder 35-class Speech Commands benchmark.
+DS-CNN remains the practical MCU KWS choice; KWT-1's contribution is
+enabling transformer-class models on Cortex-M at all (LN, GELU,
+fused attention, BMM, softmax kernels this directory ships).
+
+Detail tables, optimization step history, per-kernel breakdowns, and
+the DS-CNN comparison reproducer all live below.
+
+---
+
+## Phase 8 journey (OneBlock, d_ff=256 era)
+
+The original Phase 8 stopping point — 1.81 M cycles scalar → 327 k
+MVE-tuned — on `OneBlockKWT(d=64, d_ff=256, seq_len=8)`.
 
 ## Setup
 
