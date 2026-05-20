@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cinttypes>
+#include <cstdio>
 
 #include "arm_perf_monitor.h"
 
@@ -134,6 +135,9 @@ void StopMeasurements(int num_inferences) {
       PMU_CNTENCLR_CCNTR_ENABLE_Msk | PMU_CNTENCLR_CNT0_ENABLE_Msk |
       PMU_CNTENCLR_CNT1_ENABLE_Msk);
   uint32_t cycle_count = ARM_PMU_Get_CCNTR() - ethosu_ArmCycleCountStart;
+  /* printf rather than ET_LOG so the cycle count escapes builds with
+   * EXECUTORCH_ENABLE_LOGGING=OFF (used by the cortex_m test runner). */
+  printf("BENCHMARK_CYCLES %u\n", (unsigned)cycle_count);
 
   // Number of comand streams handled by the NPU
   ET_LOG(Info, "NPU Inferences : %d", num_inferences);

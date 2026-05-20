@@ -227,10 +227,10 @@ def main() -> int:
     parser.add_argument("--seq-len", type=int, default=8,
                         help="Sequence length S.  Smaller than KWT-1's 99 by "
                              "default to keep host-build smoke tests fast.")
-    parser.add_argument("--num-blocks", type=int, default=1,
+    parser.add_argument("--num-blocks", type=int, default=None,
                         help="Number of stacked transformer encoder blocks. "
-                             "1 = OneBlockKWT (Phase 0-8 validation unit); "
-                             "12 = canonical KWT-1 encoder.")
+                             "Default: 1 for OneBlockKWT path; 12 for "
+                             "--full-kwt1 (canonical KWT-1 encoder).")
     parser.add_argument("--full-kwt1", action="store_true",
                         help="Use the full KWT-1 model (input embed + pos enc + "
                              "12 encoder blocks + mean pool + classification "
@@ -247,17 +247,19 @@ def main() -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.full_kwt1:
+        # If --num-blocks was not passed, expand to canonical 12.
+        nb = args.num_blocks if args.num_blocks is not None else 12
         model = KWT1(
             mfcc_dim=args.mfcc_dim,
             seq_len=args.seq_len,
-            num_blocks=args.num_blocks if args.num_blocks > 1 else 12,
+            num_blocks=nb,
             d=args.d_model,
             d_ff=args.d_ff,
             num_classes=args.num_classes,
         ).eval()
         torch.manual_seed(1)
         sample = (torch.randn(1, args.seq_len, args.mfcc_dim),)
-    elif args.num_blocks == 1:
+    elif args.num_blocks is None or args.num_blocks == 1:
         model = OneBlockKWT(args.d_model, args.d_ff).eval()
         torch.manual_seed(1)
         sample = (torch.randn(1, args.seq_len, args.d_model),)
