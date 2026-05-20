@@ -790,27 +790,28 @@ void attention_fused_s8(
   };
 
 #if KWT_1_USE_MVE
-  /* MVE fast path.  KWT-1 uses D=64 (multiple of 16) and S=8, so the
-   * D-loop in QK^T is MVE-vectorizable via vmladavaq_s8 with the same
-   * kernel-sum trick the linears use:
-   *   sum_k (q[k]+q_off)(k[k]+k_off) = qk_dot + q_off*k_sum + k_off*q_sum
-   *                                  + D*q_off*k_off
-   * For step 3, S=8 is below MVE's 16 int8 lanes, so we keep that loop
-   * scalar but precompute the v column sums once per batch — the
-   * scores_scratch sum is computed in one vaddvaq_s8 after softmax. */
-  if ((D & 15u) == 0u && S <= 16) {
-    /* MVE fast path scope: D multiple of 16 (KWT-1's d=64), S ≤ 16
-     * (KWT-1 OneBlock test uses S=8; canonical seq_len=98 falls
-     * through to the scalar path until the K-vectorized long-S
-     * variant lands).  Precompute k row sums (S entries) once per
-     * batch and v column sums (D entries). */
+  /* MVE fast path.  D must be a multiple of 16 (KWT-1's d=64 fits) so
+   * the QK^T D-loop vectorizes via vmladavaq_s8.  The AV step rounds
+   * the contraction dim S up to a multiple of 16 (S_pad) and uses a
+   * zero-padded v scratch so the same vmladavaq_s8 covers both short
+   * (S=8) and long (canonical S=98) sequences.
+   *
+   * Kernel-sum reformulation lets the inner dot use raw int8 (no
+   * per-lane zp subtraction):
+   *   sum (q+q_off)(k+k_off) = qk_dot + q_off*k_sum + k_off*q_sum
+   *                          + D*q_off*k_off
+   *   sum (p+probs_off)(v+v_off) = pv_dot + probs_off*v_sum
+   *                              + v_off*p_sum + S*probs_off*v_off
+   */
+  #define KWT_1_AV_MAX_S_PAD 128
+  if ((D & 15u) == 0u && D <= 64 && ((S + 15u) & ~15u) <= KWT_1_AV_MAX_S_PAD) {
+    /* MVE fast path scope: D multiple of 16 and D ≤ 64 (v_col_sums
+     * static); S_pad ≤ KWT_1_AV_MAX_S_PAD (v_padded static).  Both
+     * limits comfortably cover canonical KWT-1 (D=64, S=98 → 112). */
     int32_t k_row_sums[KWT_1_SOFTMAX_MAX_ROW];
-    int32_t v_col_sums[64];  /* D ≤ 64 in KWT-1 */
-    /* The v_col_sums array sizes hard-coded to D=64 max; if D ever
-     * grows we'll need a heap scratch.  Asserting it fits via a
-     * compile-time check below would require D as a literal.
-     * Practical guard: bail out to the scalar path if D > 64. */
-    if (D > 64) goto scalar_path;
+    int32_t v_col_sums[64];
+    int8_t v_padded[64 * KWT_1_AV_MAX_S_PAD];
+    const uint32_t S_pad = (S + 15u) & ~15u;
     for (uint32_t b = 0; b < B; ++b) {
       const int8_t* q_b = q + (size_t)b * S * D;
       const int8_t* k_b = k + (size_t)b * S * D;
@@ -833,13 +834,12 @@ void attention_fused_s8(
         for (uint32_t jj = 0; jj < S; ++jj) s += (int32_t)v_row[jj];
         v_col_sums[n] = s;
       }
-      /* Build a (D, 16) zero-padded copy of v for the AV step's
-       * vmladavaq_s8 inner.  S=8 fits in MVE's 16 lanes once padded;
-       * sidesteps the predicated-load gotcha seen on this gcc+M55
-       * combo (predicate-zero lanes leaked nonzero junk through the
-       * vmladavaq sum).  Stack cost = D*16 bytes = 1 KB at D=64. */
-      int8_t v_padded[64 * 16];
-      const uint32_t S_pad = 16;
+      /* Build a (D, S_pad) zero-padded copy of v for the AV step's
+       * vmladavaq_s8 inner.  S_pad = ceil(S/16)*16; padding lets a
+       * single 16-lane vmladavaq_s8 sweep the contraction without a
+       * predicated tail (the predicated-load path leaked nonzero
+       * junk through the sum on this gcc+M55 combo).  Stack cost
+       * = D * S_pad bytes; e.g. 1 KB at S=8 or ~7 KB at S=98. */
       for (uint32_t n = 0; n < D; ++n) {
         const int8_t* v_row = v_b + (size_t)n * S;
         int8_t* dst = v_padded + (size_t)n * S_pad;
@@ -912,12 +912,15 @@ void attention_fused_s8(
         softmax_s8(scores_scratch, scores_scratch, &sm_p);
 
         /* Step 3: AV row i = sum_j (probs[j]+128)(v[n,j]+v_off).
-         * Use kernel-sum reformulation so vmladavaq_s8 handles the
-         * int8 dot directly; pad probs to 16 lanes via scores_scratch's
-         * tail bytes (zeroed below), and use v_padded for v rows. */
+         * Kernel-sum reformulation; the dot sweeps the padded
+         * contraction in 16-byte chunks (one vmladavaq_s8 per chunk),
+         * with zero-padded tail bytes contributing 0.  Probs sum is
+         * computed across the same padded buffer for consistency. */
         for (uint32_t jj = S; jj < S_pad; ++jj) scores_scratch[jj] = 0;
-        int8x16_t probs_v = vldrbq_s8(scores_scratch);
-        const int32_t probs_sum = vaddvq_s8(probs_v);
+        int32_t probs_sum = 0;
+        for (uint32_t kk = 0; kk < S_pad; kk += 16) {
+          probs_sum = vaddvaq_s8(probs_sum, vldrbq_s8(scores_scratch + kk));
+        }
         const int32_t probs_row_term = v_off * probs_sum + av_const_term;
 
         int8_t* out_row = out_b + (size_t)i * D;
@@ -927,20 +930,25 @@ void attention_fused_s8(
         const int32x4_t v_probs_row_term = vdupq_n_s32(probs_row_term);
         const int32_t probs_off_local = probs_off;
         uint32_t n = 0;
-        /* AV step in tile-of-4 outputs: 4 vmladavaq_s8 produce 4
-         * scalar dots, pack into int32x4 and use the vector
-         * requantize + narrow store path.  Eliminates 75% of the
-         * per-output scalar requantize+clamp+store cost. */
+        /* AV step in tile-of-4 outputs: each of the 4 dots sweeps
+         * S_pad in 16-byte chunks; for S=8 (S_pad=16) the inner is
+         * a single vmladavaq_s8 per dot, for S=98 (S_pad=112) it's
+         * 7 vmladavaq_s8 per dot.  Probs are loaded fresh per chunk
+         * so 8 Q-regs hold {probs_v, v0..v3, scratch}. */
         if (av_shift <= 0) {
           for (; n + 4 <= D; n += 4) {
-            int8x16_t v0 = vldrbq_s8(v_padded + (size_t)(n + 0) * S_pad);
-            int8x16_t v1 = vldrbq_s8(v_padded + (size_t)(n + 1) * S_pad);
-            int8x16_t v2 = vldrbq_s8(v_padded + (size_t)(n + 2) * S_pad);
-            int8x16_t v3 = vldrbq_s8(v_padded + (size_t)(n + 3) * S_pad);
-            int32_t d0 = vmladavaq_s8(0, probs_v, v0);
-            int32_t d1 = vmladavaq_s8(0, probs_v, v1);
-            int32_t d2 = vmladavaq_s8(0, probs_v, v2);
-            int32_t d3 = vmladavaq_s8(0, probs_v, v3);
+            const int8_t* vr0 = v_padded + (size_t)(n + 0) * S_pad;
+            const int8_t* vr1 = v_padded + (size_t)(n + 1) * S_pad;
+            const int8_t* vr2 = v_padded + (size_t)(n + 2) * S_pad;
+            const int8_t* vr3 = v_padded + (size_t)(n + 3) * S_pad;
+            int32_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+            for (uint32_t kk = 0; kk < S_pad; kk += 16) {
+              int8x16_t probs_v = vldrbq_s8(scores_scratch + kk);
+              d0 = vmladavaq_s8(d0, probs_v, vldrbq_s8(vr0 + kk));
+              d1 = vmladavaq_s8(d1, probs_v, vldrbq_s8(vr1 + kk));
+              d2 = vmladavaq_s8(d2, probs_v, vldrbq_s8(vr2 + kk));
+              d3 = vmladavaq_s8(d3, probs_v, vldrbq_s8(vr3 + kk));
+            }
             int32x4_t dots = {d0, d1, d2, d3};
             int32x4_t vsum = vldrwq_s32(v_col_sums + n);
             int32x4_t acc = vaddq_s32(dots, vmulq_n_s32(vsum, probs_off_local));
@@ -952,8 +960,12 @@ void attention_fused_s8(
           }
         }
         for (; n < D; ++n) {
-          int8x16_t v_v = vldrbq_s8(v_padded + (size_t)n * S_pad);
-          int32_t dot = vmladavaq_s8(0, probs_v, v_v);
+          const int8_t* v_row = v_padded + (size_t)n * S_pad;
+          int32_t dot = 0;
+          for (uint32_t kk = 0; kk < S_pad; kk += 16) {
+            dot = vmladavaq_s8(dot, vldrbq_s8(scores_scratch + kk),
+                                    vldrbq_s8(v_row + kk));
+          }
           int32_t acc = dot + probs_off * v_col_sums[n] + probs_row_term;
           int32_t r = kwt_1_requantize(acc, av_mult, av_shift) + av_zp;
           if (r < -128) r = -128;
