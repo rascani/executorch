@@ -1051,27 +1051,69 @@ void attention_fused_s8(
           const int32x4_t v_pos127 = vdupq_n_s32(127);
           const int32x4_t v_qk_zp = vdupq_n_s32(qk_zp);
           const int32x4_t v_qk_row_const = vdupq_n_s32(qk_row_const);
-          for (; j + 4 <= S; j += 4) {
-            const int8_t* k0 = k_b + (size_t)(j + 0) * D;
-            const int8_t* k1 = k_b + (size_t)(j + 1) * D;
-            const int8_t* k2 = k_b + (size_t)(j + 2) * D;
-            const int8_t* k3 = k_b + (size_t)(j + 3) * D;
-            int32_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
-            for (uint32_t kk = 0; kk < D; kk += 16) {
-              int8x16_t qv = vldrbq_s8(q_row + kk);
-              d0 = vmladavaq_s8(d0, qv, vldrbq_s8(k0 + kk));
-              d1 = vmladavaq_s8(d1, qv, vldrbq_s8(k1 + kk));
-              d2 = vmladavaq_s8(d2, qv, vldrbq_s8(k2 + kk));
-              d3 = vmladavaq_s8(d3, qv, vldrbq_s8(k3 + kk));
+          /* D=64 hoist: q_row's four 16-byte vectors stay resident
+           * across all S/4 j-tile iterations.  Saves S/4 × 4 - 4
+           * = S - 4 q_row loads per query row (~94 loads/query at
+           * S=98, ~9200 cycles per attention call). */
+          if (D == 64) {
+            int8x16_t qv0 = vldrbq_s8(q_row +  0);
+            int8x16_t qv1 = vldrbq_s8(q_row + 16);
+            int8x16_t qv2 = vldrbq_s8(q_row + 32);
+            int8x16_t qv3 = vldrbq_s8(q_row + 48);
+            for (; j + 4 <= S; j += 4) {
+              const int8_t* k0 = k_b + (size_t)(j + 0) * D;
+              const int8_t* k1 = k_b + (size_t)(j + 1) * D;
+              const int8_t* k2 = k_b + (size_t)(j + 2) * D;
+              const int8_t* k3 = k_b + (size_t)(j + 3) * D;
+              int32_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+              d0 = vmladavaq_s8(d0, qv0, vldrbq_s8(k0 +  0));
+              d1 = vmladavaq_s8(d1, qv0, vldrbq_s8(k1 +  0));
+              d2 = vmladavaq_s8(d2, qv0, vldrbq_s8(k2 +  0));
+              d3 = vmladavaq_s8(d3, qv0, vldrbq_s8(k3 +  0));
+              d0 = vmladavaq_s8(d0, qv1, vldrbq_s8(k0 + 16));
+              d1 = vmladavaq_s8(d1, qv1, vldrbq_s8(k1 + 16));
+              d2 = vmladavaq_s8(d2, qv1, vldrbq_s8(k2 + 16));
+              d3 = vmladavaq_s8(d3, qv1, vldrbq_s8(k3 + 16));
+              d0 = vmladavaq_s8(d0, qv2, vldrbq_s8(k0 + 32));
+              d1 = vmladavaq_s8(d1, qv2, vldrbq_s8(k1 + 32));
+              d2 = vmladavaq_s8(d2, qv2, vldrbq_s8(k2 + 32));
+              d3 = vmladavaq_s8(d3, qv2, vldrbq_s8(k3 + 32));
+              d0 = vmladavaq_s8(d0, qv3, vldrbq_s8(k0 + 48));
+              d1 = vmladavaq_s8(d1, qv3, vldrbq_s8(k1 + 48));
+              d2 = vmladavaq_s8(d2, qv3, vldrbq_s8(k2 + 48));
+              d3 = vmladavaq_s8(d3, qv3, vldrbq_s8(k3 + 48));
+              int32x4_t dots = {d0, d1, d2, d3};
+              int32x4_t ks_v = vldrwq_s32(k_row_sums + j);
+              int32x4_t acc = vaddq_s32(dots, vmulq_n_s32(ks_v, q_off));
+              acc = vaddq_s32(acc, v_qk_row_const);
+              acc = kwt_1_mve_requantize_nonpos(acc, qk_mult, qk_shift);
+              acc = vaddq_s32(acc, v_qk_zp);
+              acc = vminq_s32(vmaxq_s32(acc, v_neg128), v_pos127);
+              vstrbq_s32(scores_scratch + j, acc);
             }
-            int32x4_t dots = {d0, d1, d2, d3};
-            int32x4_t ks_v = vldrwq_s32(k_row_sums + j);
-            int32x4_t acc = vaddq_s32(dots, vmulq_n_s32(ks_v, q_off));
-            acc = vaddq_s32(acc, v_qk_row_const);
-            acc = kwt_1_mve_requantize_nonpos(acc, qk_mult, qk_shift);
-            acc = vaddq_s32(acc, v_qk_zp);
-            acc = vminq_s32(vmaxq_s32(acc, v_neg128), v_pos127);
-            vstrbq_s32(scores_scratch + j, acc);
+          } else {
+            for (; j + 4 <= S; j += 4) {
+              const int8_t* k0 = k_b + (size_t)(j + 0) * D;
+              const int8_t* k1 = k_b + (size_t)(j + 1) * D;
+              const int8_t* k2 = k_b + (size_t)(j + 2) * D;
+              const int8_t* k3 = k_b + (size_t)(j + 3) * D;
+              int32_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+              for (uint32_t kk = 0; kk < D; kk += 16) {
+                int8x16_t qv = vldrbq_s8(q_row + kk);
+                d0 = vmladavaq_s8(d0, qv, vldrbq_s8(k0 + kk));
+                d1 = vmladavaq_s8(d1, qv, vldrbq_s8(k1 + kk));
+                d2 = vmladavaq_s8(d2, qv, vldrbq_s8(k2 + kk));
+                d3 = vmladavaq_s8(d3, qv, vldrbq_s8(k3 + kk));
+              }
+              int32x4_t dots = {d0, d1, d2, d3};
+              int32x4_t ks_v = vldrwq_s32(k_row_sums + j);
+              int32x4_t acc = vaddq_s32(dots, vmulq_n_s32(ks_v, q_off));
+              acc = vaddq_s32(acc, v_qk_row_const);
+              acc = kwt_1_mve_requantize_nonpos(acc, qk_mult, qk_shift);
+              acc = vaddq_s32(acc, v_qk_zp);
+              acc = vminq_s32(vmaxq_s32(acc, v_neg128), v_pos127);
+              vstrbq_s32(scores_scratch + j, acc);
+            }
           }
         }
         for (; j < S; ++j) {
