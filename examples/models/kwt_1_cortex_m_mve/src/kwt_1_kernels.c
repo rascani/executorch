@@ -354,13 +354,36 @@ static inline void softmax_s8(
 
   float scratch[KWT_1_SOFTMAX_MAX_ROW];
 
+  const int32_t in_zp_i = p->input_zp;
   for (uint32_t r = 0; r < R; ++r) {
     const int8_t* row_in = input + (size_t)r * N;
     int8_t* row_out = output + (size_t)r * N;
 
-    /* Pass 1: dequant + row max. */
+    /* Pass 1: dequant into the float scratch + track row_max in
+     * parallel.  Vectorize 4 floats per iter via MVE FP for the
+     * bulk; scalar handles the tail when N % 4 != 0. */
     float row_max = -INFINITY;
-    for (uint32_t i = 0; i < N; ++i) {
+    uint32_t i = 0;
+#if KWT_1_USE_MVE
+    {
+      float32x4_t row_max_v = vdupq_n_f32(-INFINITY);
+      for (; i + 4 <= N; i += 4) {
+        int32x4_t qv = vldrbq_s32(row_in + i);
+        qv = vsubq_n_s32(qv, in_zp_i);
+        float32x4_t fv = vmulq_n_f32(vcvtq_f32_s32(qv), real_scale);
+        vstrwq_f32(scratch + i, fv);
+        row_max_v = vmaxnmq_f32(row_max_v, fv);
+      }
+      row_max = vgetq_lane_f32(row_max_v, 0);
+      float m1 = vgetq_lane_f32(row_max_v, 1);
+      float m2 = vgetq_lane_f32(row_max_v, 2);
+      float m3 = vgetq_lane_f32(row_max_v, 3);
+      if (m1 > row_max) row_max = m1;
+      if (m2 > row_max) row_max = m2;
+      if (m3 > row_max) row_max = m3;
+    }
+#endif
+    for (; i < N; ++i) {
       float x = ((float)row_in[i] - in_zp) * real_scale;
       scratch[i] = x;
       if (x > row_max) row_max = x;
@@ -368,25 +391,43 @@ static inline void softmax_s8(
 
     /* Pass 2: shifted exp + row sum. */
     float sum = 0.0f;
-    for (uint32_t i = 0; i < N; ++i) {
-      float e = KWT_1_EXPF(scratch[i] - row_max);
-      scratch[i] = e;
+    for (uint32_t k = 0; k < N; ++k) {
+      float e = KWT_1_EXPF(scratch[k] - row_max);
+      scratch[k] = e;
       sum += e;
     }
 
     /* Pass 3: normalize + quantize at CMSIS-NN's fixed (scale=1/256,
      * zp=-128).  probs * 256 has range [0, 256], round and subtract
      * 128 — final clamp guards against a probability of 1.0
-     * mapping to 128 (above int8 max). */
-    const float inv_sum = 1.0f / sum;
-    for (uint32_t i = 0; i < N; ++i) {
-      float prob = scratch[i] * inv_sum;
-      float qf = prob * 256.0f;
+     * mapping to 128 (above int8 max).  Vectorize 4 floats per iter
+     * via MVE FP; scalar handles the tail. */
+    const float inv_sum_scaled = 256.0f / sum;
+    uint32_t k2 = 0;
+#if KWT_1_USE_MVE
+    {
+      const float32x4_t v_inv_sum_scaled = vdupq_n_f32(inv_sum_scaled);
+      const int32x4_t v_neg128 = vdupq_n_s32(-128);
+      const int32x4_t v_pos127 = vdupq_n_s32(127);
+      for (; k2 + 4 <= N; k2 += 4) {
+        float32x4_t pv = vldrwq_f32(scratch + k2);
+        float32x4_t qf = vmulq_f32(pv, v_inv_sum_scaled);
+        /* vcvtaq_s32_f32 rounds away-from-zero, matching the scalar
+         * `(qf >= 0 ? +0.5 : -0.5) + cast` round semantics. */
+        int32x4_t qi = vcvtaq_s32_f32(qf);
+        qi = vsubq_n_s32(qi, 128);
+        qi = vminq_s32(vmaxq_s32(qi, v_neg128), v_pos127);
+        vstrbq_s32(row_out + k2, qi);
+      }
+    }
+#endif
+    for (; k2 < N; ++k2) {
+      float qf = scratch[k2] * inv_sum_scaled;
       int32_t q = (int32_t)(qf + (qf >= 0.0f ? 0.5f : -0.5f));
       q -= 128;
       if (q < -128) q = -128;
       if (q >  127) q =  127;
-      row_out[i] = (int8_t)q;
+      row_out[k2] = (int8_t)q;
     }
   }
 }
