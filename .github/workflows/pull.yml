@@ -544,6 +544,7 @@ jobs:
       submodules: 'recursive'
       ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout: 90
+      upload-artifact: bloaty-arm-${{ matrix.os }}
       script: |
         # The generic Linux job chooses to use base env, not the one setup by the image
         CONDA_ENV=$(conda env list --json | jq -r ".envs | .[-1]")
@@ -576,20 +577,83 @@ jobs:
         # Setup cmake target to desired toolchain
         toolchain_cmake=$(realpath ${toolchain_cmake})
 
-        # Build and run size test
-        if [[ ${{ matrix.os}} == "bare_metal" ]]; then
-          bash test/build_size_test.sh "-DCMAKE_TOOLCHAIN_FILE=${toolchain_cmake} -DEXECUTORCH_BUILD_ARM_BAREMETAL=ON"
-        elif [[ ${{ matrix.os}} == "zephyr-preset" ]]; then
-          CXXFLAGS=${cxx_flags} cmake --preset zephyr -DCMAKE_BUILD_TYPE=Release -DEXECUTORCH_OPTIMIZE_SIZE=ON -DEXECUTORCH_BUILD_EXTENSION_DATA_LOADER=ON -DCMAKE_INSTALL_PREFIX=cmake-out -Bcmake-out .
-          cmake --build cmake-out -j9 --target install --config Release
-          CXXFLAGS=${cxx_flags}  cmake -DCMAKE_TOOLCHAIN_FILE=${toolchain_cmake} -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=cmake-out -Bcmake-out/test test
-          cmake --build cmake-out/test -j9 --config Release
-        else
-          echo "Fail unsupported OS selection ${{ matrix.os }}"
-          exit 1
+        build_size_test() {
+          if [[ $1 == "bare_metal" ]]; then
+            bash test/build_size_test.sh "-DCMAKE_TOOLCHAIN_FILE=${toolchain_cmake} -DEXECUTORCH_BUILD_ARM_BAREMETAL=ON"
+          elif [[ $1 == "zephyr-preset" ]]; then
+            CXXFLAGS=${cxx_flags} cmake --preset zephyr -DCMAKE_BUILD_TYPE=Release -DEXECUTORCH_OPTIMIZE_SIZE=ON -DEXECUTORCH_BUILD_EXTENSION_DATA_LOADER=ON -DCMAKE_INSTALL_PREFIX=cmake-out -Bcmake-out .
+            cmake --build cmake-out -j9 --target install --config Release
+            CXXFLAGS=${cxx_flags} cmake -DCMAKE_TOOLCHAIN_FILE=${toolchain_cmake} -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=cmake-out -Bcmake-out/test test
+            cmake --build cmake-out/test -j9 --config Release
+          fi
+        }
+
+        build_size_test "${{ matrix.os }}"
+        elf="cmake-out/test/size_test"
+
+        mkdir -p /tmp/bloaty-elfs
+        cp "${elf}" /tmp/bloaty-elfs/head.elf
+
+        # Base build for the bloaty diff. Failures degrade the report to head-only.
+        # Worktree must be named `executorch` — see CMakeLists.txt:420.
+        # actions/checkout's shallow fetch doesn't include the base SHA, so fetch it.
+        base_elf=""
+        base_sha=""
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          base_worktree=/tmp/bloaty-base/executorch
+          mkdir -p /tmp/bloaty-base
+          if git fetch --depth=1 origin "${base_sha}" \
+             && git worktree add --force "${base_worktree}" "${base_sha}" \
+             && ( cd "${base_worktree}" \
+                  && git submodule update --init --recursive --depth=1 --jobs=8 \
+                  && build_size_test "${{ matrix.os }}" ) \
+             && cp "${base_worktree}/cmake-out/test/size_test" /tmp/bloaty-elfs/base.elf; then
+            base_elf="/tmp/bloaty-elfs/base.elf"
+          else
+            echo "base build failed; bloaty report will be head-only"
+          fi
         fi
 
-        elf="cmake-out/test/size_test"
+        # Bloaty report. Best-effort: failures here never fail the size job.
+        # `set -e` is disabled by the outer `|| true`, so commands need explicit
+        # `|| exit 1` to abort the subshell on failure.
+        (
+          # bloaty isn't in apt on the executorch-ubuntu-22.04-arm-sdk image and
+          # the system libstdc++ is too old for the conda-forge build, so install
+          # bloaty into a dedicated conda env that also brings libstdcxx-ng.
+          # `conda run` then sets LD_LIBRARY_PATH for us.
+          bloaty_env=/tmp/bloaty-conda-env
+          if [[ ! -x "${bloaty_env}/bin/bloaty" ]]; then
+            conda create -y -p "${bloaty_env}" -c conda-forge bloaty libstdcxx-ng || exit 1
+          fi
+          bloaty_cmd=("conda" "run" "--no-capture-output" "-p" "${bloaty_env}" "bloaty")
+          "${bloaty_cmd[@]}" --version || exit 1
+
+          tmp_out=/tmp/bloaty-out
+          rm -rf "${tmp_out}" && mkdir -p "${tmp_out}"
+          measure_args=(
+            --head /tmp/bloaty-elfs/head.elf
+            --job "arm-${{ matrix.os }}"
+            --binary-name size_test
+            --head-sha "${{ github.event.pull_request.head.sha || github.sha }}"
+            --strip-tool "${toolchain_prefix}strip"
+            --out "${tmp_out}"
+          )
+          if [[ -n "${base_elf}" ]]; then
+            measure_args+=(--base "${base_elf}" --base-sha "${base_sha}")
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            measure_args+=(--base-build-failed --base-sha "${base_sha}")
+          fi
+          BLOATY="${bloaty_cmd[*]}" python .github/scripts/bloaty_diff.py measure "${measure_args[@]}" || exit 1
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "${{ github.event.pull_request.number }}" > "${tmp_out}/pr_number.txt"
+          fi
+          # Move into the upload directory only after a clean run, so a partial
+          # measure can't ship a corrupt artifact that the poster chokes on.
+          mkdir -p artifacts-to-be-uploaded
+          mv "${tmp_out}"/* artifacts-to-be-uploaded/
+        ) || echo "bloaty report failed; continuing"
 
         # Dump basic info
         ls -al ${elf}
