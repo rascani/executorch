@@ -5,11 +5,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Usage: bash .ci/scripts/bloaty-measure.sh <job_name> <head_elf> <strip_tool>
+# Usage: bash .ci/scripts/bloaty-measure.sh <job_name> <head_elf> <strip_tool> [base_elf] [base_sha]
 #
-# Runs bloaty against the head ELF, writes metadata.json + full.txt +
-# head_only.txt to artifacts-to-be-uploaded/, and appends a markdown table
-# to $GITHUB_STEP_SUMMARY.
+# Runs bloaty against the head ELF (and optionally the merge-base ELF), writes
+# metadata.json + full.txt + head_only.txt to artifacts-to-be-uploaded/, and
+# appends a markdown table to $GITHUB_STEP_SUMMARY.
+#
+# If <base_elf> is supplied but empty (e.g. "") and <base_sha> is set, the
+# measurement is recorded with base_build_failed=true.
 #
 # Best-effort: never exits non-zero — the size jobs that source this should
 # not fail because of a bloaty hiccup.
@@ -19,6 +22,8 @@ set -uo pipefail
 job_name=$1
 head_elf=$2
 strip_tool=$3
+base_elf=${4:-}
+base_sha=${5:-}
 head_sha=${GITHUB_HEAD_SHA:-${GITHUB_SHA:-unknown}}
 
 (
@@ -34,13 +39,26 @@ head_sha=${GITHUB_HEAD_SHA:-${GITHUB_SHA:-unknown}}
 
   tmp_out=/tmp/bloaty-out
   rm -rf "${tmp_out}" && mkdir -p "${tmp_out}"
+
+  measure_args=(
+    --head "${head_elf}"
+    --job "${job_name}"
+    --binary-name size_test
+    --head-sha "${head_sha}"
+    --strip-tool "${strip_tool}"
+    --out "${tmp_out}"
+  )
+  if [[ -n "${base_sha}" ]]; then
+    measure_args+=(--base-sha "${base_sha}")
+    if [[ -n "${base_elf}" && -f "${base_elf}" ]]; then
+      measure_args+=(--base "${base_elf}")
+    else
+      measure_args+=(--base-build-failed)
+    fi
+  fi
+
   BLOATY="${bloaty_cmd[*]}" python3 .github/scripts/bloaty_diff.py measure \
-    --head "${head_elf}" \
-    --job "${job_name}" \
-    --binary-name size_test \
-    --head-sha "${head_sha}" \
-    --strip-tool "${strip_tool}" \
-    --out "${tmp_out}" || exit 1
+    "${measure_args[@]}" || exit 1
   mkdir -p artifacts-to-be-uploaded
   mv "${tmp_out}"/* artifacts-to-be-uploaded/
 ) || echo "bloaty report failed; continuing"

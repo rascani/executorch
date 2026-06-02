@@ -497,8 +497,37 @@ jobs:
         # Bloaty per-bucket size report (best-effort; never fails the size job).
         mkdir -p /tmp/bloaty-elfs
         cp cmake-out/test/size_test /tmp/bloaty-elfs/head.elf
+
+        # Build the merge-base too, so the PR comment can show per-bucket Δ.
+        # The worktree must be named exactly `executorch` (see CMakeLists.txt).
+        # For fork PRs, `origin` is the fork's clone which does NOT have the
+        # base SHA; fetch from the PR's base repo URL explicitly.
+        base_elf=""
+        base_sha=""
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          base_clone_url="${{ github.event.pull_request.base.repo.clone_url }}"
+          base_worktree=/tmp/bloaty-base/executorch
+          mkdir -p /tmp/bloaty-base
+          rm -rf "${base_worktree}"
+          if git fetch --depth=1 "${base_clone_url}" "${base_sha}" \
+             && git worktree add --force "${base_worktree}" "${base_sha}" \
+             && ( cd "${base_worktree}" \
+                  && git submodule update --init --recursive --depth=1 --jobs=8 \
+                  && bash test/build_size_test.sh ) \
+             && cp "${base_worktree}/cmake-out/test/size_test" /tmp/bloaty-elfs/base.elf; then
+            base_elf=/tmp/bloaty-elfs/base.elf
+          else
+            echo "base build failed; bloaty report will be head-only"
+          fi
+        fi
+
         GITHUB_HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}" \
-          bash .ci/scripts/bloaty-measure.sh "linux-gcc" /tmp/bloaty-elfs/head.elf strip
+          bash .ci/scripts/bloaty-measure.sh "linux-gcc" /tmp/bloaty-elfs/head.elf strip \
+          "${base_elf}" "${base_sha}"
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          echo "${{ github.event.pull_request.number }}" > artifacts-to-be-uploaded/pr_number.txt
+        fi
 
         strip cmake-out/test/size_test
         output=$(ls -la cmake-out/test/size_test)
@@ -541,8 +570,37 @@ jobs:
         # Bloaty per-bucket size report (best-effort; never fails the size job).
         mkdir -p /tmp/bloaty-elfs
         cp cmake-out/test/size_test /tmp/bloaty-elfs/head.elf
+
+        # Build the merge-base too, so the PR comment can show per-bucket Δ.
+        # The worktree must be named exactly `executorch` (see CMakeLists.txt).
+        # For fork PRs, `origin` is the fork's clone which does NOT have the
+        # base SHA; fetch from the PR's base repo URL explicitly.
+        base_elf=""
+        base_sha=""
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          base_clone_url="${{ github.event.pull_request.base.repo.clone_url }}"
+          base_worktree=/tmp/bloaty-base/executorch
+          mkdir -p /tmp/bloaty-base
+          rm -rf "${base_worktree}"
+          if git fetch --depth=1 "${base_clone_url}" "${base_sha}" \
+             && git worktree add --force "${base_worktree}" "${base_sha}" \
+             && ( cd "${base_worktree}" \
+                  && git submodule update --init --recursive --depth=1 --jobs=8 \
+                  && bash test/build_size_test.sh ) \
+             && cp "${base_worktree}/cmake-out/test/size_test" /tmp/bloaty-elfs/base.elf; then
+            base_elf=/tmp/bloaty-elfs/base.elf
+          else
+            echo "base build failed; bloaty report will be head-only"
+          fi
+        fi
+
         GITHUB_HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}" \
-          bash .ci/scripts/bloaty-measure.sh "linux-clang" /tmp/bloaty-elfs/head.elf strip
+          bash .ci/scripts/bloaty-measure.sh "linux-clang" /tmp/bloaty-elfs/head.elf strip \
+          "${base_elf}" "${base_sha}"
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          echo "${{ github.event.pull_request.number }}" > artifacts-to-be-uploaded/pr_number.txt
+        fi
 
         strip cmake-out/test/size_test
         output=$(ls -la cmake-out/test/size_test)
@@ -606,18 +664,23 @@ jobs:
         # Setup cmake target to desired toolchain
         toolchain_cmake=$(realpath ${toolchain_cmake})
 
-        # Build and run size test
-        if [[ ${{ matrix.os}} == "bare_metal" ]]; then
-          bash test/build_size_test.sh "-DCMAKE_TOOLCHAIN_FILE=${toolchain_cmake} -DEXECUTORCH_BUILD_ARM_BAREMETAL=ON"
-        elif [[ ${{ matrix.os}} == "zephyr-preset" ]]; then
-          CXXFLAGS=${cxx_flags} cmake --preset zephyr -DCMAKE_BUILD_TYPE=Release -DEXECUTORCH_OPTIMIZE_SIZE=ON -DEXECUTORCH_BUILD_EXTENSION_DATA_LOADER=ON -DCMAKE_INSTALL_PREFIX=cmake-out -Bcmake-out .
-          cmake --build cmake-out -j9 --target install --config Release
-          CXXFLAGS=${cxx_flags}  cmake -DCMAKE_TOOLCHAIN_FILE=${toolchain_cmake} -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=cmake-out -Bcmake-out/test test
-          cmake --build cmake-out/test -j9 --config Release
-        else
-          echo "Fail unsupported OS selection ${{ matrix.os }}"
-          exit 1
-        fi
+        # Build size test in the current working directory's repo checkout.
+        # Used for both the head build and (in a worktree) the merge-base build.
+        build_arm_size_test() {
+          if [[ ${{ matrix.os}} == "bare_metal" ]]; then
+            bash test/build_size_test.sh "-DCMAKE_TOOLCHAIN_FILE=${toolchain_cmake} -DEXECUTORCH_BUILD_ARM_BAREMETAL=ON"
+          elif [[ ${{ matrix.os}} == "zephyr-preset" ]]; then
+            CXXFLAGS=${cxx_flags} cmake --preset zephyr -DCMAKE_BUILD_TYPE=Release -DEXECUTORCH_OPTIMIZE_SIZE=ON -DEXECUTORCH_BUILD_EXTENSION_DATA_LOADER=ON -DCMAKE_INSTALL_PREFIX=cmake-out -Bcmake-out .
+            cmake --build cmake-out -j9 --target install --config Release
+            CXXFLAGS=${cxx_flags}  cmake -DCMAKE_TOOLCHAIN_FILE=${toolchain_cmake} -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=cmake-out -Bcmake-out/test test
+            cmake --build cmake-out/test -j9 --config Release
+          else
+            echo "Fail unsupported OS selection ${{ matrix.os }}"
+            return 1
+          fi
+        }
+
+        build_arm_size_test
 
         elf="cmake-out/test/size_test"
 
@@ -634,8 +697,37 @@ jobs:
         # Runs BEFORE the in-place strip below so the head ELF is still unstripped.
         mkdir -p /tmp/bloaty-elfs
         cp "${elf}" /tmp/bloaty-elfs/head.elf
+
+        # Build the merge-base too, so the PR comment can show per-bucket Δ.
+        # The worktree must be named exactly `executorch` (see CMakeLists.txt).
+        # For fork PRs, `origin` is the fork's clone which does NOT have the
+        # base SHA; fetch from the PR's base repo URL explicitly.
+        base_elf=""
+        base_sha=""
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          base_clone_url="${{ github.event.pull_request.base.repo.clone_url }}"
+          base_worktree=/tmp/bloaty-base/executorch
+          mkdir -p /tmp/bloaty-base
+          rm -rf "${base_worktree}"
+          if git fetch --depth=1 "${base_clone_url}" "${base_sha}" \
+             && git worktree add --force "${base_worktree}" "${base_sha}" \
+             && ( cd "${base_worktree}" \
+                  && git submodule update --init --recursive --depth=1 --jobs=8 \
+                  && build_arm_size_test ) \
+             && cp "${base_worktree}/cmake-out/test/size_test" /tmp/bloaty-elfs/base.elf; then
+            base_elf=/tmp/bloaty-elfs/base.elf
+          else
+            echo "base build failed; bloaty report will be head-only"
+          fi
+        fi
+
         GITHUB_HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}" \
-          bash .ci/scripts/bloaty-measure.sh "arm-${{ matrix.os }}" /tmp/bloaty-elfs/head.elf "${toolchain_prefix}strip"
+          bash .ci/scripts/bloaty-measure.sh "arm-${{ matrix.os }}" /tmp/bloaty-elfs/head.elf "${toolchain_prefix}strip" \
+          "${base_elf}" "${base_sha}"
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          echo "${{ github.event.pull_request.number }}" > artifacts-to-be-uploaded/pr_number.txt
+        fi
 
         # Add basic guard - TODO: refine this!
         ${toolchain_prefix}strip ${elf}

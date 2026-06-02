@@ -1,0 +1,81 @@
+name: Bloaty size comment
+
+on:
+  workflow_run:
+    workflows: ["pull"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "GitHub Actions run ID of the `pull` workflow run whose artifacts to comment on"
+        required: true
+      pr_number:
+        description: "PR number to comment on"
+        required: true
+
+# Cancel stale runs when contributors push rapidly. Different keys for
+# workflow_run vs manual dispatch so they don't fight each other.
+concurrency:
+  group: bloaty-comment-${{ github.event.workflow_run.head_repository.full_name || 'manual' }}-${{ github.event.workflow_run.head_branch || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  comment:
+    # Only run on the canonical repo (forks lack the secrets to post comments
+    # anyway, and we don't want fork copies of this workflow firing). Skip
+    # cancelled/skipped runs; failure conclusions are kept so the comment still
+    # posts when a size job fails the (eventual) gate.
+    if: >-
+      github.repository_owner == 'pytorch' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.conclusion != 'cancelled' &&
+        github.event.workflow_run.conclusion != 'skipped'))
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout (for bloaty_diff.py)
+        uses: actions/checkout@v4
+        with:
+          # Only need the scripts directory.
+          sparse-checkout: |
+            .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Download bloaty artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bloaty-*
+          path: bloaty-artifacts
+          run-id: ${{ github.event.workflow_run.id || inputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: List downloaded artifacts
+        run: |
+          ls -laR bloaty-artifacts || echo "(no artifacts)"
+
+      - name: Post sticky PR comment
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          # Pass workflow_dispatch inputs via env, not direct ${{ ... }}
+          # interpolation into the shell — guards against command injection
+          # via maintainer-typed input on the manual-dispatch UI.
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          # For workflow_run events, github.event.repository is the FORK repo
+          # (head of the PR). Use the run's repository instead, falling back
+          # to the canonical name on workflow_dispatch.
+          TARGET_REPO: ${{ github.event.workflow_run.repository.name || 'executorch' }}
+        run: |
+          pr_args=()
+          if [[ -n "${INPUT_PR_NUMBER}" ]]; then
+            pr_args=(--pr-num "${INPUT_PR_NUMBER}")
+          fi
+          python3 .github/scripts/bloaty_diff.py post \
+            --in-dir bloaty-artifacts \
+            --org "${{ github.repository_owner }}" \
+            --repo "${TARGET_REPO}" \
+            "${pr_args[@]}"
