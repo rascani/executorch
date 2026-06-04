@@ -38,21 +38,20 @@ ops_before_transforms: dict[str, int] = {
     "executorch_exir_dialects_edge__ops_quantized_decomposed_dequantize_per_tensor_default": 20,
     "executorch_exir_dialects_edge__ops_quantized_decomposed_quantize_per_tensor_default": 18,
 }
-# The STFT magnitude block `(real**2 + imag**2).sqrt()` now lowers: pow->mul
+# The STFT magnitude block `(real**2 + imag**2).sqrt()` lowers: pow->mul
 # (DecomposePowPass) gives 2 quantized_mul, the sum gives 1 quantized_add, and
 # sqrt lowers to a quantized_activation LUT -- so the only remaining
 # quantized_activation pair is sqrt + the final-conv sigmoid (2 total).
 # The 3 remaining sigmoids and 2 tanhs are LSTMCell gates: PyTorch export
 # captures nn.LSTMCell as a single high-level op, so the quantizer never sees
-# the gate activations and can't annotate them. They're decomposed only at
-# to_edge -- after the quantizer -- so the gates have no qparams to fold and
-# the lowering pass correctly skips them (a pre-annotation LSTMCell decompose
-# lands separately). The 6 Conv1ds likewise stay fp32 until conv1d support
-# lands, so their conv-tail relus stay in aten.
+# the gate activations and can't annotate them (they decompose only at to_edge,
+# after the quantizer, with no qparams to fold). The 6 Conv1ds are not lowered
+# either, so their conv-tail relus stay in aten.
+# The reflect-pad index math (arange/abs/sub) is data-independent for a fixed
+# input shape, so constant_prop_pass folds it away -- only the int8 gather
+# (index) remains.
 ops_after_transforms: dict[str, int] = {
-    "executorch_exir_dialects_edge__ops_aten_abs_default": 2,
     "executorch_exir_dialects_edge__ops_aten_add_Tensor": 2,
-    "executorch_exir_dialects_edge__ops_aten_arange_start_step": 1,
     "executorch_exir_dialects_edge__ops_aten_cat_default": 1,
     "executorch_exir_dialects_edge__ops_aten_convolution_default": 6,
     "executorch_exir_dialects_edge__ops_aten_index_Tensor": 1,
@@ -65,7 +64,6 @@ ops_after_transforms: dict[str, int] = {
     "executorch_exir_dialects_edge__ops_aten_slice_copy_Tensor": 2,
     "executorch_exir_dialects_edge__ops_aten_split_with_sizes_copy_default": 1,
     "executorch_exir_dialects_edge__ops_aten_squeeze_copy_dims": 2,
-    "executorch_exir_dialects_edge__ops_aten_sub_Tensor": 2,
     "executorch_exir_dialects_edge__ops_aten_tanh_default": 2,
     "executorch_exir_dialects_edge__ops_aten_unsqueeze_copy_default": 2,
     "executorch_exir_dialects_edge__ops_aten_view_copy_default": 1,

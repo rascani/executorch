@@ -19,6 +19,7 @@ from executorch.backends.transforms.replace_scalar_with_tensor import (
 )
 from executorch.exir.pass_base import ExportPass
 from executorch.exir.pass_manager import PassManager
+from executorch.exir.passes.constant_prop_pass import constant_prop_pass
 from executorch.exir.program._program import _transform, lift_constant_tensor_pass
 from torch.export import ExportedProgram
 
@@ -120,7 +121,13 @@ class CortexMPassManager(PassManager):
             transform_pass = pass_cls(**kwargs)
             exported_program = _transform(exported_program, transform_pass)
 
-        # All constant tensors should be lifted to buffers at this point, re-run
-        # lift_constant_tensor_pass in case new ones have been introduced.
+        # Fold data-independent subgraphs into constants -- e.g. the reflect-pad
+        # index math (arange/abs/sub) in front of an int8 gather, which is fixed
+        # for a given input shape -- so they don't run (or link kernels) on the
+        # MCU.
+        exported_program = constant_prop_pass(exported_program)
+
+        # Re-run lift_constant_tensor_pass in case any pass above introduced new
+        # get_attr constants.
         exported_program = lift_constant_tensor_pass(exported_program)
         return exported_program
