@@ -61,6 +61,42 @@ class _SiLU(torch.nn.Module):
         return torch.nn.functional.silu(x)
 
 
+class _Sqrt(torch.nn.Module):
+    # sqrt is only defined on non-negative input (it backs the magnitude
+    # block); inputs below stay >= 0 so the fp32 reference is well-defined.
+    ops_before_transforms = {
+        **_OPS_BEFORE,
+        "executorch_exir_dialects_edge__ops_aten_sqrt_default": 1,
+    }
+    ops_after_transforms = _OPS_AFTER
+
+    def forward(self, x):
+        return torch.sqrt(x)
+
+
+class _Magnitude(torch.nn.Module):
+    # (real**2 + imag**2).sqrt(): DecomposePowPass turns each square into a
+    # mul(x, x), so the whole block lowers to quantized_mul x2 + quantized_add
+    # + quantized_activation(sqrt) with no fp32 island.
+    ops_before_transforms = {
+        "executorch_exir_dialects_edge__ops_aten_add_Tensor": 1,
+        "executorch_exir_dialects_edge__ops_aten_mul_Tensor": 2,
+        "executorch_exir_dialects_edge__ops_aten_sqrt_default": 1,
+        "executorch_exir_dialects_edge__ops_quantized_decomposed_quantize_per_tensor_default": 6,
+        "executorch_exir_dialects_edge__ops_quantized_decomposed_dequantize_per_tensor_default": 6,
+    }
+    ops_after_transforms = {
+        "executorch_exir_dialects_edge__ops_cortex_m_quantized_mul_default": 2,
+        "executorch_exir_dialects_edge__ops_cortex_m_quantized_add_default": 1,
+        "executorch_exir_dialects_edge__ops_cortex_m_quantized_activation_default": 1,
+        "executorch_exir_dialects_edge__ops_cortex_m_quantize_per_tensor_default": 2,
+        "executorch_exir_dialects_edge__ops_cortex_m_dequantize_per_tensor_default": 1,
+    }
+
+    def forward(self, real, imag):
+        return (real**2 + imag**2).sqrt()
+
+
 import torch as _torch
 
 
@@ -132,6 +168,30 @@ test_cases = {
     "silu_zero": McuTestCase(
         model=_SiLU(),
         example_inputs=(_zero_input((16,)),),
+    ),
+    "sqrt_rank1": McuTestCase(
+        model=_Sqrt(),
+        example_inputs=(ramp_tensor(0, 6, (16,)),),
+    ),
+    "sqrt_rank3": McuTestCase(
+        model=_Sqrt(),
+        example_inputs=(ramp_tensor(0, 4, (1, 4, 16)),),
+    ),
+    "sqrt_asymmetric_zp": McuTestCase(
+        model=_Sqrt(),
+        example_inputs=(ramp_tensor(1, 9, (16,)),),
+    ),
+    "sqrt_zero": McuTestCase(
+        model=_Sqrt(),
+        example_inputs=(_zero_input((16,)),),
+    ),
+    "magnitude_rank3": McuTestCase(
+        model=_Magnitude(),
+        example_inputs=(ramp_tensor(-3, 3, (1, 4, 16)), ramp_tensor(-2, 4, (1, 4, 16))),
+    ),
+    "magnitude_rank1": McuTestCase(
+        model=_Magnitude(),
+        example_inputs=(ramp_tensor(-5, 5, (16,)), ramp_tensor(-1, 6, (16,))),
     ),
 }
 

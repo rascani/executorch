@@ -124,6 +124,7 @@ ACTIVATION_OP_PATTERNS = {
     (torch.ops.aten.sigmoid.default,): CortexMActivationCheck,
     (torch.ops.aten.tanh.default,): CortexMActivationCheck,
     (torch.ops.aten.silu.default,): CortexMActivationCheck,
+    (torch.ops.aten.sqrt.default,): CortexMActivationCheck,
 }
 
 POOL_OP_PATTERNS = {

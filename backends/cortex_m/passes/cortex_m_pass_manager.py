@@ -27,6 +27,7 @@ from .clamp_hardswish_pass import ClampHardswishPass
 from .convert_to_cortex_m_pass import ConvertToCortexMPass
 from .decompose_hardswish_pass import DecomposeHardswishPass
 from .decompose_mean_pass import DecomposeMeanPass
+from .decompose_pow_pass import DecomposePowPass
 from .quantized_clamp_activation_pass import QuantizedClampActivationPass
 from .quantized_op_fusion_pass import QuantizedOpFusionPass
 from .replace_quant_nodes_pass import ReplaceQuantNodesPass
@@ -49,6 +50,9 @@ class CortexMPassManager(PassManager):
     ]
 
     pass_list_transform_for_annotation: list[PassClass] = [
+        # Rewrite pow(x, 2) -> mul(x, x) before annotation so the quantizer can
+        # observe the multiply (e.g. the real**2 + imag**2 magnitude block).
+        DecomposePowPass,
         ScalarsToAttributePass,
         ReplaceScalarWithTensorArgPass,
         ClampHardswishPass,

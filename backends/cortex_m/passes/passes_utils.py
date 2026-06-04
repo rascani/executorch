@@ -204,10 +204,18 @@ def _stable_silu(x: float) -> float:
     return x * _stable_sigmoid(x)
 
 
+def _nonneg_sqrt(x: float) -> float:
+    # sqrt is only meaningful on the magnitude block's non-negative input
+    # (real**2 + imag**2); clamp the small negative excursions that per-tensor
+    # quantization can produce near zero rather than returning NaN.
+    return math.sqrt(x) if x > 0.0 else 0.0
+
+
 _ACTIVATION_FNS = {
     exir_ops.edge.aten.sigmoid.default: _stable_sigmoid,
     exir_ops.edge.aten.tanh.default: math.tanh,
     exir_ops.edge.aten.silu.default: _stable_silu,
+    exir_ops.edge.aten.sqrt.default: _nonneg_sqrt,
 }
 
 

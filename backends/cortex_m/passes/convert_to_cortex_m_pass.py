@@ -487,10 +487,10 @@ class ConvertToCortexMPass(CortexMPass):
         return exir_ops.edge.cortex_m.quantized_batch_matmul.default, args
 
     def _get_activation_replacement(self, node):
-        """Lower a standalone quantized sigmoid / tanh / silu to a single
-        cortex_m.quantized_activation call backed by an AoT-built 256-entry
-        int8 LUT. The kernel is shape-agnostic; the LUT encodes both the
-        activation function and the input/output qparams.
+        """Lower a standalone quantized sigmoid / tanh / silu / sqrt to a
+        single cortex_m.quantized_activation call backed by an AoT-built
+        256-entry int8 LUT. The kernel is shape-agnostic; the LUT encodes both
+        the activation function and the input/output qparams.
         """
         input_qparams = node.meta["input_qparams"][0]
         output_qparams = node.meta["output_qparams"][0]
@@ -545,6 +545,7 @@ class ConvertToCortexMPass(CortexMPass):
                     exir_ops.edge.aten.sigmoid.default
                     | exir_ops.edge.aten.tanh.default
                     | exir_ops.edge.aten.silu.default
+                    | exir_ops.edge.aten.sqrt.default
                 ):
                     op, args = self._get_activation_replacement(node)
                 case _:
