@@ -8,7 +8,6 @@ from .activation_fusion_pass import ActivationFusionPass  # noqa
 from .aten_to_cortex_m_pass import AtenToCortexMPass  # noqa
 from .clamp_hardswish_pass import ClampHardswishPass  # noqa
 from .cortex_m_pass import CortexMPass  # noqa
-from .decompose_hardswish_pass import DecomposeHardswishPass  # noqa
 from .decompose_mean_pass import DecomposeMeanPass  # noqa
 from .quantized_clamp_activation_pass import QuantizedClampActivationPass  # noqa
 from .replace_quant_nodes_pass import ReplaceQuantNodesPass  # noqa

@@ -14,10 +14,13 @@ from torch.fx.node import Argument
 
 class ClampHardswishPass(ExportPass):
     """
-    Adds a clamp operation before hardswish to ensure input is in the range [-3, inf).
+    Clamps the input to hardswish to [-3, inf) before quantization.
 
-    By doing this before quantization the output range of the preceding op is minimized,
-    potentially improving accuracy.
+    Mathematically a no-op, since hardswish is zero below -3, but it narrows
+    the range the observer sees. Hardswish lowers to an int8 LUT and is near
+    the identity for large inputs, so its input grid wants to be about as fine
+    as its output grid. This is an accuracy heuristic; nothing depends on it
+    for correctness.
     """
 
     def call_operator(

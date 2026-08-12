@@ -28,8 +28,6 @@ BINARY_OP_PATTERNS = {
     (torch.ops.aten.add_.Tensor,): CortexMAddMulCheck,
     (torch.ops.aten.mul.Tensor,): CortexMAddMulCheck,
     (torch.ops.aten.mul_.Tensor,): CortexMAddMulCheck,
-    (torch.ops.aten.hardswish.default,): CortexMAddMulCheck,  # lowers to mul
-    (torch.ops.aten.hardswish_.default,): CortexMAddMulCheck,  # lowers to mul
     (torch.ops.aten.div.Tensor,): CortexMDivCheck,
     (torch.ops.aten.div_.Tensor,): CortexMDivCheck,
 }
@@ -128,6 +126,8 @@ ACTIVATION_OP_PATTERNS = {
     (torch.ops.aten.tanh.default,): CortexMActivationCheck,
     (torch.ops.aten.silu.default,): CortexMActivationCheck,
     (torch.ops.aten.gelu.default,): CortexMActivationCheck,
+    (torch.ops.aten.hardswish.default,): CortexMActivationCheck,
+    (torch.ops.aten.hardswish_.default,): CortexMActivationCheck,
 }
 
 POOL_OP_PATTERNS = {

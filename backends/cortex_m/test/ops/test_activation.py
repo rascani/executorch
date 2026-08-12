@@ -164,8 +164,7 @@ class CortexMLinearHardswish(torch.nn.Module):
     ops_after_transforms = {
         "executorch_exir_dialects_edge__ops_cortex_m_quantized_linear_default": 1,
         "executorch_exir_dialects_edge__ops_cortex_m_quantize_per_tensor_default": 1,
-        "executorch_exir_dialects_edge__ops_cortex_m_minimum_default": 1,
-        "executorch_exir_dialects_edge__ops_cortex_m_quantized_mul_default": 1,
+        "executorch_exir_dialects_edge__ops_cortex_m_quantized_activation_default": 1,
         "executorch_exir_dialects_edge__ops_cortex_m_dequantize_per_tensor_default": 1,
     }
 
@@ -263,8 +262,7 @@ class CortexMConv2DHardswish(torch.nn.Module):
     ops_after_transforms = {
         "executorch_exir_dialects_edge__ops_cortex_m_quantized_conv2d_default": 1,
         "executorch_exir_dialects_edge__ops_cortex_m_quantize_per_tensor_default": 1,
-        "executorch_exir_dialects_edge__ops_cortex_m_minimum_default": 1,
-        "executorch_exir_dialects_edge__ops_cortex_m_quantized_mul_default": 1,
+        "executorch_exir_dialects_edge__ops_cortex_m_quantized_activation_default": 1,
         "executorch_exir_dialects_edge__ops_cortex_m_dequantize_per_tensor_default": 1,
     }
 
@@ -645,6 +643,17 @@ test_cases = {
         model=CortexMConv2DHardswish(),
         example_inputs=(
             ramp_tensor(-3, 0, (1, 2, 1, 100)).to(memory_format=torch.channels_last),
+        ),
+    ),
+    # Deliberately wide: hardswish is the identity for large inputs, and a lowering
+    # that quantizes it on a grid sized for the input range loses resolution in
+    # proportion to that range. Narrow inputs hide this entirely.
+    "conv2d_hardswish_wide_range": McuTestCase(
+        model=CortexMConv2DHardswish(),
+        example_inputs=(
+            ramp_tensor(-100, 100, (1, 2, 1, 100)).to(
+                memory_format=torch.channels_last
+            ),
         ),
     ),
     "conv2d_clamp_inplace": McuTestCase(

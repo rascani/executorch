@@ -305,10 +305,11 @@ def _has_qparams(node: Node) -> bool:
 @AtenToCortexMPass.register_dialect_substitution(exir_ops.edge.aten.tanh.default)
 @AtenToCortexMPass.register_dialect_substitution(exir_ops.edge.aten.silu.default)
 @AtenToCortexMPass.register_dialect_substitution(exir_ops.edge.aten.gelu.default)
+@AtenToCortexMPass.register_dialect_substitution(exir_ops.edge.aten.hardswish.default)
 def _get_activation_replacement(
     node: Node, dialect_pass: AtenToDialectPass
 ) -> DialectNodeSpec | None:
-    """Lower a standalone quantized sigmoid / tanh / silu to a single
+    """Lower a standalone quantized elementwise activation to a single
     cortex_m.quantized_activation call backed by an AoT-built 256-entry
     int8 LUT. The kernel is shape-agnostic; the LUT encodes both the
     activation function and the input/output qparams.
