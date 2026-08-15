@@ -191,6 +191,32 @@ def test_max_pool2d_with_indices_matches_aten():
     assert torch.equal(act_i, expected_i)
 
 
+def test_max_pool2d_matches_aten():
+    torch.manual_seed(0)
+    nchw = torch.randn(2, 3, 8, 8)
+    nhwc = _to_nhwc(nchw)
+
+    expected = _to_nhwc(
+        torch.ops.aten.max_pool2d.default(nchw, [2, 2], [2, 2], [0, 0], [1, 1], False)
+    )
+    actual = torch.ops.channels_last.max_pool2d(
+        nhwc, [2, 2], [2, 2], [0, 0], [1, 1], False
+    )
+
+    assert actual.shape == expected.shape
+    assert torch.equal(actual, expected)
+
+
+def test_constant_pad_nd_matches_aten():
+    x = torch.randn(2, 1, 5, 3)
+    padding = [0, 0, 1, 2, 3, 0]
+
+    expected = torch.ops.aten.constant_pad_nd(x, padding, -0.5)
+    actual = torch.ops.channels_last.constant_pad_nd(x, padding, -0.5)
+
+    torch.testing.assert_close(actual, expected)
+
+
 def test_grid_sampler_2d_matches_aten():
     torch.manual_seed(0)
     nchw = torch.randn(2, 3, 8, 8)

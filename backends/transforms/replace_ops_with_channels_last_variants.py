@@ -11,6 +11,8 @@ import executorch.backends.transforms.channels_last_ops  # noqa: F401
 
 import torch
 
+from executorch.backends.transforms.channels_last_layout import LAYOUT_PERMUTE_COPY
+
 from executorch.exir import ExportedProgram
 from executorch.exir.dialects._ops import ops as exir_ops
 
@@ -63,7 +65,7 @@ class ChannelsLastOpSpec:
     # Positional arg indices of tensor inputs that should be permuted NCHW→NHWC.
     input_indices: list[int]
 
-    # Indices of the outputs that should be permuted NCHW→NHWC.
+    # Indices of the outputs that should be permuted NHWC→NCHW.
     output_indices: list[int]
 
     # If provided, this function must return True for a node to be replaced.
@@ -101,6 +103,12 @@ _DEFAULT_OP_MAP: dict[Target, ChannelsLastOpSpec] = {
         output_indices=[0, 1],
         filter_fn=_requires_rank([3, 4]),
     ),
+    exir_ops.edge.aten.max_pool2d.default: ChannelsLastOpSpec(
+        target=exir_ops.edge.channels_last.max_pool2d.default,
+        input_indices=[0],
+        output_indices=[0],
+        filter_fn=_requires_rank([3, 4]),
+    ),
     exir_ops.edge.aten.upsample_bilinear2d.vec: ChannelsLastOpSpec(
         target=exir_ops.edge.channels_last.upsample_bilinear2d.default,
         input_indices=[0],
@@ -131,16 +139,17 @@ class ReplaceOpsWithChannelsLastVariants(ExportPass):
         self,
         exported_program: ExportedProgram,
         op_map: dict[Target, ChannelsLastOpSpec] | None = None,
+        preserve_meta_keys: tuple[str, ...] = (),
     ) -> None:
         super().__init__()
         self.exported_program = exported_program
         self.op_map: dict[Target, ChannelsLastOpSpec] = (
             op_map if op_map is not None else dict(_DEFAULT_OP_MAP)
         )
+        self.preserve_meta_keys = preserve_meta_keys
 
-    @staticmethod
     def _permute_node_input(
-        graph: torch.fx.Graph, node_input: torch.fx.Node, implicit_batch: bool
+        self, graph: torch.fx.Graph, node_input: torch.fx.Node, implicit_batch: bool
     ) -> torch.fx.Node:
         if implicit_batch:
             # Explicitly add batch size of `1`.
@@ -153,15 +162,15 @@ class ReplaceOpsWithChannelsLastVariants(ExportPass):
 
         res = graph.create_node(
             "call_function",
-            target=exir_ops.edge.channels_last.permute_copy.default,
+            target=LAYOUT_PERMUTE_COPY,
             args=(node_input, _NCHW_TO_NHWC_PERM),
         )
         res.meta = {}
 
         return res
 
-    @staticmethod
     def _permute_node_output(
+        self,
         graph: torch.fx.Graph,
         node_output: torch.fx.Node,
         original_node_output: torch.fx.Node,
@@ -169,7 +178,7 @@ class ReplaceOpsWithChannelsLastVariants(ExportPass):
     ):
         output = graph.create_node(
             "call_function",
-            target=exir_ops.edge.channels_last.permute_copy.default,
+            target=LAYOUT_PERMUTE_COPY,
             args=(node_output, _NHWC_TO_NCHW_PERM),
         )
         output.meta = {}
@@ -221,7 +230,11 @@ class ReplaceOpsWithChannelsLastVariants(ExportPass):
                     args=tuple(args),
                     kwargs=node.kwargs,
                 )
-                nhwc_node.meta = {}
+                nhwc_node.meta = {
+                    key: node.meta[key]
+                    for key in self.preserve_meta_keys
+                    if key in node.meta
+                }
 
                 users = list(node.users)
                 if all(

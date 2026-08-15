@@ -27,6 +27,12 @@ _DECOMPOSITIONS = {
     exir_ops.edge.channels_last.grid_sampler_2d.default: exir_ops.edge.aten.grid_sampler_2d.default,
 }
 
+# These operators already carry arguments in NHWC logical order, so fallback
+# only needs to replace the dialect target.
+_DIRECT_DECOMPOSITIONS = {
+    exir_ops.edge.channels_last.constant_pad_nd.default: exir_ops.edge.aten.constant_pad_nd.default,
+}
+
 
 class DecomposeChannelsLastPass(ExportPass):
     """Decompose channels_last dialect ops into permute + aten op + permute.
@@ -39,6 +45,10 @@ class DecomposeChannelsLastPass(ExportPass):
     """
 
     def call_operator(self, op, args, kwargs, meta):
+        direct_op = _DIRECT_DECOMPOSITIONS.get(op)
+        if direct_op is not None:
+            return super().call_operator(direct_op, args, kwargs, meta)
+
         aten_op = _DECOMPOSITIONS.get(op)
         if aten_op is not None:
             nchw_in = super().call_operator(
@@ -53,6 +63,26 @@ class DecomposeChannelsLastPass(ExportPass):
             return super().call_operator(
                 exir_ops.edge.aten.permute_copy.default,
                 (nchw_out, _NCHW_TO_NHWC),
+                {},
+                meta,
+            )
+        if op == exir_ops.edge.channels_last.max_pool2d.default:
+            nchw_in = super().call_operator(
+                exir_ops.edge.aten.permute_copy.default,
+                (args[0], _NHWC_TO_NCHW),
+                {},
+                meta,
+            )
+            pooled = super().call_operator(
+                exir_ops.edge.aten.max_pool2d_with_indices.default,
+                (nchw_in, *args[1:]),
+                kwargs,
+                meta,
+            )
+            values = super().call_operator(operator.getitem, (pooled, 0), {}, meta)
+            return super().call_operator(
+                exir_ops.edge.aten.permute_copy.default,
+                (values, _NCHW_TO_NHWC),
                 {},
                 meta,
             )
