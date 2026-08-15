@@ -51,9 +51,11 @@ def define_operator_target(name: str):
 
     runtime.cxx_library(
         name = "op_{}".format(name),
-        srcs = [
-            "op_{}.cpp".format(name),
-        ],
+        srcs = ["op_{}.cpp".format(name)] + (
+            ["op_{}_nhwc.cpp".format(name)]
+            if name in _EXPLICIT_LAYOUT_OPERATORS
+            else []
+        ),
         headers = cmsis_headers,
         platforms = CXX,
         deps = [

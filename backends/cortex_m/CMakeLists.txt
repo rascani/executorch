@@ -103,14 +103,19 @@ if(EXECUTORCH_BUILD_CORTEX_M)
       ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_quantized_activation.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_quantized_add.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_quantized_avg_pool2d.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_quantized_avg_pool2d_nhwc.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_quantized_batch_matmul.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_quantized_conv2d.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_quantized_conv2d_nhwc.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_quantized_depthwise_conv2d.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_quantized_depthwise_conv2d_nhwc.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_quantized_div.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_quantized_linear.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_quantized_max_pool2d.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_quantized_max_pool2d_nhwc.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_quantized_mul.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_quantized_transpose_conv2d.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_quantized_transpose_conv2d_nhwc.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_softmax.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_transpose.cpp
   )
