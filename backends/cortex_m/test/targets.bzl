@@ -50,4 +50,18 @@ def define_common_targets(is_fbcode = False):
             ],
         )
 
+        python_unittest(
+            name = "test_quantized_conv2d_layout",
+            srcs = [
+                "test_quantized_conv2d_layout.py",
+            ],
+            deps = [
+                "//caffe2:torch",
+                "//executorch/backends/cortex_m:target_config",
+                "//executorch/backends/cortex_m/ops:ops",
+                "//executorch/backends/cortex_m/passes:cortex_passes",
+                "//executorch/exir:lib",
+            ],
+        )
+
     
