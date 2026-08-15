@@ -5,13 +5,13 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "cortex_m_ops_common.h"
+#include "op_quantized_max_pool2d.h"
 
 namespace cortex_m {
 namespace native {
 
 // cppcheck-suppress unusedFunction
-Tensor& quantized_max_pool2d_out(
+Tensor& quantized_max_pool2d_out_impl(
     KernelRuntimeContext& context,
     const Tensor& input,
     const Int64ArrayRef kernel_size,
@@ -23,6 +23,7 @@ Tensor& quantized_max_pool2d_out(
     const int64_t output_zero_point,
     const int64_t activation_min,
     const int64_t activation_max,
+    ActivationLayout layout,
     Tensor& out) {
   CmsisPool2DConfig pool_config;
   if (!prepare_cmsis_pool2d_config(
@@ -37,7 +38,8 @@ Tensor& quantized_max_pool2d_out(
           ceil_mode,
           activation_min,
           activation_max,
-          pool_config)) {
+          pool_config,
+          layout)) {
     return out;
   }
 
@@ -93,6 +95,36 @@ Tensor& quantized_max_pool2d_out(
   }
 
   return out;
+}
+
+// cppcheck-suppress unusedFunction
+Tensor& quantized_max_pool2d_out(
+    KernelRuntimeContext& context,
+    const Tensor& input,
+    const Int64ArrayRef kernel_size,
+    const Int64ArrayRef stride,
+    const Int64ArrayRef padding,
+    const Int64ArrayRef dilation,
+    const bool ceil_mode,
+    const int64_t input_zero_point,
+    const int64_t output_zero_point,
+    const int64_t activation_min,
+    const int64_t activation_max,
+    Tensor& out) {
+  return quantized_max_pool2d_out_impl(
+      context,
+      input,
+      kernel_size,
+      stride,
+      padding,
+      dilation,
+      ceil_mode,
+      input_zero_point,
+      output_zero_point,
+      activation_min,
+      activation_max,
+      ActivationLayout::NCHWLogical,
+      out);
 }
 
 } // namespace native

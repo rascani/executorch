@@ -18,6 +18,14 @@ _PORTABLE_OPERATORS = [
     "dequantize_per_tensor",
 ]
 
+_EXPLICIT_LAYOUT_OPERATORS = [
+    "quantized_avg_pool2d",
+    "quantized_conv2d",
+    "quantized_depthwise_conv2d",
+    "quantized_max_pool2d",
+    "quantized_transpose_conv2d",
+]
+
 
 def define_operator_target(name: str):
     needs_cmsis = name not in _PORTABLE_OPERATORS
@@ -34,6 +42,8 @@ def define_operator_target(name: str):
     ] if needs_cmsis else []
 
     cmsis_headers = ["cortex_m_ops_common.h"] if needs_cmsis else []
+    if name in _EXPLICIT_LAYOUT_OPERATORS:
+        cmsis_headers.append("op_{}.h".format(name))
 
     _compat_kwargs = {}
     if needs_cmsis:
