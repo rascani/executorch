@@ -213,6 +213,7 @@ def define_common_targets():
             "//executorch/backends/...",
         ],
         deps = [
+            "//caffe2:torch",
             ":channels_last_ops",
             "//executorch/exir/dialects:lib",
         ],
@@ -385,6 +386,7 @@ def define_common_targets():
             "//executorch/backends/...",
         ],
         deps = [
+            ":channels_last_layout",
             "//caffe2:torch",
             "//executorch/exir/dialects:lib",
             ":permute_pass_utils",
@@ -411,6 +413,7 @@ def define_common_targets():
             "//executorch/backends/...",
         ],
         deps = [
+            ":channels_last_layout",
             "//caffe2:torch",
             "//executorch/exir:pass_base",
             "//executorch/exir/dialects:lib",
@@ -426,8 +429,10 @@ def define_common_targets():
             "@EXECUTORCH_CLIENTS",
         ],
         deps = [
+            ":channels_last_layout",
             ":permute_pass_utils",
             "//caffe2:torch",
+            "//executorch/exir:lib",
             "//executorch/exir:pass_base",
             "//executorch/exir/dialects:lib",
         ],
@@ -440,6 +445,7 @@ def define_common_targets():
             "//executorch/backends/...",
         ],
         deps = [
+            ":channels_last_layout",
             "//caffe2:torch",
             "//executorch/exir:pass_base",
             "//executorch/exir/dialects:lib",
@@ -454,6 +460,7 @@ def define_common_targets():
             "//executorch/backends/...",
         ],
         deps = [
+            ":channels_last_layout",
             "//caffe2:torch",
             "//executorch/exir/dialects:lib",
             ":permute_pass_utils",
