@@ -8,6 +8,7 @@ import operator
 import executorch.backends.transforms.channels_last_ops  # noqa: F401
 import pytest
 import torch
+from executorch.backends.transforms.channels_last_layout import LAYOUT_PERMUTE_COPY
 from executorch.backends.transforms.replace_ops_with_channels_last_variants import (
     _NCHW_TO_NHWC_PERM,
     _NHWC_TO_NCHW_PERM,
@@ -131,6 +132,25 @@ class UpsampleNearestModule(torch.nn.Module):
 
 
 class TestReplaceOpsWithChannelsLastVariants:
+    def test_preserve_meta_keys(self):
+        ep = _export_to_edge(Conv2dModule(), (torch.randn(1, 4, 8, 8),))
+        conv = _find_nodes(ep.graph_module, exir_ops.edge.aten.convolution.default)[0]
+        conv.meta["input_qparams"] = {0: "input"}
+        conv.meta["output_qparams"] = {0: "output"}
+        conv.meta["not_preserved"] = True
+
+        result = ReplaceOpsWithChannelsLastVariants(
+            ep,
+            preserve_meta_keys=("input_qparams", "output_qparams"),
+        )(ep.graph_module)
+        replaced = _find_nodes(
+            result.graph_module, exir_ops.edge.channels_last.convolution.default
+        )[0]
+
+        assert replaced.meta["input_qparams"] == {0: "input"}
+        assert replaced.meta["output_qparams"] == {0: "output"}
+        assert "not_preserved" not in replaced.meta
+        assert len(_find_nodes(result.graph_module, LAYOUT_PERMUTE_COPY)) == 2
 
     def test_conv2d(self):
         ep = _export_to_edge(Conv2dModule(bias=True), (torch.randn(1, 4, 8, 8),))

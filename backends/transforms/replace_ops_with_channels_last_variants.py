@@ -11,6 +11,8 @@ import executorch.backends.transforms.channels_last_ops  # noqa: F401
 
 import torch
 
+from executorch.backends.transforms.channels_last_layout import LAYOUT_PERMUTE_COPY
+
 from executorch.exir import ExportedProgram
 from executorch.exir.dialects._ops import ops as exir_ops
 
@@ -63,7 +65,7 @@ class ChannelsLastOpSpec:
     # Positional arg indices of tensor inputs that should be permuted NCHW→NHWC.
     input_indices: list[int]
 
-    # Indices of the outputs that should be permuted NCHW→NHWC.
+    # Indices of the outputs that should be permuted NHWC→NCHW.
     output_indices: list[int]
 
     # If provided, this function must return True for a node to be replaced.
@@ -125,18 +127,23 @@ class ReplaceOpsWithChannelsLastVariants(ExportPass):
 
     By default, all currently implemented channels_last dialect ops are replaced.
     Pass a custom op_map to restrict or extend the set of replacements.
+
+    Metadata named by preserve_meta_keys must remain valid when tensor argument
+    zero changes from NCHW to NHWC logical order.
     """
 
     def __init__(
         self,
         exported_program: ExportedProgram,
         op_map: dict[Target, ChannelsLastOpSpec] | None = None,
+        preserve_meta_keys: tuple[str, ...] = (),
     ) -> None:
         super().__init__()
         self.exported_program = exported_program
         self.op_map: dict[Target, ChannelsLastOpSpec] = (
             op_map if op_map is not None else dict(_DEFAULT_OP_MAP)
         )
+        self.preserve_meta_keys = preserve_meta_keys
 
     @staticmethod
     def _permute_node_input(
@@ -153,7 +160,7 @@ class ReplaceOpsWithChannelsLastVariants(ExportPass):
 
         res = graph.create_node(
             "call_function",
-            target=exir_ops.edge.channels_last.permute_copy.default,
+            target=LAYOUT_PERMUTE_COPY,
             args=(node_input, _NCHW_TO_NHWC_PERM),
         )
         res.meta = {}
@@ -169,7 +176,7 @@ class ReplaceOpsWithChannelsLastVariants(ExportPass):
     ):
         output = graph.create_node(
             "call_function",
-            target=exir_ops.edge.channels_last.permute_copy.default,
+            target=LAYOUT_PERMUTE_COPY,
             args=(node_output, _NHWC_TO_NCHW_PERM),
         )
         output.meta = {}
@@ -221,7 +228,11 @@ class ReplaceOpsWithChannelsLastVariants(ExportPass):
                     args=tuple(args),
                     kwargs=node.kwargs,
                 )
-                nhwc_node.meta = {}
+                nhwc_node.meta = {
+                    key: node.meta[key]
+                    for key in self.preserve_meta_keys
+                    if key in node.meta
+                }
 
                 users = list(node.users)
                 if all(

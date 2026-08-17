@@ -205,6 +205,20 @@ def define_common_targets():
     )
 
     runtime.python_library(
+        name = "channels_last_layout",
+        srcs = [
+            "channels_last_layout.py",
+        ],
+        visibility = [
+            "//executorch/backends/...",
+        ],
+        deps = [
+            ":channels_last_ops",
+            "//executorch/exir/dialects:lib",
+        ],
+    )
+
+    runtime.python_library(
         name = "decompose_channels_last_pass",
         srcs = [
             "decompose_channels_last_pass.py",
@@ -491,6 +505,7 @@ def define_common_targets():
         ],
         deps = [
             "//caffe2:torch",
+            ":channels_last_layout",
             ":channels_last_ops",
             "//executorch/exir:pass_base",
             "//executorch/exir:lib",
@@ -504,6 +519,7 @@ def define_common_targets():
         ],
         deps = [
             "//caffe2:torch",
+            ":channels_last_layout",
             ":channels_last_ops",
             ":replace_ops_with_channels_last_variants",
             "//executorch/exir:lib",
