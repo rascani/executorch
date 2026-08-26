@@ -48,6 +48,22 @@ fbcode_target(
 
 fbcode_target(
     _kind = python_library,
+    name = "op_backend",
+    srcs = [
+        "op_backend.py",
+    ],
+    visibility = ["PUBLIC"],
+    deps = [
+        ":target_config",
+        "//caffe2:torch",
+        "//executorch/backends/cortex_m/passes:cortex_passes",
+        "//executorch/exir:lib",
+        "//executorch/exir/backend:op_backend",
+    ],
+)
+
+fbcode_target(
+    _kind = python_library,
     name = "target_config",
     srcs = [
         "target_config.py",
