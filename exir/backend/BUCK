@@ -54,6 +54,17 @@ fbcode_target(_kind = runtime.python_library,
 )
 
 fbcode_target(_kind = runtime.python_library,
+    name = "op_backend",
+    srcs = [
+        "op_backend.py",
+    ],
+    visibility = ["PUBLIC"],
+    deps = [
+        "//caffe2:torch",
+    ],
+)
+
+fbcode_target(_kind = runtime.python_library,
     name = "partitioner",
     srcs = [
         "partitioner.py",

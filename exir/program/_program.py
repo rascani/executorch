@@ -27,6 +27,7 @@ from executorch.exir.backend.backend_api import (
     MethodProgramsPartitionerSpec,
     to_backend,
 )
+from executorch.exir.backend.op_backend import OpBackend, to_op_backend
 from executorch.exir.backend.partitioner import Partitioner
 from executorch.exir.capture._config import EdgeCompileConfig, ExecutorchBackendConfig
 from executorch.exir.delegate import executorch_call_delegate, is_lowered_module
@@ -1684,6 +1685,52 @@ class EdgeProgramManager:
             config,
         )
 
+        epm._etrecord = self._etrecord
+        return epm
+
+    def to_op_backend(
+        self,
+        op_backend: Union[OpBackend, Dict[str, OpBackend]],
+    ) -> "EdgeProgramManager":
+        """
+        Returns a program in which each method has been rewritten by an
+        operator backend, which replaces operators with its own kernels rather
+        than delegating a subgraph.
+
+        Args:
+            op_backend: Either one OpBackend applied to every method, or a
+                dictionary mapping method names to one each, in which case
+                methods absent from the dictionary are left alone.
+
+        Returns:
+            EdgeProgramManager: A copy of the calling EdgeProgramManager with
+            the specified methods lowered.
+        """
+        method_to_op_backend = (
+            op_backend
+            if isinstance(op_backend, dict)
+            else {name: op_backend for name in self._edge_programs}
+        )
+
+        new_edge_programs: Dict[str, ExportedProgram] = {}
+        for name in sorted(self._edge_programs):
+            program = self._edge_programs[name]
+            backend = method_to_op_backend.get(name)
+            new_edge_programs[name] = (
+                to_op_backend(program, backend, name) if backend else program
+            )
+
+        # As in to_backend, an operator backend installs operators outside the
+        # edge dialect, so reconstructing must not re-verify against it. Unlike
+        # to_backend, the rest of the config is carried rather than replaced,
+        # so preserve_ops and the exception list survive the rebuild.
+        config = copy.copy(self.compile_config)
+        config._check_ir_validity = False
+        epm = EdgeProgramManager(
+            new_edge_programs,
+            copy.deepcopy(self._config_methods),
+            config,
+        )
         epm._etrecord = self._etrecord
         return epm
 
