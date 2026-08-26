@@ -1089,6 +1089,22 @@ class TestOpBackendPipeline(unittest.TestCase):
         session.export()
         self.assertEqual(self.backend.seen, ["forward"])
 
+    def test_omitting_the_stage_from_pipeline_stages_is_rejected(self) -> None:
+        # The default pipeline places the stage; a caller-supplied list that
+        # leaves it out would silently drop the transforms.
+        with self.assertRaisesRegex(ValueError, "EDGE_PROGRAM_MANAGER_TRANSFORM"):
+            ExportSession(
+                model=self.model,
+                example_inputs=self.inputs,
+                export_recipe=self._recipe(
+                    pipeline_stages=[
+                        StageType.TORCH_EXPORT,
+                        StageType.TO_EDGE_TRANSFORM_AND_LOWER,
+                        StageType.TO_EXECUTORCH,
+                    ]
+                ),
+            ).export()
+
     def test_edge_program_manager_getter_returns_the_lowered_program(self) -> None:
         session = ExportSession(
             model=self.model,
@@ -1501,6 +1517,105 @@ class TestPipelinesThatWouldMisapplyTheRecipe(unittest.TestCase):
         )
         self._session(recipe).export()
         self.assertEqual(backend.seen, ["forward"])
+
+    def test_op_backends_cannot_outrun_the_partitioners(self) -> None:
+        # With partitioners set, lowering before they run would let the backend
+        # claim operators a delegate was going to take.
+        from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
+            XnnpackPartitioner,
+        )
+
+        recipe = ExportRecipe(
+            name="pre",
+            lowering_recipe=LoweringRecipe(
+                partitioners=[XnnpackPartitioner()],
+                op_backends=[_RecordingOpBackend()],
+            ),
+            pipeline_stages=[
+                StageType.TORCH_EXPORT,
+                StageType.TO_EDGE,
+                StageType.EDGE_PROGRAM_MANAGER_TRANSFORM,
+                StageType.TO_BACKEND,
+                StageType.TO_EXECUTORCH,
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "before any partitioning stage"):
+            self._session(recipe).export()
+
+    def test_partitioners_cannot_run_twice(self) -> None:
+        # TETAL -> EPMT -> TO_BACKEND only became legal with this stage's new
+        # predecessors; before, the transition validator refused it and this
+        # rule had nothing to catch.
+        from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
+            XnnpackPartitioner,
+        )
+
+        recipe = ExportRecipe(
+            name="twice",
+            lowering_recipe=LoweringRecipe(
+                partitioners=[XnnpackPartitioner()],
+                op_backends=[_RecordingOpBackend()],
+            ),
+            pipeline_stages=[
+                StageType.TORCH_EXPORT,
+                StageType.TO_EDGE_TRANSFORM_AND_LOWER,
+                StageType.EDGE_PROGRAM_MANAGER_TRANSFORM,
+                StageType.TO_BACKEND,
+                StageType.TO_EXECUTORCH,
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "partitioners would be applied"):
+            self._session(recipe).export()
+
+    def test_op_backends_cannot_run_twice(self) -> None:
+        backend = _RecordingOpBackend()
+        recipe = ExportRecipe(
+            name="twice",
+            lowering_recipe=LoweringRecipe(op_backends=[backend]),
+            pipeline_stages=[
+                StageType.TORCH_EXPORT,
+                StageType.TO_EDGE,
+                StageType.EDGE_PROGRAM_MANAGER_TRANSFORM,
+                StageType.TO_BACKEND,
+                StageType.EDGE_PROGRAM_MANAGER_TRANSFORM,
+                StageType.TO_EXECUTORCH,
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "more than once"):
+            self._session(recipe).export()
+
+    def test_a_truncated_pipeline_is_not_refused(self) -> None:
+        # Stopping early to inspect an intermediate artifact is supported, so
+        # a field the run never reaches is not an error.
+        recipe = ExportRecipe(
+            name="truncated",
+            lowering_recipe=LoweringRecipe(op_backends=[_RecordingOpBackend()]),
+            pipeline_stages=[StageType.TORCH_EXPORT],
+        )
+        self._session(recipe).export()
+
+    def test_a_partitioning_stage_cannot_repeat(self) -> None:
+        # TO_BACKEND accepts EDGE_PROGRAM_MANAGER_TRANSFORM as a predecessor,
+        # so the new predecessor closes a loop back onto partitioning.
+        from executorch.exir.backend.partitioner import Partitioner
+
+        recipe = ExportRecipe(
+            name="cycle",
+            lowering_recipe=LoweringRecipe(
+                partitioners=[Mock(spec=Partitioner)],
+                op_backends=[_RecordingOpBackend()],
+            ),
+            pipeline_stages=[
+                StageType.TORCH_EXPORT,
+                StageType.TO_EDGE,
+                StageType.TO_BACKEND,
+                StageType.EDGE_PROGRAM_MANAGER_TRANSFORM,
+                StageType.TO_BACKEND,
+                StageType.TO_EXECUTORCH,
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "more than once"):
+            self._session(recipe).export()
 
     def test_op_backends_may_follow_a_separate_to_backend(self) -> None:
         # to_edge -> to_backend -> op backend is the staged shape a composed

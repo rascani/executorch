@@ -375,12 +375,80 @@ class ExportSession:
         """
         return self._stage_registry
 
+    def _validate_lowering_recipe_reaches_its_stages(
+        self, stages: List[StageType]
+    ) -> None:
+        """Refuse a pipeline that would misapply the lowering recipe.
+
+        Only shapes that letting the transform stage follow the partitioning
+        stages made reachable. A field that a truncated pipeline never gets to
+        is not an error: stopping early to inspect an intermediate artifact is
+        a supported thing to do.
+        """
+        lowering = self._lowering_recipe
+        if lowering is None:
+            return
+
+        if (
+            lowering.op_backends
+            and StageType.TO_EXECUTORCH in stages
+            and StageType.EDGE_PROGRAM_MANAGER_TRANSFORM not in stages
+        ):
+            raise ValueError(
+                "The lowering recipe sets op_backends, but pipeline_stages runs "
+                "to TO_EXECUTORCH without EDGE_PROGRAM_MANAGER_TRANSFORM, so the "
+                "backends would never run. Add that stage after whichever stage "
+                "produces the edge programs, or drop pipeline_stages and let the "
+                "default pipeline place it."
+            )
+
+        partitioning = [
+            stage
+            for stage in stages
+            if stage in (StageType.TO_EDGE_TRANSFORM_AND_LOWER, StageType.TO_BACKEND)
+        ]
+        if lowering.partitioners and len(partitioning) > 1:
+            raise ValueError(
+                "pipeline_stages runs a partitioning stage more than once "
+                f"({[s.name for s in partitioning]}), so the recipe's "
+                "partitioners would be applied repeatedly. Keep one."
+            )
+
+        if (
+            lowering.op_backends
+            and stages.count(StageType.EDGE_PROGRAM_MANAGER_TRANSFORM) > 1
+        ):
+            raise ValueError(
+                "pipeline_stages runs EDGE_PROGRAM_MANAGER_TRANSFORM more than "
+                "once, so every operator backend would sweep over its own "
+                "output. Keep one."
+            )
+
+        # An operator backend is meant to see what the partitioners left
+        # behind. With partitioners set, running it first would hand it the
+        # whole graph and let it claim operators a delegate was going to take.
+        if (
+            lowering.partitioners
+            and lowering.op_backends
+            and StageType.EDGE_PROGRAM_MANAGER_TRANSFORM in stages
+        ):
+            transform = stages.index(StageType.EDGE_PROGRAM_MANAGER_TRANSFORM)
+            if not any(stage in partitioning for stage in stages[:transform]):
+                raise ValueError(
+                    "The lowering recipe sets both partitioners and op_backends, "
+                    "but pipeline_stages places EDGE_PROGRAM_MANAGER_TRANSFORM "
+                    "before any partitioning stage, so the backends would rewrite "
+                    "operators the partitioners were going to claim."
+                )
+
     def _validate_pipeline_sequence(
         self,
         stages: List[StageType],
     ) -> None:
         if not stages:
             raise ValueError("Pipeline stages cannot be empty")
+
+        self._validate_lowering_recipe_reaches_its_stages(stages)
 
         # Validate pipeline compatibility with input model type
         if self._input_model_type == "GraphModule":
