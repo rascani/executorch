@@ -11,6 +11,7 @@ from typing import List
 from unittest.mock import Mock
 
 import torch
+from executorch.exir.backend.op_backend import OpBackend
 from executorch.export import ExportRecipe, ExportSession
 from executorch.export.recipe import (
     AOQuantizationConfig,
@@ -1017,3 +1018,504 @@ class TestStageArtifactsAreScopedToOneRun(unittest.TestCase):
         with self.assertRaises(ValueError):
             session.export()
         self.assertIs(session.get_executorch_program_manager(), before)
+
+
+class _RecordingOpBackend(OpBackend):
+    """Records the methods it lowered; optionally applies a real pass."""
+
+    def __init__(self, apply_pass: bool = False) -> None:
+        self.seen: List[str] = []
+        self._apply_pass = apply_pass
+
+    def lower(self, exported_program, method_name):
+        from executorch.exir.pass_base import ExportPass
+        from executorch.exir.program._program import _transform
+
+        self.seen.append(method_name)
+        return (
+            _transform(exported_program, ExportPass())
+            if self._apply_pass
+            else exported_program
+        )
+
+
+class TestOpBackendPipeline(unittest.TestCase):
+    """A lowering recipe that declares op_backends has to get the
+    stage that runs them, whatever the input model type."""
+
+    def setUp(self) -> None:
+        self.model = SimpleTestModel()
+        self.inputs = [(torch.randn(1, 10),)]
+
+    def _recipe(self, real_pass: bool = False, **kwargs) -> ExportRecipe:
+        self.backend = _RecordingOpBackend(apply_pass=real_pass)
+        return ExportRecipe(
+            name="ppt",
+            lowering_recipe=LoweringRecipe(op_backends=[self.backend]),
+            **kwargs,
+        )
+
+    def test_stage_added_to_default_pipeline(self) -> None:
+        session = ExportSession(
+            model=self.model, example_inputs=self.inputs, export_recipe=self._recipe()
+        )
+        stages = session._pipeline_stages
+        self.assertGreater(
+            stages.index(StageType.EDGE_PROGRAM_MANAGER_TRANSFORM),
+            stages.index(StageType.TO_EDGE_TRANSFORM_AND_LOWER),
+        )
+        session.export()
+        self.assertEqual(self.backend.seen, ["forward"])
+
+    def test_stage_absent_without_op_backends(self) -> None:
+        session = ExportSession(
+            model=self.model,
+            example_inputs=self.inputs,
+            export_recipe=ExportRecipe(name="plain"),
+        )
+        self.assertNotIn(
+            StageType.EDGE_PROGRAM_MANAGER_TRANSFORM, session._pipeline_stages
+        )
+
+    def test_accepts_exported_program_input(self) -> None:
+        exported = torch.export.export(self.model, self.inputs[0])
+        session = ExportSession(
+            model=exported, example_inputs=self.inputs, export_recipe=self._recipe()
+        )
+        self.assertNotIn(StageType.TORCH_EXPORT, session._pipeline_stages)
+        self.assertIn(
+            StageType.EDGE_PROGRAM_MANAGER_TRANSFORM, session._pipeline_stages
+        )
+        session.export()
+        self.assertEqual(self.backend.seen, ["forward"])
+
+    def test_edge_program_manager_getter_returns_the_lowered_program(self) -> None:
+        session = ExportSession(
+            model=self.model,
+            example_inputs=self.inputs,
+            export_recipe=self._recipe(real_pass=True),
+        )
+        session.export()
+        artifacts = session.get_stage_artifacts()
+        lowered = artifacts[StageType.TO_EDGE_TRANSFORM_AND_LOWER].data
+        transformed = artifacts[StageType.EDGE_PROGRAM_MANAGER_TRANSFORM].data
+        # Guard the guard: the stage always rebuilds the manager, so comparing
+        # managers proves nothing -- it is the programs that must differ.
+        self.assertIsNot(
+            lowered.exported_program("forward"),
+            transformed.exported_program("forward"),
+        )
+        self.assertIs(session.get_edge_program_manager(), transformed)
+
+
+_kernels = torch.library.Library("op_backend_test", "FRAGMENT")
+_kernels.define("scale(Tensor x) -> Tensor")
+_kernels.impl("scale", lambda x: x * 2.0, "CompositeExplicitAutograd")
+# to_executorch needs an out variant for every operator left in the graph.
+_kernels.define("scale.out(Tensor x, *, Tensor(a!) out) -> Tensor(a!)")
+_kernels.impl(
+    "scale.out",
+    lambda x, out: out.copy_(x * 2.0),
+    "CompositeExplicitAutograd",
+)
+
+
+class _TwoOpModel(torch.nn.Module):
+    """The retargeted operator has to be non-terminal, or replacing it would
+    invalidate the graph signature's user outputs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear: torch.nn.Module = torch.nn.Linear(10, 5)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # atan is not delegated by XNNPACK, so the backend has something left
+        # to retarget in both the partitioned and unpartitioned cases.
+        return torch.relu(torch.atan(self.linear(x)))
+
+
+class _RetargetingOpBackend(OpBackend):
+    """Does what the ABC describes: swaps an operator for its own kernel."""
+
+    def lower(self, exported_program, method_name):
+        from executorch.exir.pass_base import ExportPass
+        from executorch.exir.program._program import _transform
+
+        graph_module = exported_program.graph_module
+        for node in list(graph_module.graph.nodes):
+            if node.op == "call_function" and "atan" in str(node.target):
+                with graph_module.graph.inserting_after(node):
+                    replacement = graph_module.graph.call_function(
+                        torch.ops.op_backend_test.scale.default, (node.args[0],)
+                    )
+                replacement.meta.update(node.meta)
+                node.replace_all_uses_with(replacement)
+                graph_module.graph.erase_node(node)
+                break
+        graph_module.graph.lint()
+        graph_module.recompile()
+        return _transform(exported_program, ExportPass())
+
+
+class TestOpBackendMisuseIsReported(unittest.TestCase):
+    def test_the_abc_cannot_be_instantiated(self) -> None:
+        with self.assertRaises(TypeError):
+            OpBackend()
+
+    def test_the_offending_backend_is_named_in_a_chain(self) -> None:
+        # Checking after the whole chain instead of after each backend would
+        # report whichever ran last, and only once the emitter tripped over it.
+        class AddsRogueInput(OpBackend):
+            def lower(self, exported_program, method_name):
+                graph = exported_program.graph
+                first = next(n for n in graph.nodes if n.op == "placeholder")
+                with graph.inserting_before(first):
+                    graph.placeholder("rogue")
+                return exported_program
+
+        recipe = ExportRecipe(
+            name="chain",
+            lowering_recipe=LoweringRecipe(
+                op_backends=[AddsRogueInput(), _RecordingOpBackend()]
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "AddsRogueInput.lower"):
+            ExportSession(
+                model=SimpleTestModel(),
+                example_inputs=[(torch.randn(1, 10),)],
+                export_recipe=recipe,
+            ).export()
+
+
+class TestOpBackendsMayLeaveTheEdgeDialect(unittest.TestCase):
+    """The whole point of an operator backend is to install operators the edge
+    verifier does not know, so the stage must not re-verify against it."""
+
+    def _export(self, **lowering):
+        session = ExportSession(
+            model=_TwoOpModel(),
+            example_inputs=[(torch.randn(1, 10),)],
+            export_recipe=ExportRecipe(
+                name="retarget",
+                lowering_recipe=LoweringRecipe(
+                    op_backends=[_RetargetingOpBackend()], **lowering
+                ),
+            ),
+        )
+        session.export()
+        return session
+
+    def _ops(self, session):
+        program = session.get_edge_program_manager().exported_program("forward")
+        return {str(n.target) for n in program.graph.nodes if n.op == "call_function"}
+
+    def test_a_custom_operator_survives_the_rebuild(self) -> None:
+        # Without partitioners nothing has cleared _check_ir_validity, so the
+        # rebuild used to raise SpecViolationError on the backend's own kernel.
+        session = self._export()
+        self.assertTrue(
+            any(op.startswith("op_backend_test.scale") for op in self._ops(session))
+        )
+        self.assertGreater(len(session.get_executorch_program_manager().buffer), 0)
+
+    def test_it_also_survives_after_partitioning(self) -> None:
+        from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
+            XnnpackPartitioner,
+        )
+
+        session = self._export(partitioners=[XnnpackPartitioner()])
+        ops = self._ops(session)
+        self.assertIn("executorch_call_delegate", ops)
+        self.assertTrue(any(op.startswith("op_backend_test.scale") for op in ops))
+        self.assertGreater(len(session.get_executorch_program_manager().buffer), 0)
+
+
+class TestTheRebuildCarriesManagerState(unittest.TestCase):
+    """Rebuilding the manager drops anything not explicitly carried over."""
+
+    def _session(self, *, constant_methods=None, etrecord=False, preserve=None):
+        from executorch.exir import EdgeCompileConfig
+
+        config = EdgeCompileConfig(preserve_ops=preserve) if preserve else None
+        return ExportSession(
+            model=SimpleTestModel(),
+            example_inputs=[(torch.randn(1, 10),)],
+            constant_methods=constant_methods,
+            generate_etrecord=etrecord,
+            export_recipe=ExportRecipe(
+                name="carry",
+                lowering_recipe=LoweringRecipe(
+                    op_backends=[_RecordingOpBackend()], edge_compile_config=config
+                ),
+            ),
+        )
+
+    def test_constant_methods_survive(self) -> None:
+        session = self._session(constant_methods={"get_max_seq_len": 128})
+        session.export()
+        manager = session.get_edge_program_manager()
+        self.assertEqual(manager._config_methods, {"get_max_seq_len": 128})
+        # Copied, so the rebuilt manager cannot write back into the one the
+        # previous stage recorded.
+        self.assertIsNot(
+            manager._config_methods,
+            session.get_stage_artifacts()[
+                StageType.TO_EDGE_TRANSFORM_AND_LOWER
+            ].data._config_methods,
+        )
+
+    def test_the_etrecord_survives(self) -> None:
+        session = self._session(etrecord=True)
+        session.export()
+        self.assertIsNotNone(session.get_edge_program_manager()._etrecord)
+
+    def test_the_compile_config_survives_except_for_validity(self) -> None:
+        # The rebuild clears _check_ir_validity deliberately; everything else
+        # the recipe asked for has to come through untouched.
+        session = self._session(preserve=[torch.ops.aten.linear.default])
+        session.export()
+        config = session.get_edge_program_manager().compile_config
+        self.assertEqual(config.preserve_ops, [torch.ops.aten.linear.default])
+        self.assertFalse(config._check_ir_validity)
+
+
+class TestEdgeManagerTransformPasses(unittest.TestCase):
+    """The field predates op_backends and keeps working unchanged."""
+
+    def _recipe(self, **kwargs):
+        self.seen = []
+
+        def collect(manager):
+            self.seen.append(sorted(manager.methods))
+            return []
+
+        return ExportRecipe(
+            name="passes",
+            lowering_recipe=LoweringRecipe(
+                edge_manager_transform_passes=[collect], **kwargs
+            ),
+            pipeline_stages=[
+                StageType.TORCH_EXPORT,
+                StageType.TO_EDGE,
+                StageType.EDGE_PROGRAM_MANAGER_TRANSFORM,
+                StageType.TO_BACKEND,
+                StageType.TO_EXECUTORCH,
+            ],
+        )
+
+    def test_the_pipeline_shape_its_callers_use_still_works(self) -> None:
+        # to_edge -> transform -> to_backend, which predates
+        # TO_EDGE_TRANSFORM_AND_LOWER and is still the only way to reach this
+        # field: the default pipeline does not insert the stage for it.
+        session = ExportSession(
+            model=SimpleTestModel(),
+            example_inputs=[(torch.randn(1, 10),)],
+            export_recipe=self._recipe(),
+        )
+        session.export()
+        self.assertEqual(self.seen, [["forward"]])
+        self.assertGreater(len(session.get_executorch_program_manager().buffer), 0)
+
+    def test_it_does_not_get_the_stage_by_default(self) -> None:
+        session = ExportSession(
+            model=SimpleTestModel(),
+            example_inputs=[(torch.randn(1, 10),)],
+            export_recipe=ExportRecipe(
+                name="passes",
+                lowering_recipe=LoweringRecipe(
+                    edge_manager_transform_passes=[lambda m: []]
+                ),
+            ),
+        )
+        self.assertNotIn(
+            StageType.EDGE_PROGRAM_MANAGER_TRANSFORM, session._pipeline_stages
+        )
+
+
+class TestOpBackendsCompose(unittest.TestCase):
+    """Several backends may share one program; the order they see it in is
+    part of the contract, and each has to be handed what the last returned."""
+
+    def test_backends_run_in_recipe_order(self) -> None:
+        from executorch.exir.pass_base import ExportPass
+        from executorch.exir.program._program import _transform
+
+        order, handoff = [], {}
+
+        class First(OpBackend):
+            def lower(self, exported_program, method_name):
+                order.append("first")
+                handoff["out"] = _transform(exported_program, ExportPass())
+                return handoff["out"]
+
+        class Second(OpBackend):
+            def lower(self, exported_program, method_name):
+                order.append("second")
+                handoff["in"] = exported_program
+                return exported_program
+
+        ExportSession(
+            model=SimpleTestModel(),
+            example_inputs=[(torch.randn(1, 10),)],
+            export_recipe=ExportRecipe(
+                name="composed",
+                lowering_recipe=LoweringRecipe(op_backends=[First(), Second()]),
+            ),
+        ).export()
+
+        self.assertEqual(order, ["first", "second"])
+        self.assertIs(handoff["in"], handoff["out"])
+
+
+class TestOpBackendsSeeDelegates(unittest.TestCase):
+    """The premise of the stage: transforms run after the partitioner, so they
+    see what was left outside the delegates."""
+
+    def test_op_backend_observes_a_partitioned_program(self) -> None:
+        from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
+            XnnpackPartitioner,
+        )
+        from executorch.exir.pass_base import ExportPass
+        from executorch.exir.program._program import _transform
+
+        observed = {}
+
+        class Observer(OpBackend):
+            def lower(self, exported_program, method_name):
+                observed["delegates"] = sum(
+                    1
+                    for n in exported_program.graph.nodes
+                    if n.op == "call_function"
+                    and n.target is torch.ops.higher_order.executorch_call_delegate
+                )
+                return _transform(exported_program, ExportPass())
+
+        session = ExportSession(
+            model=SimpleTestModel(),
+            example_inputs=[(torch.randn(1, 10),)],
+            export_recipe=ExportRecipe(
+                name="delegated",
+                lowering_recipe=LoweringRecipe(
+                    partitioners=[XnnpackPartitioner()],
+                    op_backends=[Observer()],
+                ),
+            ),
+        )
+        session.export()
+
+        self.assertGreater(observed["delegates"], 0)
+        self.assertGreater(len(session.get_executorch_program_manager().buffer), 0)
+
+    def test_graph_module_input_gets_the_stage(self) -> None:
+        backend = _RecordingOpBackend()
+        exported = torch.export.export(SimpleTestModel(), (torch.randn(1, 10),))
+        session = ExportSession(
+            model=exported.module(),
+            example_inputs=[(torch.randn(1, 10),)],
+            export_recipe=ExportRecipe(
+                name="gm", lowering_recipe=LoweringRecipe(op_backends=[backend])
+            ),
+        )
+        self.assertNotIn(StageType.QUANTIZE, session._pipeline_stages)
+        session.export()
+        self.assertEqual(backend.seen, ["forward"])
+
+
+class TestEdgeProgramManagerGetterArms(unittest.TestCase):
+    """Each edge stage the getter recognises has to be the one it returns when
+    that stage ran last."""
+
+    def setUp(self) -> None:
+        self.model = SimpleTestModel()
+        self.inputs = [(torch.randn(1, 10),)]
+
+    def _run(self, stages, **lowering):
+        session = ExportSession(
+            model=self.model,
+            example_inputs=self.inputs,
+            export_recipe=ExportRecipe(
+                name="arms",
+                lowering_recipe=LoweringRecipe(**lowering) if lowering else None,
+                pipeline_stages=stages,
+            ),
+        )
+        session.export()
+        return session
+
+    def test_to_backend_last(self) -> None:
+        from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
+            XnnpackPartitioner,
+        )
+
+        session = self._run(
+            [
+                StageType.TORCH_EXPORT,
+                StageType.TO_EDGE,
+                StageType.TO_BACKEND,
+                StageType.TO_EXECUTORCH,
+            ],
+            partitioners=[XnnpackPartitioner()],
+        )
+        artifacts = session.get_stage_artifacts()
+        # Without a partitioner these are the same object and the assertion
+        # below would hold whichever arm the getter took.
+        self.assertIsNot(
+            artifacts[StageType.TO_EDGE].data, artifacts[StageType.TO_BACKEND].data
+        )
+        self.assertIs(
+            session.get_edge_program_manager(),
+            artifacts[StageType.TO_BACKEND].data,
+        )
+
+    def test_to_edge_last(self) -> None:
+        session = self._run([StageType.TORCH_EXPORT, StageType.TO_EDGE])
+        self.assertIs(
+            session.get_edge_program_manager(),
+            session.get_stage_artifacts()[StageType.TO_EDGE].data,
+        )
+
+
+class TestPipelinesThatWouldMisapplyTheRecipe(unittest.TestCase):
+    def setUp(self) -> None:
+        self.model = SimpleTestModel()
+        self.inputs = [(torch.randn(1, 10),)]
+
+    def _session(self, recipe) -> ExportSession:
+        return ExportSession(
+            model=self.model, example_inputs=self.inputs, export_recipe=recipe
+        )
+
+    def test_op_backends_may_follow_a_plain_to_edge(self) -> None:
+        # Without partitioners there is nothing to run after, and this is the
+        # pipeline shape the stage supported before op_backends existed.
+        backend = _RecordingOpBackend()
+        recipe = ExportRecipe(
+            name="plain",
+            lowering_recipe=LoweringRecipe(op_backends=[backend]),
+            pipeline_stages=[
+                StageType.TORCH_EXPORT,
+                StageType.TO_EDGE,
+                StageType.EDGE_PROGRAM_MANAGER_TRANSFORM,
+                StageType.TO_EXECUTORCH,
+            ],
+        )
+        self._session(recipe).export()
+        self.assertEqual(backend.seen, ["forward"])
+
+    def test_op_backends_may_follow_a_separate_to_backend(self) -> None:
+        # to_edge -> to_backend -> op backend is the staged shape a composed
+        # NPU export needs; TO_BACKEND partitions, so it qualifies.
+        backend = _RecordingOpBackend()
+        recipe = ExportRecipe(
+            name="staged",
+            lowering_recipe=LoweringRecipe(op_backends=[backend]),
+            pipeline_stages=[
+                StageType.TORCH_EXPORT,
+                StageType.TO_EDGE,
+                StageType.TO_BACKEND,
+                StageType.EDGE_PROGRAM_MANAGER_TRANSFORM,
+                StageType.TO_EXECUTORCH,
+            ],
+        )
+        self._session(recipe).export()
+        self.assertEqual(backend.seen, ["forward"])

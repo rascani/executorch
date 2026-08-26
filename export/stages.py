@@ -15,6 +15,7 @@ import torch
 from executorch.devtools.backend_debug import get_delegation_info
 from executorch.exir import EdgeCompileConfig, EdgeProgramManager, ExportedProgram
 from executorch.exir.backend.backend_api import validation_disabled
+from executorch.exir.backend.op_backend import OpBackend
 from executorch.exir.program import to_edge, to_edge_transform_and_lower
 from executorch.export.recipe import LoweringRecipe, QuantizationRecipe
 from executorch.export.types import StageType
@@ -34,6 +35,22 @@ def _drop_empty(
     passes_by_method: Dict[str, List[PassType]]
 ) -> Dict[str, List[PassType]]:
     return {method: p for method, p in passes_by_method.items() if p}
+
+
+def _edge_compile_config_for(lowering_recipe: "LoweringRecipe") -> Any:
+    """The to_edge config, relaxed if operator backends are going to run.
+
+    An operator backend installs operators outside the edge dialect by
+    definition. The programs to_edge builds carry a verifier for the life of
+    the program, so leaving validity on means the backend's own `_transform`
+    rejects its output before the stage ever sees it.
+    """
+    config = lowering_recipe.edge_compile_config
+    if not lowering_recipe.op_backends:
+        return config
+    config = copy.copy(config) if config is not None else EdgeCompileConfig()
+    config._check_ir_validity = False
+    return config
 
 
 class PipelineArtifact:
@@ -206,7 +223,7 @@ class EdgeTransformAndLowerStage(Stage):
         return cls(
             partitioners=lowering_recipe.partitioners,
             transform_passes=lowering_recipe.edge_transform_passes,
-            compile_config=lowering_recipe.edge_compile_config,
+            compile_config=_edge_compile_config_for(lowering_recipe),
         )
 
     @property
@@ -486,7 +503,7 @@ class ToEdgeStage(Stage):
             return cls()
 
         return cls(
-            edge_compile_config=lowering_recipe.edge_compile_config,
+            edge_compile_config=_edge_compile_config_for(lowering_recipe),
         )
 
     @property
@@ -524,11 +541,13 @@ class ToEdgeStage(Stage):
 
 class EdgeProgramManagerTransformStage(Stage):
     """
-    Stage: Apply transformation passes that require EdgeProgramManager.
+    Stage: Rewrite the edge programs once the earlier stages are done with them.
 
-    This stage enables dynamic pass generation where passes need access to the
-    EdgeProgramManager instance. Passes are applied sequentially, allowing
-    to control order and dependencies between pass groups.
+    Runs the recipe's `op_backends`, which lower by rewriting operators rather
+    than by delegating a subgraph. Placed after a partitioning stage, they see
+    what was left outside the delegates.
+
+    Also applies `edge_manager_transform_passes`, which it has always run.
     """
 
     def __init__(
@@ -547,30 +566,41 @@ class EdgeProgramManagerTransformStage(Stage):
                 Callable[[EdgeProgramManager], List[PassType] | GraphModulePassManager]
             ]
         ) = None,
+        op_backends: Optional[List[OpBackend]] = None,
     ) -> None:
         """
-        Initialize the EdgeProgramManagerTransformStage.
-
         Args:
-            edge_manager_transform_passes: List of callables that take EdgeProgramManager
-                                           and return either List[PassType] or PassManager.
-                                           Each callable is applied sequentially, allowing
-                                           backends to control pass ordering and dependencies.
+            edge_transform_passes: Per-method callables returning passes.
+            edge_manager_transform_passes: Callables handed the whole
+                EdgeProgramManager.
+            op_backends: Backends that lower by rewriting operators, applied in
+                order to every method.
         """
         super().__init__()
+        for op_backend in op_backends or []:
+            if not isinstance(op_backend, OpBackend):
+                raise TypeError(
+                    f"op_backends entries must be OpBackends, got {op_backend!r}"
+                )
         self._edge_transform_passes = edge_transform_passes or []
         self._edge_manager_transform_passes = edge_manager_transform_passes or []
+        self._op_backends = op_backends or []
 
     @classmethod
     def from_recipe(
-        cls, lowering_recipe: Optional[LoweringRecipe]
+        cls,
+        lowering_recipe: Optional[LoweringRecipe],
+        with_transform_passes: bool = True,
     ) -> "EdgeProgramManagerTransformStage":
         if lowering_recipe is None:
             return cls()
 
         return cls(
-            edge_transform_passes=lowering_recipe.edge_transform_passes,
+            edge_transform_passes=(
+                lowering_recipe.edge_transform_passes if with_transform_passes else None
+            ),
             edge_manager_transform_passes=lowering_recipe.edge_manager_transform_passes,
+            op_backends=lowering_recipe.op_backends,
         )
 
     @property
@@ -581,7 +611,8 @@ class EdgeProgramManagerTransformStage(Stage):
     def valid_predecessor_stages(self) -> List["StageType"]:
         return [
             StageType.TO_EDGE,
-            # StageType.TO_EDGE_TRANSFORM_AND_LOWER,  # TODO
+            StageType.TO_EDGE_TRANSFORM_AND_LOWER,
+            StageType.TO_BACKEND,
         ]
 
     @property
@@ -589,12 +620,6 @@ class EdgeProgramManagerTransformStage(Stage):
         return False
 
     def run(self, artifact: PipelineArtifact) -> None:
-        """
-        Apply transformation passes sequentially.
-
-        Args:
-            artifact: Pipeline artifact containing EdgeProgramManager
-        """
         edge_program_manager = artifact.data
 
         if not isinstance(edge_program_manager, EdgeProgramManager):
@@ -602,40 +627,38 @@ class EdgeProgramManagerTransformStage(Stage):
                 f"Expected EdgeProgramManager but got {type(edge_program_manager)}"
             )
 
-        if not self._edge_transform_passes and not self._edge_manager_transform_passes:
-            self._artifact = artifact
-            return
+        # Each backend sees what the previous one returned; the per-method
+        # loop and the manager rebuild belong to to_op_backend.
+        for op_backend in self._op_backends:
+            edge_program_manager = edge_program_manager.to_op_backend(op_backend)
 
-        # Detect if any callable returns PassManager
-        pass_manager = None
-        transform_passes = defaultdict(list)
-        for method_name in edge_program_manager.methods:
-            # Resolve transform passes if it's a callable
-            ep = edge_program_manager.exported_program(method_name)
-            for pass_callable in self._edge_transform_passes or []:
-                if not callable(pass_callable):
-                    raise ValueError(
-                        "Transform passes must be a callable that resolves to passes"
-                    )
-                passes = pass_callable(method_name, ep)
-                if isinstance(passes, GraphModulePassManager):
-                    pass_manager = passes
-                    break
-                else:
+        if self._edge_transform_passes or self._edge_manager_transform_passes:
+            pass_manager = None
+            transform_passes = defaultdict(list)
+            for method_name in edge_program_manager.methods:
+                ep = edge_program_manager.exported_program(method_name)
+                for pass_callable in self._edge_transform_passes:
+                    if not callable(pass_callable):
+                        raise ValueError(
+                            "Transform passes must be a callable that resolves to passes"
+                        )
+                    passes = pass_callable(method_name, ep)
+                    if isinstance(passes, GraphModulePassManager):
+                        pass_manager = passes
+                        break
                     transform_passes[method_name].extend(passes)
-            if pass_manager:
-                break
+                if pass_manager:
+                    break
 
-        # See EdgeTransformAndLowerStage.run.
-        final_passes = pass_manager or _drop_empty(transform_passes) or None
-        if final_passes is not None:
-            edge_program_manager = edge_program_manager.transform(final_passes)
+            # See EdgeTransformAndLowerStage.run.
+            final_passes = pass_manager or _drop_empty(transform_passes) or None
+            if final_passes is not None:
+                edge_program_manager = edge_program_manager.transform(final_passes)
 
-        # Run edge manager transform passes
-        for pass_callable in self._edge_manager_transform_passes:
-            passes = pass_callable(edge_program_manager)
-            if passes:
-                edge_program_manager = edge_program_manager.transform(passes)
+            for pass_callable in self._edge_manager_transform_passes:
+                passes = pass_callable(edge_program_manager)
+                if passes:
+                    edge_program_manager = edge_program_manager.transform(passes)
 
         self._artifact = artifact.copy_with_new_data(edge_program_manager)
 
