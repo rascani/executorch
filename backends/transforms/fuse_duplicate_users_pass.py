@@ -36,6 +36,24 @@ class FuseDuplicateUsersPass(ExportPass):
         # so backends name those here rather than the pass guessing.
         self._excluded_targets = excluded_targets or frozenset()
 
+    @staticmethod
+    def _is_replayable(target: Any) -> bool:
+        """Whether two calls to ``target`` on equal arguments are interchangeable.
+
+        Fusion replaces N calls with one and shares its result. That is only
+        value-preserving for an operator whose result is a function of its
+        arguments alone. A seeded operator draws a fresh value per call, so
+        sharing one makes previously independent tensors equal; a mutating one
+        applies its effect once instead of N times.
+
+        """
+        op = getattr(target, "_op", target)
+        tags = getattr(op, "tags", ())
+        if torch.Tag.nondeterministic_seeded in tags:
+            return False
+        schema = getattr(op, "_schema", None)
+        return not (schema is not None and schema.is_mutable)
+
     def call(self, graph_module: GraphModule) -> PassResult:
         graph = graph_module.graph
         modified = False
@@ -102,6 +120,9 @@ class FuseDuplicateUsersPass(ExportPass):
                 continue
 
             if user.target in self._excluded_targets:
+                continue
+
+            if not self._is_replayable(user.target):
                 continue
 
             target_key = self._get_target_key(user.target)
