@@ -10,20 +10,24 @@ set -euo pipefail
 install_idf=true
 install_emulator=true
 minimal=false
+idf_version=v6.1
 for arg in "$@"; do
     case "${arg}" in
         --minimal) minimal=true ;;
         --skip-idf) install_idf=false ;;
         --skip-emulator) install_emulator=false ;;
+        --idf-version=*) idf_version="${arg#*=}"; idf_version="v${idf_version#v}" ;;
         --help|-h)
             cat <<EOF
-Usage: $0 [--minimal] [--skip-idf] [--skip-emulator]
+Usage: $0 [--minimal] [--skip-idf] [--skip-emulator] [--idf-version=VERSION]
 
 Install ESP-IDF and esp-emulator for ESP32-S3 development.
 By default, install ESP-IDF's standard ESP32-S3 development tools.
 --minimal installs only the Xtensa compiler, SDK Python packages, and emulator.
+--idf-version selects 6.0.1 (Muse) or 6.1 (default, standalone runner).
 ESP-IDF Python dependencies are installed in the active venv or conda environment.
-ESPRESSIF_TOOLS_DIR selects the install directory (default: ~/.cache/executorch-espressif).
+ESPRESSIF_TOOLS_DIR selects the install directory (default: ~/.cache/executorch-espressif
+for 6.1, ~/.cache/executorch-espressif-v6.0.1 for 6.0.1).
 IDF_PATH and IDF_TOOLS_PATH can select an existing checkout of the pinned SDK and tool directory.
 EOF
             exit 0
@@ -32,8 +36,12 @@ EOF
     esac
 done
 
-tools_dir="${ESPRESSIF_TOOLS_DIR:-${HOME}/.cache/executorch-espressif}"
-idf_version=v6.1
+case "${idf_version}" in
+    v6.1) default_tools_dir="${HOME}/.cache/executorch-espressif" ;;
+    v6.0.1) default_tools_dir="${HOME}/.cache/executorch-espressif-v6.0.1" ;;
+    *) echo "Unsupported ESP-IDF version: ${idf_version}. Choose 6.0.1 or 6.1." >&2; exit 1 ;;
+esac
+tools_dir="${ESPRESSIF_TOOLS_DIR:-${default_tools_dir}}"
 emulator_version=0.48.0
 mkdir -p "${tools_dir}"
 tools_dir=$(cd "${tools_dir}" && pwd)
