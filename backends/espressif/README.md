@@ -1,6 +1,12 @@
 # Espressif backend
 
-This backend is under development to accelerate ExecuTorch operators on ESP32-S3 using ESP-NN. The intended frontend uses TorchAO PT2E quantization and the shared `channels_last` dialect for explicit activation layout. Model lowering and ESP-NN kernels remain to be implemented.
+This backend is under development to accelerate ExecuTorch operators on ESP32-S3 using ESP-NN. `EspQuantizer`, available from `executorch.backends.espressif.quantizer`, provides TorchAO PT2E quantization for multiply with static, equal-shaped, contiguous FP32 inputs. Inputs and output use independent per-tensor affine int8 quantization. Unsupported cases stay unannotated; model lowering and ESP-NN kernels follow separately.
+
+Run the quantizer tests in an ExecuTorch Python environment:
+
+```bash
+python -m pytest backends/espressif/test/test_quantizer.py
+```
 
 ## SDK selection
 
