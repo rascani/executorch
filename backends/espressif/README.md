@@ -2,7 +2,9 @@
 
 This backend is under development to accelerate ExecuTorch operators on ESP32-S3 using ESP-NN. `EspQuantizer`, available from `executorch.backends.espressif.quantizer`, provides TorchAO PT2E quantization for multiply with static, equal-shaped, contiguous FP32 inputs. Inputs and output use independent per-tensor affine int8 quantization. Unsupported cases stay unannotated; model lowering and ESP-NN kernels follow separately.
 
-`EspPassManager`, available from `executorch.backends.espressif.passes`, integrates with `to_edge_transform_and_lower(program, transform_passes=EspPassManager())` and `edge.transform(EspPassManager())`. Its initial pass list is empty; operator lowering passes will be added alongside their kernels. `EspTester` exposes both paths through `.to_edge_transform_and_lower()` and `.to_edge().run_passes()`.
+`EspPassManager`, available from `executorch.backends.espressif.passes`, integrates with `to_edge_transform_and_lower(program, transform_passes=EspPassManager())` and `edge.transform(EspPassManager())`. `EspTester` exposes both paths through `.to_edge_transform_and_lower()` and `.to_edge().run_passes()`.
+
+`EspChannelsLastPass` reuses the shared clone and permutation passes to remove redundant layout copies around elementwise operations and per-tensor Q/DQ. It recognizes both ATen and shared `channels_last` permutation copies. Explicit NHWC tensors have contiguous storage; standalone multiply keeps its existing shape. Graphs containing other memory layouts, including PyTorch's channels-last memory format, retain their conversions. Q/DQ and float operations remain executable until operator lowering is added. Spatial operator mappings will follow with their kernels.
 
 For PTE serialization, import `executorch.kernels.quantized` to register the portable Q/DQ out variants from the ExecuTorch build.
 
